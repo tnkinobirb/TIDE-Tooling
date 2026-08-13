@@ -1,0 +1,1341 @@
+{
+  "cas": {
+    "sha3_512_tide:09362107366fc5dc41ed2c4532b932be94f82dc013d11f7717d246bf784c481680a9071c2df6713532e9e4a0cb13d559409a270b4cf672d3cf4a5277389f0485": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWpReUlnPT0ifV0sWyJzZXJpYWxpc2VyIiwicHJpbWl0aXZlIl1dfQ=="
+    },
+    "sha3_512_tide:2d6ed8c0c30097f768b4b5e8c6df64d851d7d5b4259cbeada167691f8aec7008a495e68418b939d2450ee8f12c9cccf1701959f81b67e0ab09ea03161a5fcfd7": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW1GMlpYSmhaMlVpIn1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:36eb7c5da5351a9cad504ef3ea4038f8e8619744363121599aca4a15d0f12cdda3f233121b5e656320829f4d0abb46046ff806437e59df4f28d24ab745c165af": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWpFd0lnPT0ifV0sWyJzZXJpYWxpc2VyIiwicHJpbWl0aXZlIl1dfQ=="
+    },
+    "sha3_512_tide:3f80e19f373cfb7d0a3256f673ca36150137f159357b99a2ec0223775df93fc11e5f671e527d188d0792762ae262aa9773834bf0adef662c1704c552f635bbd4": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xNCJdXX1dXX1dXSxbImtpbmQiLCJkaWN0Il0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInNlcmlhbGlzZXIiLCJjb250YWluZXIiXV19"
+    },
+    "sha3_512_tide:40ffe791be10cba8c6fd401ebfbc411cb8fdad1eae5e7b5eb5593a2fe1c11c77a5f1b41359f584e2674a137a82c07dc8dae089df807a4403b3f747f20c7bb3be": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJsaXN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfMSJdXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF80Il1dfSx7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzYiXV19LHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfOCJdXX1dXSxbImtpbmQiLCJsaXN0Il0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInNlcmlhbGlzZXIiLCJjb250YWluZXIiXV19"
+    },
+    "sha3_512_tide:420e20010cc20762633c56f2c61dd831bf415ab27eab244611f7a7990cc3de09e5a403694d282ed215435089df4b8ebbd6084c94bc0043280674fdc504753609": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWpJMUlnPT0ifV0sWyJzZXJpYWxpc2VyIiwicHJpbWl0aXZlIl1dfQ=="
+    },
+    "sha3_512_tide:45356b5fff5fa157cb69fb82de6c137e27ddca6425f80928061fb79396827345e5253877a9868fce001663e0bcfecb1ba9879b3aa315fc50d298acf590de90e9": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xMiJdXX1dXX1dXSxbImtpbmQiLCJkaWN0Il0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInNlcmlhbGlzZXIiLCJjb250YWluZXIiXV19"
+    },
+    "sha3_512_tide:48a245bee0d19bf5638f67e0d5bc4e14d875c5a3e2ab4a2b73d271384244bd3fa8025a0a967d3b32a1520f2e9128f19de8ea9810748d9b98f96d396cb762a516": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF83Il1dfV1dfV1dLFsia2luZCIsImRpY3QiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsic2VyaWFsaXNlciIsImNvbnRhaW5lciJdXX0="
+    },
+    "sha3_512_tide:48a3bc58abc1ab1ac0aac19ab369f1d94948609212955969bf8e9b0cf09293ab7909a86bfc5b44dd555e1c41988456edbfb4a6ed059c96e5504d234612acd010": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJkZXNjcmlwdG9yIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJvcGFxdWUiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsibW9kdWxlIiwicGF0aGxpYiJdLFsicXVhbG5hbWUiLCJQb3NpeFBhdGgiXSxbInJlYXNvbiIsInVuc3VwcG9ydGVkIFRJREUgdmFsdWUiXSxbInJlcHIiLCJQb3NpeFBhdGgoJ2RlbW9zL3BpcGVsaW5lL3Byb2Nlc3NlZF9kYXRhLmNzdicpIl0sWyJzZXJpYWxpc2VyIiwib3BhcXVlIl0sWyJ0eXBlIiwiUG9zaXhQYXRoIl1dfQ=="
+    },
+    "sha3_512_tide:527b62347d6d2e9f8cfbd58b4bf39aff22773e4b231e170c616f54c4ed88e30027af80926b049930c0ce592971cb3b9df4746b9d884af8724aa4811f833baabb": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiTnc9PSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:56e6a2e3e5b091a36e902f7db38c7a503ad7b5e74f9be1e17a7213aef4c90e7a00989ddfbcbd1444bbc42270fa68a736bdb111b92157752e031941a95e76fda7": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJkZXNjcmlwdG9yIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJvcGFxdWUiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsibW9kdWxlIiwicGF0aGxpYiJdLFsicXVhbG5hbWUiLCJQb3NpeFBhdGgiXSxbInJlYXNvbiIsInVuc3VwcG9ydGVkIFRJREUgdmFsdWUiXSxbInJlcHIiLCJQb3NpeFBhdGgoJ2RlbW9zL3BpcGVsaW5lJykiXSxbInNlcmlhbGlzZXIiLCJvcGFxdWUiXSxbInR5cGUiLCJQb3NpeFBhdGgiXV19"
+    },
+    "sha3_512_tide:601b7073d3a965fe983c5ee33e05eca69be2fd69f08b30287e77c2fbbbd835c8e39e947a314edf64fe0e67841407999c8e53edc1327dbfedf08ae8ebbae79b7b": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW1SaGRHRXVZM04ySWc9PSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:62e1e1adddaccad28ed3e8fa108070545354398a06af9c20ebfdc37fe5e3fbb6ca8b3c4e3251e8e89041d5a03ad6ab9df637fd01c4492bf7682c2acec50487aa": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW1OdmRXNTBJZz09In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:63204cbbd39149c85c01d9e41e1c468589f1cb8a2429c34070de0f7318094e5a452607a332959fe8367bc1eb3c14302ba0ae056370f43c237aac9d40e9ee5d43": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJub25lIl0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInBheWxvYWQiLHsiJHR5cGUiOiJieXRlcyIsImJhc2U2NCI6ImJuVnNiQT09In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:688fb4a74bc08317ac21e898725c2e214e0b9f72fafe1a53cdb9996a21bda85cf04cab8a3ea7563de2fca6de2c02a0caec9d9f5f2cdb154be32deeebe9a40d24": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiT0RRPSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:7df0fefd8271f449b54fd47fbfd1491794570f8e1d3c56d523f977d3eede445bc418476ed1d3316a76a671f014d0203d6047392b7467f6e430325d2d5f12076b": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJsaXN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfMSJdXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF80Il1dfSx7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzYiXV19LHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfOCJdXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xMCJdXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xMSJdXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xMyJdXX1dXSxbImtpbmQiLCJsaXN0Il0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInNlcmlhbGlzZXIiLCJjb250YWluZXIiXV19"
+    },
+    "sha3_512_tide:7fcd8f848b96289e2ac68e33282b87ee8d147367e855e641f65d1660a91bd5213e2b9d9bb54b997c0c1d524ad0035441acd642436e7cd1bfbc3ff738fc6a0ed7": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV1dfSx7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyJrZXkiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfMyJdXX1dLFsidmFsdWUiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfNCJdXX1dXX1dXSxbImtpbmQiLCJkaWN0Il0sWyJtZXRhZGF0YSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W119XSxbInNlcmlhbGlzZXIiLCJjb250YWluZXIiXV19"
+    },
+    "sha3_512_tide:935affbcf1522ab4693b04f90a3caffed7af52f7cd88b927e987ab4336c7e0c80d144bc20700f7c04a49479517c89600debec1f2704502b4235601851b372e8d": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJmbG9hdCJdLFsibWV0YWRhdGEiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltdfV0sWyJwYXlsb2FkIix7IiR0eXBlIjoiYnl0ZXMiLCJiYXNlNjQiOiJNakV1TUE9PSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:a42b996148b3883111166d55ebe45fb00d224adb1d550bfa619fc646419a045cb1f66f3242b1ae83f1f5997fbf72d5caced0720dd1ece9f3c6a2ce2a6a487d05": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW5ScGRHeGxJZz09In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:a4fd453d336045bce49a024ffc81ab228447fd447b29592620b54d9ec1e959a15b749291648b8f951b6ee5287010b9489a0c8ad7aa6a59cdfe4144f6d0f11e80": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWlJPSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:ac836cd9a36fb8893932e0d06bb65cd4c8d026470aa8c6885ec8b0261ac9d9e3ec3f50a660273e5b7187601d479689e660c4deb2db92cdaca929ec68c0e7ebcf": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF81Il1dfV1dfV1dLFsia2luZCIsImRpY3QiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsic2VyaWFsaXNlciIsImNvbnRhaW5lciJdXX0="
+    },
+    "sha3_512_tide:bc465dc42ca13fea3f6f8b3732284b51f8ef1f2ecae97ebf96c9ab54c9ae5bdee584b1a52d54b435d48c72f7b306296f2f7ed5725c18d7283c6bfb095c2baf43": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8xIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV1dfSx7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyJrZXkiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfMyJdXX1dLFsidmFsdWUiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfNCJdXX1dXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1sia2V5Iix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzUiXV19XSxbInZhbHVlIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzYiXV19XV19XV0sWyJraW5kIiwiZGljdCJdLFsibWV0YWRhdGEiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltdfV0sWyJzZXJpYWxpc2VyIiwiY29udGFpbmVyIl1dfQ=="
+    },
+    "sha3_512_tide:bcd5b57dc58c93684b952f3f1f21172fe4126155267bfaf28882903981caa7fe502619faa550a46dc4bb9ac5900c787f9a625828a00d1ba562d04d840bd97d3c": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW1SbGJXOXpMM0JwY0dWc2FXNWxMM0J5YjJObGMzTmxaRjlrWVhSaExtTnpkaUk9In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:bcfd1dfa3d1b1df407d7306fe482dd2459440b6a6cac5817e2638e2a8f39e43a836fc12b1ef9de6dff81ba57222a8b59ef75dc237bee89fb66cec14509a7b9fb": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWpjaSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:c0b712f7335ac0e2a7e3bc4d3d948a69a338ca19cf9e5dd89a32914a99ddd7c84660f4d03fe0361c67baf22497440114214016bc138b8d36852e7df644761e26": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiTkE9PSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:c312bdd71be1214c39e35eb308ed18bcbba8bdafc524370c5456c0ff0f0e32dfe03b535a2718b1abdd21e942e6f3af34a98f46161034501f4bb6b3346ed8b6dc": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWlBaSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:c51ce271904eda16fed4b85e2115fc2e5b04333f8f79340309cffae5f2861bdb42acc7d9a9f0e5c71ab6f6b83f62663ff364dc0aae67a98bdda12e92c8463324": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF85Il1dfV1dfV1dLFsia2luZCIsImRpY3QiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsic2VyaWFsaXNlciIsImNvbnRhaW5lciJdXX0="
+    },
+    "sha3_512_tide:d435fa9d1fc09c01e4d7dd380150178268712a2fd03812eb93d151b446a8b7a7fb9e523dada1dcb26abd4c1517ad4124b1b3255a7281947e99e1a965e90901aa": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW5aaGJIVmxJZz09In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:d78812f0033f827216c0d764b11a2d0c1fe3b32f6933b42eb23405216f3644d73eeb9ac7a35fd3c9e4e5125fb0ed380f29a0b9b824724f7e5bbd8c1ebe418567": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiTWpVPSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:dabfba65f04e7de2643c017db81b9067ccf4d21189f2a67fd39783b4aa396c28fffb9c8d8793b0fa122808ef9e6f2baffe5a28f305c1a213d6ebbda53971a45d": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF81Il1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF82Il1dfV1dfSx7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyJrZXkiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfNyJdXX1dLFsidmFsdWUiLHsiJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbIiRyZWYiLCJvYmplY3RfOCJdXX1dXX0seyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1sia2V5Iix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzkiXV19XSxbInZhbHVlIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbWyIkcmVmIiwib2JqZWN0XzEwIl1dfV1dfV1dLFsia2luZCIsImRpY3QiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsic2VyaWFsaXNlciIsImNvbnRhaW5lciJdXX0="
+    },
+    "sha3_512_tide:dd1fdfd21a402d293908299d2b24ffb543ce108129533351762abe70f422c7d7e3b853c024217408e9c3a5e7aac2e53d45ddfeda3f951af546ec4b3ad094479a": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSWxCcGNHVnNhVzVsSUZOMWJXMWhjbmtpIn1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:f2a501d1c6ee35850ecf1b5900c867751db587ae83d09c7992705efb83e4cf59c323f3d0d8d0b6284fcf5848abf9cc3ec79ab230df27d8ef2735df7f7f3c05cb": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29udGFpbmVyX3R5cGUiLCJkaWN0Il0sWyJpdGVtcyIsW3siJHR5cGUiOiJkaWN0IiwiaXRlbXMiOltbImtleSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8yIl1dfV0sWyJ2YWx1ZSIseyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siJHJlZiIsIm9iamVjdF8zIl1dfV1dfV1dLFsia2luZCIsImRpY3QiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsic2VyaWFsaXNlciIsImNvbnRhaW5lciJdXX0="
+    },
+    "sha3_512_tide:f5c4b2e8f17d579dd2d362a720cbe9e0b1bf21e87f9f571fea9378676115aef2acf03aee73b3c15a87bbd27c55483f368cca667e670c961132b69f8603c62c8c": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiTVRBPSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:f77dc1b66c092b73c885881a8a777bb4cdc34c2d973cdcc853b3f5f9cc8dc6a69db00c9baf38be747eb16771d15071cb364426b0193fc4d4247e3d69b0a3254c": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW5OMWJXMWhjbmtpIn1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    },
+    "sha3_512_tide:fa8560e5a4f1cb09d70001a854f83495ce922ddfd353ea6d21fcdfa2df8ba15eff77bf5fc490e9ff22578b47ec275ecaa6c157585ca40910c76f4532e887dec7": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJpbnQiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiTkRJPSJ9XSxbInNlcmlhbGlzZXIiLCJwcmltaXRpdmUiXV19"
+    },
+    "sha3_512_tide:fe674f1608c4d18d8848c6e025fbba8414a14a5559abc3019571157cbf606bfaee3b5aed7162ea00d912f8f359d729cd132f6c1812519c41291dd8db086c4470": {
+      "$tide_json_type": "bytes",
+      "base64": "eyIkdHlwZSI6ImRpY3QiLCJpdGVtcyI6W1siY29kZWMiLCJqc29uIl0sWyJjb2RlY192ZXJzaW9uIiwxXSxbImtpbmQiLCJzdHIiXSxbIm1ldGFkYXRhIix7IiR0eXBlIjoiZGljdCIsIml0ZW1zIjpbXX1dLFsicGF5bG9hZCIseyIkdHlwZSI6ImJ5dGVzIiwiYmFzZTY0IjoiSW5SdmRHRnNJZz09In1dLFsic2VyaWFsaXNlciIsInByaW1pdGl2ZSJdXX0="
+    }
+  },
+  "manifest": {
+    "cas_index": {
+      "sha3_512_tide:40ffe791be10cba8c6fd401ebfbc411cb8fdad1eae5e7b5eb5593a2fe1c11c77a5f1b41359f584e2674a137a82c07dc8dae089df807a4403b3f747f20c7bb3be": [
+        "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+      ],
+      "sha3_512_tide:48a3bc58abc1ab1ac0aac19ab369f1d94948609212955969bf8e9b0cf09293ab7909a86bfc5b44dd555e1c41988456edbfb4a6ed059c96e5504d234612acd010": [
+        "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da"
+      ],
+      "sha3_512_tide:56e6a2e3e5b091a36e902f7db38c7a503ad7b5e74f9be1e17a7213aef4c90e7a00989ddfbcbd1444bbc42270fa68a736bdb111b92157752e031941a95e76fda7": [
+        "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f"
+      ],
+      "sha3_512_tide:601b7073d3a965fe983c5ee33e05eca69be2fd69f08b30287e77c2fbbbd835c8e39e947a314edf64fe0e67841407999c8e53edc1327dbfedf08ae8ebbae79b7b": [
+        "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666"
+      ],
+      "sha3_512_tide:63204cbbd39149c85c01d9e41e1c468589f1cb8a2429c34070de0f7318094e5a452607a332959fe8367bc1eb3c14302ba0ae056370f43c237aac9d40e9ee5d43": [
+        "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00"
+      ],
+      "sha3_512_tide:7df0fefd8271f449b54fd47fbfd1491794570f8e1d3c56d523f977d3eede445bc418476ed1d3316a76a671f014d0203d6047392b7467f6e430325d2d5f12076b": [
+        "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+      ],
+      "sha3_512_tide:7fcd8f848b96289e2ac68e33282b87ee8d147367e855e641f65d1660a91bd5213e2b9d9bb54b997c0c1d524ad0035441acd642436e7cd1bfbc3ff738fc6a0ed7": [
+        "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e"
+      ],
+      "sha3_512_tide:bc465dc42ca13fea3f6f8b3732284b51f8ef1f2ecae97ebf96c9ab54c9ae5bdee584b1a52d54b435d48c72f7b306296f2f7ed5725c18d7283c6bfb095c2baf43": [
+        "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+      ],
+      "sha3_512_tide:bcd5b57dc58c93684b952f3f1f21172fe4126155267bfaf28882903981caa7fe502619faa550a46dc4bb9ac5900c787f9a625828a00d1ba562d04d840bd97d3c": [
+        "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc"
+      ]
+    },
+    "codec_version": 1,
+    "kind": "tide_trace_values",
+    "metadata": {},
+    "ref_index": {
+      "global:EXP_PATH": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:48a3bc58abc1ab1ac0aac19ab369f1d94948609212955969bf8e9b0cf09293ab7909a86bfc5b44dd555e1c41988456edbfb4a6ed059c96e5504d234612acd010",
+            "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da"
+          }
+        }
+      },
+      "global:LOAD_FILE": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:601b7073d3a965fe983c5ee33e05eca69be2fd69f08b30287e77c2fbbbd835c8e39e947a314edf64fe0e67841407999c8e53edc1327dbfedf08ae8ebbae79b7b",
+            "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666"
+          }
+        }
+      },
+      "global:LOAD_PATH": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:56e6a2e3e5b091a36e902f7db38c7a503ad7b5e74f9be1e17a7213aef4c90e7a00989ddfbcbd1444bbc42270fa68a736bdb111b92157752e031941a95e76fda7",
+            "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f"
+          }
+        }
+      },
+      "global:clean_data": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:40ffe791be10cba8c6fd401ebfbc411cb8fdad1eae5e7b5eb5593a2fe1c11c77a5f1b41359f584e2674a137a82c07dc8dae089df807a4403b3f747f20c7bb3be",
+            "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+          }
+        }
+      },
+      "global:export_path": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:bcd5b57dc58c93684b952f3f1f21172fe4126155267bfaf28882903981caa7fe502619faa550a46dc4bb9ac5900c787f9a625828a00d1ba562d04d840bd97d3c",
+            "value_hash": "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc"
+          }
+        }
+      },
+      "global:processed_data": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:bc465dc42ca13fea3f6f8b3732284b51f8ef1f2ecae97ebf96c9ab54c9ae5bdee584b1a52d54b435d48c72f7b306296f2f7ed5725c18d7283c6bfb095c2baf43",
+            "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+          }
+        }
+      },
+      "global:raw_data": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:7df0fefd8271f449b54fd47fbfd1491794570f8e1d3c56d523f977d3eede445bc418476ed1d3316a76a671f014d0203d6047392b7467f6e430325d2d5f12076b",
+            "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+          }
+        }
+      },
+      "global:report": {
+        "versions": {
+          "0": {
+            "root_cas_ref": "sha3_512_tide:7fcd8f848b96289e2ac68e33282b87ee8d147367e855e641f65d1660a91bd5213e2b9d9bb54b997c0c1d524ad0035441acd642436e7cd1bfbc3ff738fc6a0ed7",
+            "value_hash": "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e"
+          }
+        }
+      }
+    },
+    "run": {
+      "codec_version": 2,
+      "exec_records": [
+        {
+          "base_node_content_id": null,
+          "base_node_id": null,
+          "content_id": null,
+          "declared_deps": [],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:LOAD_FILE"
+          ],
+          "duration_ms": null,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:0c95f79b1b444a40895ad9e20eacafee",
+          "finished_at": null,
+          "func_name": "TIDE_USER",
+          "handled_raise": false,
+          "node_id": "unknown",
+          "node_options": {},
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00",
+          "pipeline_id": "TIDE: .event(TIDE_USER[0])",
+          "reads": [],
+          "resolve_output": true,
+          "runner_id": "TIDE: .event()",
+          "runtime_effects": [],
+          "runtime_targets": [],
+          "seq_id": 0,
+          "started_at": null,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "declared",
+              "observed_mutable": false,
+              "reference": "global:LOAD_FILE",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "'data.csv'",
+                  "type": "str",
+                  "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": null,
+          "base_node_id": null,
+          "content_id": null,
+          "declared_deps": [],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:LOAD_PATH"
+          ],
+          "duration_ms": null,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:e2c6a8a509394d7895e69e285bfe62a1",
+          "finished_at": null,
+          "func_name": "TIDE_USER",
+          "handled_raise": false,
+          "node_id": "unknown",
+          "node_options": {},
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00",
+          "pipeline_id": "TIDE: .event(TIDE_USER[1])",
+          "reads": [],
+          "resolve_output": true,
+          "runner_id": "TIDE: .event()",
+          "runtime_effects": [],
+          "runtime_targets": [],
+          "seq_id": 1,
+          "started_at": null,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "declared",
+              "observed_mutable": false,
+              "reference": "global:LOAD_PATH",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": null,
+          "base_node_id": null,
+          "content_id": null,
+          "declared_deps": [],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:EXP_PATH"
+          ],
+          "duration_ms": null,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:9eb8f283c8044eb989c087a2b10defa8",
+          "finished_at": null,
+          "func_name": "TIDE_USER",
+          "handled_raise": false,
+          "node_id": "unknown",
+          "node_options": {},
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00",
+          "pipeline_id": "TIDE: .event(TIDE_USER[2])",
+          "reads": [],
+          "resolve_output": true,
+          "runner_id": "TIDE: .event()",
+          "runtime_effects": [],
+          "runtime_targets": [],
+          "seq_id": 2,
+          "started_at": null,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "declared",
+              "observed_mutable": false,
+              "reference": "global:EXP_PATH",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline/processed_data.csv')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": "b\"('load', ('@LOAD_PATH', '@LOAD_FILE'), {}, None, None, None, None, ['global:raw_data'], False)\"",
+          "base_node_id": "'e6b93a64d9334aea8890147a03fd54dc'",
+          "content_id": "b\"('load', ('@LOAD_PATH', '@LOAD_FILE'), {}, None, None, None, None, ['global:raw_data'], False)\"",
+          "declared_deps": [
+            "global:LOAD_PATH",
+            "global:LOAD_FILE"
+          ],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:raw_data"
+          ],
+          "duration_ms": 0.0009012222290039062,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:ef0f7c0a798d4deebf71f3a36eb5dbf5",
+          "finished_at": 1786577613.3683114,
+          "func_name": "load",
+          "handled_raise": false,
+          "node_id": 0,
+          "node_options": {
+            "inject_data_store": false,
+            "recompute": false,
+            "resolve_output": false
+          },
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725",
+          "pipeline_id": 0,
+          "reads": [
+            {
+              "input_index": 0,
+              "input_name": "args",
+              "input_path": [
+                0
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "TIDE_USER",
+                "ocean": 0,
+                "runner": "TIDE: .event()"
+              },
+              "producer_exec_id": "TIDE_EXEC:e2c6a8a509394d7895e69e285bfe62a1",
+              "producer_source": "TIDE: .event()",
+              "reference": "global:LOAD_PATH",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f",
+              "version": 0
+            },
+            {
+              "input_index": 1,
+              "input_name": "args",
+              "input_path": [
+                1
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "TIDE_USER",
+                "ocean": 0,
+                "runner": "TIDE: .event()"
+              },
+              "producer_exec_id": "TIDE_EXEC:0c95f79b1b444a40895ad9e20eacafee",
+              "producer_source": "TIDE: .event()",
+              "reference": "global:LOAD_FILE",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "'data.csv'",
+                  "type": "str",
+                  "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "'data.csv'",
+                  "type": "str",
+                  "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666",
+              "version": 0
+            }
+          ],
+          "resolve_output": false,
+          "runner_id": "TIDE: .exec(0)",
+          "runtime_effects": [],
+          "runtime_targets": [
+            "global:raw_data"
+          ],
+          "seq_id": 3,
+          "started_at": 1786577613.3674102,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "TIDE: node write",
+              "observed_mutable": false,
+              "reference": "global:raw_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "result",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': '10'}, {'value': ''}, {'value': '25'}, {'value': '7'}, {'value': ''}, {'value': '42'}, {'value': ' '}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+                },
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': '10'}, {'value': ''}, {'value': '25'}, {'value': '7'}, {'value': ''}, {'value': '42'}, {'value': ' '}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": "b\"('clean', ('@raw_data',), {}, None, None, None, None, ['global:clean_data'], False)\"",
+          "base_node_id": "'d3b7efa769a64495a2bc5934f88a6ac4'",
+          "content_id": "b\"('clean', ('@raw_data',), {}, None, None, None, None, ['global:clean_data'], False)\"",
+          "declared_deps": [
+            "global:raw_data"
+          ],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:clean_data"
+          ],
+          "duration_ms": 0.0019257068634033203,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:03a9d7c61a7c444a999ab83f356f1a6a",
+          "finished_at": 1786577613.3995159,
+          "func_name": "clean",
+          "handled_raise": false,
+          "node_id": 0,
+          "node_options": {
+            "inject_data_store": false,
+            "recompute": false,
+            "resolve_output": false
+          },
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1",
+          "pipeline_id": 1,
+          "reads": [
+            {
+              "input_index": 0,
+              "input_name": "args",
+              "input_path": [
+                0
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "load",
+                "ocean": 0,
+                "runner": "TIDE: .exec(0)"
+              },
+              "producer_exec_id": "TIDE_EXEC:ef0f7c0a798d4deebf71f3a36eb5dbf5",
+              "producer_source": "TIDE: .exec(0)",
+              "reference": "global:raw_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': '10'}, {'value': ''}, {'value': '25'}, {'value': '7'}, {'value': ''}, {'value': '42'}, {'value': ' '}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': '10'}, {'value': ''}, {'value': '25'}, {'value': '7'}, {'value': ''}, {'value': '42'}, {'value': ' '}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725",
+              "version": 0
+            }
+          ],
+          "resolve_output": false,
+          "runner_id": "TIDE: .exec(1)",
+          "runtime_effects": [],
+          "runtime_targets": [
+            "global:clean_data"
+          ],
+          "seq_id": 4,
+          "started_at": 1786577613.3975902,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "TIDE: node write",
+              "observed_mutable": false,
+              "reference": "global:clean_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "result",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': 10}, {'value': 25}, {'value': 7}, {'value': 42}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+                },
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': 10}, {'value': 25}, {'value': 7}, {'value': 42}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": "b\"('process', ('@clean_data',), {}, None, None, None, None, ['global:processed_data'], False)\"",
+          "base_node_id": "'ea510910477245db9fe29bd00a78b132'",
+          "content_id": "b\"('process', ('@clean_data',), {}, None, None, None, None, ['global:processed_data'], False)\"",
+          "declared_deps": [
+            "global:clean_data"
+          ],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:processed_data"
+          ],
+          "duration_ms": 0.0009272098541259766,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:efdc884f556e4077931a9b5d531b5684",
+          "finished_at": 1786577613.4274893,
+          "func_name": "process",
+          "handled_raise": false,
+          "node_id": 0,
+          "node_options": {
+            "inject_data_store": false,
+            "recompute": false,
+            "resolve_output": false
+          },
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb",
+          "pipeline_id": 2,
+          "reads": [
+            {
+              "input_index": 0,
+              "input_name": "args",
+              "input_path": [
+                0
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "clean",
+                "ocean": 0,
+                "runner": "TIDE: .exec(1)"
+              },
+              "producer_exec_id": "TIDE_EXEC:03a9d7c61a7c444a999ab83f356f1a6a",
+              "producer_source": "TIDE: .exec(1)",
+              "reference": "global:clean_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': 10}, {'value': 25}, {'value': 7}, {'value': 42}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "[{'value': 10}, {'value': 25}, {'value': 7}, {'value': 42}]",
+                  "type": "list",
+                  "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1",
+              "version": 0
+            }
+          ],
+          "resolve_output": false,
+          "runner_id": "TIDE: .exec(2)",
+          "runtime_effects": [],
+          "runtime_targets": [
+            "global:processed_data"
+          ],
+          "seq_id": 5,
+          "started_at": 1786577613.426562,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "TIDE: node write",
+              "observed_mutable": false,
+              "reference": "global:processed_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "result",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                },
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": "b\"('report', ('@processed_data',), {}, None, None, None, None, ['global:report'], False)\"",
+          "base_node_id": "'ce81ee4e1bf94e939ad176d581e4c32f'",
+          "content_id": "b\"('report', ('@processed_data',), {}, None, None, None, None, ['global:report'], False)\"",
+          "declared_deps": [
+            "global:processed_data"
+          ],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:report"
+          ],
+          "duration_ms": 0.0008502006530761719,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:bf199d49dd654b37bcc8f40751c2b20d",
+          "finished_at": 1786577613.452281,
+          "func_name": "report",
+          "handled_raise": false,
+          "node_id": 0,
+          "node_options": {
+            "inject_data_store": false,
+            "recompute": false,
+            "resolve_output": false
+          },
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e",
+          "pipeline_id": 3,
+          "reads": [
+            {
+              "input_index": 0,
+              "input_name": "args",
+              "input_path": [
+                0
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "process",
+                "ocean": 0,
+                "runner": "TIDE: .exec(2)"
+              },
+              "producer_exec_id": "TIDE_EXEC:efdc884f556e4077931a9b5d531b5684",
+              "producer_source": "TIDE: .exec(2)",
+              "reference": "global:processed_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb",
+              "version": 0
+            }
+          ],
+          "resolve_output": false,
+          "runner_id": "TIDE: .exec(3)",
+          "runtime_effects": [],
+          "runtime_targets": [
+            "global:report"
+          ],
+          "seq_id": 6,
+          "started_at": 1786577613.4514308,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "TIDE: node write",
+              "observed_mutable": false,
+              "reference": "global:report",
+              "snapshot_lineage": [
+                {
+                  "boundary": "result",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'title': 'Pipeline Summary', 'summary': {'count': 4, 'total': 84, 'average': 21.0}}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e"
+                },
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'title': 'Pipeline Summary', 'summary': {'count': 4, 'total': 84, 'average': 21.0}}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e",
+              "version": 0
+            }
+          ]
+        },
+        {
+          "base_node_content_id": "b\"('export', ('@processed_data', '@EXP_PATH'), {}, None, None, None, None, ['global:export_path'], False)\"",
+          "base_node_id": "'784dc69f08a34383981c2ad09875db5a'",
+          "content_id": "b\"('export', ('@processed_data', '@EXP_PATH'), {}, None, None, None, None, ['global:export_path'], False)\"",
+          "declared_deps": [
+            "global:processed_data",
+            "global:EXP_PATH"
+          ],
+          "declared_effects": [],
+          "declared_targets": [
+            "global:export_path"
+          ],
+          "duration_ms": 0.0012164115905761719,
+          "effects": [],
+          "emitted_by": null,
+          "emitted_nodes": [],
+          "error": null,
+          "exec_id": "TIDE_EXEC:39eea975e2fe42b387cd3cdd62dee07c",
+          "finished_at": 1786577613.482514,
+          "func_name": "export",
+          "handled_raise": false,
+          "node_id": 0,
+          "node_options": {
+            "inject_data_store": false,
+            "recompute": false,
+            "resolve_output": false
+          },
+          "ocean_id": 0,
+          "output_value_available": true,
+          "output_value_hash": "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc",
+          "pipeline_id": 4,
+          "reads": [
+            {
+              "input_index": 0,
+              "input_name": "args",
+              "input_path": [
+                0
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "process",
+                "ocean": 0,
+                "runner": "TIDE: .exec(2)"
+              },
+              "producer_exec_id": "TIDE_EXEC:efdc884f556e4077931a9b5d531b5684",
+              "producer_source": "TIDE: .exec(2)",
+              "reference": "global:processed_data",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "{'count': 4, 'total': 84, 'average': 21.0}",
+                  "type": "dict",
+                  "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb",
+              "version": 0
+            },
+            {
+              "input_index": 1,
+              "input_name": "args",
+              "input_path": [
+                1
+              ],
+              "observed_mutable": false,
+              "producer_actor": {
+                "name": "TIDE_USER",
+                "ocean": 0,
+                "runner": "TIDE: .event()"
+              },
+              "producer_exec_id": "TIDE_EXEC:9eb8f283c8044eb989c087a2b10defa8",
+              "producer_source": "TIDE: .event()",
+              "reference": "global:EXP_PATH",
+              "snapshot_lineage": [
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline/processed_data.csv')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da"
+                },
+                {
+                  "boundary": "read",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "PosixPath('demos/pipeline/processed_data.csv')",
+                  "type": "PosixPath",
+                  "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da"
+                }
+              ],
+              "type": "static",
+              "value_available": true,
+              "value_hash": "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da",
+              "version": 0
+            }
+          ],
+          "resolve_output": false,
+          "runner_id": "TIDE: .exec(4)",
+          "runtime_effects": [],
+          "runtime_targets": [
+            "global:export_path"
+          ],
+          "seq_id": 7,
+          "started_at": 1786577613.4812975,
+          "status": "succeeded",
+          "unscoped_store_refs": [
+            "global"
+          ],
+          "writes": [
+            {
+              "cause": "TIDE: node write",
+              "observed_mutable": false,
+              "reference": "global:export_path",
+              "snapshot_lineage": [
+                {
+                  "boundary": "result",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "'demos/pipeline/processed_data.csv'",
+                  "type": "str",
+                  "value_hash": "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc"
+                },
+                {
+                  "boundary": "write",
+                  "capture_method": "deepcopy",
+                  "exact": true,
+                  "observed_mutable": false,
+                  "repr": "'demos/pipeline/processed_data.csv'",
+                  "type": "str",
+                  "value_hash": "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc"
+                }
+              ],
+              "value_available": true,
+              "value_hash": "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc",
+              "version": 0
+            }
+          ]
+        }
+      ],
+      "kind": "tide_run",
+      "trace": {
+        "name": "TIDE: .trace()",
+        "ocean_id": 0,
+        "pipeline": "MULTIPLE (6)",
+        "run": "MULTIPLE (6)",
+        "sources": [
+          {
+            "pipeline": "TIDE: .event()",
+            "pipeline_id": "TIDE: .event(TIDE_USER[0])",
+            "run": "TIDE: .event()"
+          },
+          {
+            "pipeline": "TIDE: .exec(load[0])",
+            "pipeline_id": 0,
+            "run": "TIDE: .exec(0)"
+          },
+          {
+            "pipeline": "TIDE: .exec(clean[1])",
+            "pipeline_id": 1,
+            "run": "TIDE: .exec(1)"
+          },
+          {
+            "pipeline": "TIDE: .exec(process[2])",
+            "pipeline_id": 2,
+            "run": "TIDE: .exec(2)"
+          },
+          {
+            "pipeline": "TIDE: .exec(report[3])",
+            "pipeline_id": 3,
+            "run": "TIDE: .exec(3)"
+          },
+          {
+            "pipeline": "TIDE: .exec(export[4])",
+            "pipeline_id": 4,
+            "run": "TIDE: .exec(4)"
+          }
+        ]
+      }
+    },
+    "trace": {
+      "name": "TIDE: .trace()",
+      "ocean_id": 0,
+      "pipeline": "MULTIPLE (6)",
+      "run": "MULTIPLE (6)",
+      "sources": [
+        {
+          "pipeline": "TIDE: .event()",
+          "pipeline_id": "TIDE: .event(TIDE_USER[0])",
+          "run": "TIDE: .event()"
+        },
+        {
+          "pipeline": "TIDE: .exec(load[0])",
+          "pipeline_id": 0,
+          "run": "TIDE: .exec(0)"
+        },
+        {
+          "pipeline": "TIDE: .exec(clean[1])",
+          "pipeline_id": 1,
+          "run": "TIDE: .exec(1)"
+        },
+        {
+          "pipeline": "TIDE: .exec(process[2])",
+          "pipeline_id": 2,
+          "run": "TIDE: .exec(2)"
+        },
+        {
+          "pipeline": "TIDE: .exec(report[3])",
+          "pipeline_id": 3,
+          "run": "TIDE: .exec(3)"
+        },
+        {
+          "pipeline": "TIDE: .exec(export[4])",
+          "pipeline_id": 4,
+          "run": "TIDE: .exec(4)"
+        }
+      ]
+    },
+    "value_hash_codec": "tide_serialised_bytes_v1",
+    "value_index": {
+      "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725": [
+        {
+          "ref": "global:raw_data",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e": [
+        {
+          "ref": "global:report",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da": [
+        {
+          "ref": "global:EXP_PATH",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb": [
+        {
+          "ref": "global:processed_data",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f": [
+        {
+          "ref": "global:LOAD_PATH",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00": [],
+      "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666": [
+        {
+          "ref": "global:LOAD_FILE",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc": [
+        {
+          "ref": "global:export_path",
+          "version": 0
+        }
+      ],
+      "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1": [
+        {
+          "ref": "global:clean_data",
+          "version": 0
+        }
+      ]
+    },
+    "values": {
+      "sha3_512_tide:2bda475adbc8f21d06db4b91e5442f7abe752428653dd135e2d05a37c65eacedd862d81cd58cefe97ae14b48247ace4469608a319864dc9db26e2dd8e1184725": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:7df0fefd8271f449b54fd47fbfd1491794570f8e1d3c56d523f977d3eede445bc418476ed1d3316a76a671f014d0203d6047392b7467f6e430325d2d5f12076b",
+            "object_1": "sha3_512_tide:f2a501d1c6ee35850ecf1b5900c867751db587ae83d09c7992705efb83e4cf59c323f3d0d8d0b6284fcf5848abf9cc3ec79ab230df27d8ef2735df7f7f3c05cb",
+            "object_10": "sha3_512_tide:ac836cd9a36fb8893932e0d06bb65cd4c8d026470aa8c6885ec8b0261ac9d9e3ec3f50a660273e5b7187601d479689e660c4deb2db92cdaca929ec68c0e7ebcf",
+            "object_11": "sha3_512_tide:45356b5fff5fa157cb69fb82de6c137e27ddca6425f80928061fb79396827345e5253877a9868fce001663e0bcfecb1ba9879b3aa315fc50d298acf590de90e9",
+            "object_12": "sha3_512_tide:09362107366fc5dc41ed2c4532b932be94f82dc013d11f7717d246bf784c481680a9071c2df6713532e9e4a0cb13d559409a270b4cf672d3cf4a5277389f0485",
+            "object_13": "sha3_512_tide:3f80e19f373cfb7d0a3256f673ca36150137f159357b99a2ec0223775df93fc11e5f671e527d188d0792762ae262aa9773834bf0adef662c1704c552f635bbd4",
+            "object_14": "sha3_512_tide:c312bdd71be1214c39e35eb308ed18bcbba8bdafc524370c5456c0ff0f0e32dfe03b535a2718b1abdd21e942e6f3af34a98f46161034501f4bb6b3346ed8b6dc",
+            "object_2": "sha3_512_tide:d435fa9d1fc09c01e4d7dd380150178268712a2fd03812eb93d151b446a8b7a7fb9e523dada1dcb26abd4c1517ad4124b1b3255a7281947e99e1a965e90901aa",
+            "object_3": "sha3_512_tide:36eb7c5da5351a9cad504ef3ea4038f8e8619744363121599aca4a15d0f12cdda3f233121b5e656320829f4d0abb46046ff806437e59df4f28d24ab745c165af",
+            "object_4": "sha3_512_tide:ac836cd9a36fb8893932e0d06bb65cd4c8d026470aa8c6885ec8b0261ac9d9e3ec3f50a660273e5b7187601d479689e660c4deb2db92cdaca929ec68c0e7ebcf",
+            "object_5": "sha3_512_tide:a4fd453d336045bce49a024ffc81ab228447fd447b29592620b54d9ec1e959a15b749291648b8f951b6ee5287010b9489a0c8ad7aa6a59cdfe4144f6d0f11e80",
+            "object_6": "sha3_512_tide:48a245bee0d19bf5638f67e0d5bc4e14d875c5a3e2ab4a2b73d271384244bd3fa8025a0a967d3b32a1520f2e9128f19de8ea9810748d9b98f96d396cb762a516",
+            "object_7": "sha3_512_tide:420e20010cc20762633c56f2c61dd831bf415ab27eab244611f7a7990cc3de09e5a403694d282ed215435089df4b8ebbd6084c94bc0043280674fdc504753609",
+            "object_8": "sha3_512_tide:c51ce271904eda16fed4b85e2115fc2e5b04333f8f79340309cffae5f2861bdb42acc7d9a9f0e5c71ab6f6b83f62663ff364dc0aae67a98bdda12e92c8463324",
+            "object_9": "sha3_512_tide:bcfd1dfa3d1b1df407d7306fe482dd2459440b6a6cac5817e2638e2a8f39e43a836fc12b1ef9de6dff81ba57222a8b59ef75dc237bee89fb66cec14509a7b9fb"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:7df0fefd8271f449b54fd47fbfd1491794570f8e1d3c56d523f977d3eede445bc418476ed1d3316a76a671f014d0203d6047392b7467f6e430325d2d5f12076b"
+      },
+      "sha3_512_tide:36d39ab08e0bfe825f772d9930c5db5860debf09b58c1f0ce2bdc26715939c5da6ac5dcf85a9c7f302e7be80b37d8011c8d507dab13bfbbdbaba2dffedbb4d0e": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:7fcd8f848b96289e2ac68e33282b87ee8d147367e855e641f65d1660a91bd5213e2b9d9bb54b997c0c1d524ad0035441acd642436e7cd1bfbc3ff738fc6a0ed7",
+            "object_1": "sha3_512_tide:a42b996148b3883111166d55ebe45fb00d224adb1d550bfa619fc646419a045cb1f66f3242b1ae83f1f5997fbf72d5caced0720dd1ece9f3c6a2ce2a6a487d05",
+            "object_10": "sha3_512_tide:935affbcf1522ab4693b04f90a3caffed7af52f7cd88b927e987ab4336c7e0c80d144bc20700f7c04a49479517c89600debec1f2704502b4235601851b372e8d",
+            "object_2": "sha3_512_tide:dd1fdfd21a402d293908299d2b24ffb543ce108129533351762abe70f422c7d7e3b853c024217408e9c3a5e7aac2e53d45ddfeda3f951af546ec4b3ad094479a",
+            "object_3": "sha3_512_tide:f77dc1b66c092b73c885881a8a777bb4cdc34c2d973cdcc853b3f5f9cc8dc6a69db00c9baf38be747eb16771d15071cb364426b0193fc4d4247e3d69b0a3254c",
+            "object_4": "sha3_512_tide:dabfba65f04e7de2643c017db81b9067ccf4d21189f2a67fd39783b4aa396c28fffb9c8d8793b0fa122808ef9e6f2baffe5a28f305c1a213d6ebbda53971a45d",
+            "object_5": "sha3_512_tide:62e1e1adddaccad28ed3e8fa108070545354398a06af9c20ebfdc37fe5e3fbb6ca8b3c4e3251e8e89041d5a03ad6ab9df637fd01c4492bf7682c2acec50487aa",
+            "object_6": "sha3_512_tide:c0b712f7335ac0e2a7e3bc4d3d948a69a338ca19cf9e5dd89a32914a99ddd7c84660f4d03fe0361c67baf22497440114214016bc138b8d36852e7df644761e26",
+            "object_7": "sha3_512_tide:fe674f1608c4d18d8848c6e025fbba8414a14a5559abc3019571157cbf606bfaee3b5aed7162ea00d912f8f359d729cd132f6c1812519c41291dd8db086c4470",
+            "object_8": "sha3_512_tide:688fb4a74bc08317ac21e898725c2e214e0b9f72fafe1a53cdb9996a21bda85cf04cab8a3ea7563de2fca6de2c02a0caec9d9f5f2cdb154be32deeebe9a40d24",
+            "object_9": "sha3_512_tide:2d6ed8c0c30097f768b4b5e8c6df64d851d7d5b4259cbeada167691f8aec7008a495e68418b939d2450ee8f12c9cccf1701959f81b67e0ab09ea03161a5fcfd7"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:7fcd8f848b96289e2ac68e33282b87ee8d147367e855e641f65d1660a91bd5213e2b9d9bb54b997c0c1d524ad0035441acd642436e7cd1bfbc3ff738fc6a0ed7"
+      },
+      "sha3_512_tide:4a604638da9f34d883871e2b766f8dcf3fef6ac087ced20519a906d22729a354e39bc55e414d6c8b8267e2636cde7abf099e1ad314c3ac1e9043e2f82b8ee2da": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:48a3bc58abc1ab1ac0aac19ab369f1d94948609212955969bf8e9b0cf09293ab7909a86bfc5b44dd555e1c41988456edbfb4a6ed059c96e5504d234612acd010"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:48a3bc58abc1ab1ac0aac19ab369f1d94948609212955969bf8e9b0cf09293ab7909a86bfc5b44dd555e1c41988456edbfb4a6ed059c96e5504d234612acd010"
+      },
+      "sha3_512_tide:52e0030a53b3d7539bf181e17af5c0ced42f4322501671e0d3c0c55e775dc0456ba89cbd36817182bfa795fea90804db7d9dd7a83d7615e9d4311c9cd88f51eb": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:bc465dc42ca13fea3f6f8b3732284b51f8ef1f2ecae97ebf96c9ab54c9ae5bdee584b1a52d54b435d48c72f7b306296f2f7ed5725c18d7283c6bfb095c2baf43",
+            "object_1": "sha3_512_tide:62e1e1adddaccad28ed3e8fa108070545354398a06af9c20ebfdc37fe5e3fbb6ca8b3c4e3251e8e89041d5a03ad6ab9df637fd01c4492bf7682c2acec50487aa",
+            "object_2": "sha3_512_tide:c0b712f7335ac0e2a7e3bc4d3d948a69a338ca19cf9e5dd89a32914a99ddd7c84660f4d03fe0361c67baf22497440114214016bc138b8d36852e7df644761e26",
+            "object_3": "sha3_512_tide:fe674f1608c4d18d8848c6e025fbba8414a14a5559abc3019571157cbf606bfaee3b5aed7162ea00d912f8f359d729cd132f6c1812519c41291dd8db086c4470",
+            "object_4": "sha3_512_tide:688fb4a74bc08317ac21e898725c2e214e0b9f72fafe1a53cdb9996a21bda85cf04cab8a3ea7563de2fca6de2c02a0caec9d9f5f2cdb154be32deeebe9a40d24",
+            "object_5": "sha3_512_tide:2d6ed8c0c30097f768b4b5e8c6df64d851d7d5b4259cbeada167691f8aec7008a495e68418b939d2450ee8f12c9cccf1701959f81b67e0ab09ea03161a5fcfd7",
+            "object_6": "sha3_512_tide:935affbcf1522ab4693b04f90a3caffed7af52f7cd88b927e987ab4336c7e0c80d144bc20700f7c04a49479517c89600debec1f2704502b4235601851b372e8d"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:bc465dc42ca13fea3f6f8b3732284b51f8ef1f2ecae97ebf96c9ab54c9ae5bdee584b1a52d54b435d48c72f7b306296f2f7ed5725c18d7283c6bfb095c2baf43"
+      },
+      "sha3_512_tide:8c5b1a9bbf68098cff9eb2323a06284b7f7cf81df8569d42ab879a7af156a527d7b0fe31aa20844d0142d976b10c3af805c641300902d74638647c6bb203ab4f": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:56e6a2e3e5b091a36e902f7db38c7a503ad7b5e74f9be1e17a7213aef4c90e7a00989ddfbcbd1444bbc42270fa68a736bdb111b92157752e031941a95e76fda7"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:56e6a2e3e5b091a36e902f7db38c7a503ad7b5e74f9be1e17a7213aef4c90e7a00989ddfbcbd1444bbc42270fa68a736bdb111b92157752e031941a95e76fda7"
+      },
+      "sha3_512_tide:9375447cd5307bf7473b8200f039b60a3be491282f852df9f42ce31a8a43f6f8e916c4f8264e7d233add48746a40166eec588be8b7b9b16a5eb698d4c3b06e00": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:63204cbbd39149c85c01d9e41e1c468589f1cb8a2429c34070de0f7318094e5a452607a332959fe8367bc1eb3c14302ba0ae056370f43c237aac9d40e9ee5d43"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:63204cbbd39149c85c01d9e41e1c468589f1cb8a2429c34070de0f7318094e5a452607a332959fe8367bc1eb3c14302ba0ae056370f43c237aac9d40e9ee5d43"
+      },
+      "sha3_512_tide:ac22e648d03821e739ce51bcd7ffb66995273f1ef980e37f275517aeec1e9770d86aef6f1c34410713deb4a1087d597ac071a4a2b7b05c03df5f51885a2bf666": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:601b7073d3a965fe983c5ee33e05eca69be2fd69f08b30287e77c2fbbbd835c8e39e947a314edf64fe0e67841407999c8e53edc1327dbfedf08ae8ebbae79b7b"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:601b7073d3a965fe983c5ee33e05eca69be2fd69f08b30287e77c2fbbbd835c8e39e947a314edf64fe0e67841407999c8e53edc1327dbfedf08ae8ebbae79b7b"
+      },
+      "sha3_512_tide:caf50076e290b334d29fe1447fd7b352aac3e344482f384a3037a9aff8053b928bed64668692d4b571029ccad0d42216a1094ef0c029242f94d32fd73231e4cc": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:bcd5b57dc58c93684b952f3f1f21172fe4126155267bfaf28882903981caa7fe502619faa550a46dc4bb9ac5900c787f9a625828a00d1ba562d04d840bd97d3c"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:bcd5b57dc58c93684b952f3f1f21172fe4126155267bfaf28882903981caa7fe502619faa550a46dc4bb9ac5900c787f9a625828a00d1ba562d04d840bd97d3c"
+      },
+      "sha3_512_tide:ff02cffef406700de9db30bf77db3bad72738d5bcfd04d35822a00238c9a13a5d0c837924e642dda10f51e60a8dc9fcbb31f8af8463bc9b4617948ca465a16b1": {
+        "bundle": {
+          "metadata": {},
+          "record_refs": {
+            "object_0": "sha3_512_tide:40ffe791be10cba8c6fd401ebfbc411cb8fdad1eae5e7b5eb5593a2fe1c11c77a5f1b41359f584e2674a137a82c07dc8dae089df807a4403b3f747f20c7bb3be",
+            "object_1": "sha3_512_tide:f2a501d1c6ee35850ecf1b5900c867751db587ae83d09c7992705efb83e4cf59c323f3d0d8d0b6284fcf5848abf9cc3ec79ab230df27d8ef2735df7f7f3c05cb",
+            "object_2": "sha3_512_tide:d435fa9d1fc09c01e4d7dd380150178268712a2fd03812eb93d151b446a8b7a7fb9e523dada1dcb26abd4c1517ad4124b1b3255a7281947e99e1a965e90901aa",
+            "object_3": "sha3_512_tide:f5c4b2e8f17d579dd2d362a720cbe9e0b1bf21e87f9f571fea9378676115aef2acf03aee73b3c15a87bbd27c55483f368cca667e670c961132b69f8603c62c8c",
+            "object_4": "sha3_512_tide:ac836cd9a36fb8893932e0d06bb65cd4c8d026470aa8c6885ec8b0261ac9d9e3ec3f50a660273e5b7187601d479689e660c4deb2db92cdaca929ec68c0e7ebcf",
+            "object_5": "sha3_512_tide:d78812f0033f827216c0d764b11a2d0c1fe3b32f6933b42eb23405216f3644d73eeb9ac7a35fd3c9e4e5125fb0ed380f29a0b9b824724f7e5bbd8c1ebe418567",
+            "object_6": "sha3_512_tide:48a245bee0d19bf5638f67e0d5bc4e14d875c5a3e2ab4a2b73d271384244bd3fa8025a0a967d3b32a1520f2e9128f19de8ea9810748d9b98f96d396cb762a516",
+            "object_7": "sha3_512_tide:527b62347d6d2e9f8cfbd58b4bf39aff22773e4b231e170c616f54c4ed88e30027af80926b049930c0ce592971cb3b9df4746b9d884af8724aa4811f833baabb",
+            "object_8": "sha3_512_tide:c51ce271904eda16fed4b85e2115fc2e5b04333f8f79340309cffae5f2861bdb42acc7d9a9f0e5c71ab6f6b83f62663ff364dc0aae67a98bdda12e92c8463324",
+            "object_9": "sha3_512_tide:fa8560e5a4f1cb09d70001a854f83495ce922ddfd353ea6d21fcdfa2df8ba15eff77bf5fc490e9ff22578b47ec275ecaa6c157585ca40910c76f4532e887dec7"
+          },
+          "root": "object_0"
+        },
+        "root_cas_ref": "sha3_512_tide:40ffe791be10cba8c6fd401ebfbc411cb8fdad1eae5e7b5eb5593a2fe1c11c77a5f1b41359f584e2674a137a82c07dc8dae089df807a4403b3f747f20c7bb3be"
+      }
+    }
+  }
+}

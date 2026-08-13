@@ -1,0 +1,79 @@
+{
+  "name": "Third Provenance Challenge",
+  "kind": "one-file/table template interpretation",
+  "I": [
+    ["e:01:is_csv_ready_file_exists", "s:csv_root_path"],
+    ["e:02:read_csv_ready_file", "s:csv_root_path"],
+    ["e:03:is_match_csv_file_tables", "s:csv_file_entries"],
+    ["e:04:is_exists_csv_file", "s:csv_file_entry_v0"],
+    ["e:05:read_csv_file_column_names", "s:csv_file_entry_v0"],
+    ["e:06:is_match_csv_file_column_names", "s:csv_file_entry_v1"],
+    ["e:07:create_empty_load_db", "s:job_id"],
+    ["e:08:load_csv_file_into_table", "s:csv_file_entry_v1"],
+    ["e:08:load_csv_file_into_table", "s:database_v0_empty"],
+    ["e:09:update_computed_columns", "s:csv_file_entry_v1"],
+    ["e:09:update_computed_columns", "s:database_v1_loaded"],
+    ["e:10:is_match_table_row_count", "s:csv_file_entry_v1"],
+    ["e:10:is_match_table_row_count", "s:database_v2_computed"],
+    ["e:11:is_match_table_column_ranges", "s:csv_file_entry_v1"],
+    ["e:11:is_match_table_column_ranges", "s:database_v2_computed"],
+    ["e:12:compact_database", "s:database_v2_computed"]
+  ],
+  "O_explicit": [
+    ["e:01:is_csv_ready_file_exists", "s:csv_ready_file_exists_result"],
+    ["e:02:read_csv_ready_file", "s:csv_file_entries"],
+    ["e:03:is_match_csv_file_tables", "s:csv_file_tables_match_result"],
+    ["e:04:is_exists_csv_file", "s:csv_file_exists_result"],
+    ["e:05:read_csv_file_column_names", "s:csv_file_entry_v1"],
+    ["e:06:is_match_csv_file_column_names", "s:csv_column_names_match_result"],
+    ["e:07:create_empty_load_db", "s:database_v0_empty"],
+    ["e:08:load_csv_file_into_table", "s:load_result"],
+    ["e:09:update_computed_columns", "s:update_computed_columns_result"],
+    ["e:10:is_match_table_row_count", "s:row_count_match_result"],
+    ["e:11:is_match_table_column_ranges", "s:column_ranges_match_result"]
+  ],
+  "O_inferred": [
+    ["e:02:read_csv_ready_file", "s:csv_file_entry_v0"],
+    ["e:08:load_csv_file_into_table", "s:database_v1_loaded"],
+    ["e:09:update_computed_columns", "s:database_v2_computed"]
+  ],
+  "execution_labels": {
+    "e:01:is_csv_ready_file_exists": "IsCSVReadyFileExists",
+    "e:02:read_csv_ready_file": "ReadCSVReadyFile",
+    "e:03:is_match_csv_file_tables": "IsMatchCSVFileTables",
+    "e:04:is_exists_csv_file": "IsExistsCSVFile",
+    "e:05:read_csv_file_column_names": "ReadCSVFileColumnNames",
+    "e:06:is_match_csv_file_column_names": "IsMatchCSVFileColumnNames",
+    "e:07:create_empty_load_db": "CreateEmptyLoadDB",
+    "e:08:load_csv_file_into_table": "LoadCSVFileIntoTable",
+    "e:09:update_computed_columns": "UpdateComputedColumns",
+    "e:10:is_match_table_row_count": "IsMatchTableRowCount",
+    "e:11:is_match_table_column_ranges": "IsMatchTableColumnRanges",
+    "e:12:compact_database": "CompactDatabase"
+  },
+  "state_labels": {
+    "s:csv_root_path": "CSV root path",
+    "s:csv_ready_file_exists_result": "CSV-ready file exists result",
+    "s:csv_file_entries": "CSVFileEntry list",
+    "s:csv_file_tables_match_result": "CSV-file/table match result",
+    "s:csv_file_entry_v0": "Representative CSVFileEntry before column names",
+    "s:csv_file_exists_result": "CSV data/header existence result",
+    "s:csv_file_entry_v1": "Representative CSVFileEntry with column names",
+    "s:csv_column_names_match_result": "CSV-column/table-column match result",
+    "s:job_id": "Job identifier",
+    "s:database_v0_empty": "Empty load database",
+    "s:database_v1_loaded": "Database after CSV table load",
+    "s:load_result": "CSV load result",
+    "s:database_v2_computed": "Database after computed-column update",
+    "s:update_computed_columns_result": "Computed-column update result",
+    "s:row_count_match_result": "Table row-count match result",
+    "s:column_ranges_match_result": "Table column-range match result"
+  },
+  "assumptions": [
+    "One representative CSVFileEntry occurrence is instantiated from the list returned by ReadCSVReadyFile.",
+    "LoadCSVFileIntoTable is treated as producing a new database State after loading.",
+    "UpdateComputedColumns is treated as producing a new database State after updating.",
+    "CompactDatabase has no represented output because the source table states None.",
+    "Validation results are represented as outputs but are not made inputs to CompactDatabase unless the source explicitly supplies that relation."
+  ]
+}

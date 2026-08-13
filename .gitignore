@@ -1,0 +1,59 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type-checker and linter caches
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Packaging and build output
+build/
+dist/
+.eggs/
+*.egg
+*.egg-info/
+*.whl
+pip-wheel-metadata/
+uv.lock
+
+# Local editor configuration
+.vscode/
+.idea/
+*.code-workspace
+
+# Operating-system noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*~

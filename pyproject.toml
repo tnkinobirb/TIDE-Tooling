@@ -1,0 +1,31 @@
+[project]
+name = "tide-tooling"
+version = "0.0.1"
+description = "Queryable execution provenance for Python"
+readme = "README.md"
+authors = [
+    { name = "Gabriel Dolbear", email = "tidetooling@gmail.com" },
+]
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENCE.md"]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[project.urls]
+Repository = "https://github.com/tnkinobirb/TIDE-Tooling"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tide_tooling*"]
+
+[tool.pytest.ini_options]
+testpaths = ["testing"]
+
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
