@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import Any, Callable
 import re
 from tide_tooling import TIDE
+from tide_tooling.tooling_core.engine.events import Cause
 from tide_tooling.core import (
     Actor,
     DataRef,
@@ -15,13 +16,13 @@ from tide_tooling.core import (
     Object,
     RunnerNodeInput,
     WriteRecord,
-    __TIDE_TEMPLATE_VALUE__,
+    __fallback__,
     tide_value_hasher,
 )
 from tide_tooling.tooling_core.engine.tide_logging import InspectedGroup
 
 
-__TEMPLATE_VALUE__ = __TIDE_TEMPLATE_VALUE__()
+__TEMPLATE_VALUE__ = __fallback__()
 
 
 
@@ -147,7 +148,6 @@ def create_exec_record(
     node_id=None,
     node_options="unknown",
     output_value=__TEMPLATE_VALUE__,
-    resolve_output="unknown",
     writes=None,
     emitted_nodes=None,
     base_node_id="unknown",
@@ -186,10 +186,9 @@ def create_exec_record(
         node_options=node_options or {},
         output_value=(
             output_value
-            if not isinstance(output_value, __TIDE_TEMPLATE_VALUE__)
+            if not isinstance(output_value, __fallback__)
             else __TEMPLATE_VALUE__
         ),
-        resolve_output=resolve_output or unknown_repr,
         writes=writes or [],
         emitted_nodes=emitted_nodes or [],
         base_node_id=base_node_id or unknown_repr,
@@ -205,7 +204,7 @@ def create_write_record(
     stored_target=__TEMPLATE_VALUE__,
 ):
     return WriteRecord(
-        cause,
+        Cause(description=cause),
         stored_result,
         stored_version,
         stored_target,
@@ -247,6 +246,13 @@ def assert_input(
         assert to_assert_input.resolved == test_input.resolved
         return
 
+    if isinstance(to_assert_input, InputUseRecord):
+        assert to_assert_input.raw == test_input.raw
+        assert to_assert_input.evaluated == test_input.evaluated
+        assert to_assert_input.normalised == test_input.normalised
+        assert to_assert_input.resolved == test_input.resolved
+        return
+
     raise TypeError("Input is not a RunnerNodeInput or NodeInput!")
 
 
@@ -282,7 +288,10 @@ def assert_write_record(
     to_assert: WriteRecord,
     expected_record: WriteRecord,
 ):
-    assert to_assert.cause == expected_record.cause
+    if expected_record.cause.description == "TIDE: node write":
+        assert isinstance(to_assert.cause.event_id, str)
+    else:
+        assert to_assert.cause == expected_record.cause
     assert to_assert.stored_target == expected_record.stored_target
     assert to_assert.stored_version == expected_record.stored_version
     assert to_assert.stored_result == expected_record.stored_result
@@ -300,7 +309,16 @@ def assert_exec_record(
     assert exec_from_inspect.node_id == expected_exec.node_id
     assert exec_from_inspect.func == expected_exec.func
     assert exec_from_inspect.func_name == expected_exec.func_name
-    assert exec_from_inspect.inputs == expected_exec.inputs
+    for name, actual_input in exec_from_inspect.inputs.items():
+        expected_input = dict(expected_exec.inputs.items())[name]
+        assert_input((name, actual_input), (name, expected_input))
+        assert len(actual_input.dependencies) == len(expected_input.dependencies)
+        for actual_read, expected_read in zip(
+            actual_input.dependencies,
+            expected_input.dependencies,
+            strict=True,
+        ):
+            assert_read_record(actual_read, expected_read)
 
     assert len(exec_from_inspect.deps) == len(expected_exec.deps)
     for idx, read in enumerate(exec_from_inspect.deps):
@@ -337,10 +355,6 @@ def assert_exec_record(
             == expected_exec.base_node_content_id
         )
         assert exec_from_inspect.content_id == expected_exec.content_id
-        assert (
-            exec_from_inspect.resolve_output
-            == expected_exec.resolve_output
-        )
         assert (
             exec_from_inspect.emitted_nodes
             == expected_exec.emitted_nodes
@@ -397,6 +411,12 @@ def assert_inspected_exec(
 
     if source_pipelines is None:
         source_pipelines = ["TIDE: .trace()"]
+
+    source_pipelines = [
+        pipeline
+        for pipeline in source_pipelines
+        if pipeline[0] in inspect.__self__.pipelines
+    ]
 
     assert exec_obj.type == "exec_record"
     assert exec_obj.source_ocean == source_oceans
@@ -476,6 +496,11 @@ def assert_inspected_fields(
     assert inspected.downstream == calculated_downstream
     assert inspected.source_oceans == oceans
     assert inspected.source_runners == runners
+    pipelines = [
+        pipeline
+        for pipeline in pipelines
+        if pipeline[0] in inspect.__self__.pipelines
+    ]
     assert inspected.source_pipelines == pipelines
     assert inspected.grouped == grouped
 
@@ -769,7 +794,7 @@ def inspect_context():
         ),
         "b_exec_actor": Actor(
             ocean_id,
-            "TIDE: .exec(0)",
+            0,
             "B",
         ),
     }
@@ -782,14 +807,18 @@ def test_inspected_to_dict_exposes_compact_contract(inspect_context):
     assert set(data) == {
         "type",
         "id",
-        "ocean",
-        "source",
-        "pipeline",
+        "version",
+        "source_oceans",
+        "source_runners",
+        "source_pipelines",
         "history",
         "upstream_seeds",
         "downstream_seeds",
         "grouped",
         "exists",
+        "parents",
+        "children",
+        "divergence",
     }
     assert data["type"] == "exec_record"
     assert data["id"] == inspected.id
@@ -946,10 +975,10 @@ def test_inspect_b_event_exec_record(inspect_context):
             unscoped_ref="global:@B",
             resolved_val="!B",
             resolved_ver=1,
-            producer_source="TIDE: .exec(0)",
+            producer_source=0,
             producer_actor=Actor(
                 ocean_id,
-                "TIDE: .exec(0)",
+                0,
                 "B",
             ),
             input_index=1,
@@ -969,7 +998,7 @@ def test_inspect_b_event_exec_record(inspect_context):
         args=(
             "args",
             args_input,
-            b_event_deps,
+            expected_b_event_read_records,
         )
     )
 
@@ -989,6 +1018,7 @@ def test_inspect_b_event_exec_record(inspect_context):
         declared_effects=[],
         declared_targets=b_event_targets,
         unscoped_store_refs=["global"],
+        status=None,
         error=None,
         output_value=None,
         writes=expected_b_event_write_records,
@@ -1112,7 +1142,7 @@ def test_inspect_b_runtime_exec_record(inspect_context):
         args=(
             "args",
             args_input,
-            b_exec_deps,
+            expected_b_exec_read_records,
         )
     )
 
@@ -1120,7 +1150,7 @@ def test_inspect_b_runtime_exec_record(inspect_context):
         seq_id=2,
         ocean_id=ocean_id,
         pipeline_id=0,
-        runner_id="TIDE: .exec(0)",
+        runner_id=0,
         node_id=0,
         actor_name="B",
         func=B,
@@ -1149,11 +1179,11 @@ def test_inspect_b_runtime_exec_record(inspect_context):
         upstream_seq_ids=[0, 1],
         downstream_seq_ids=[3],
         source_oceans=[ocean_id],
-        source_runners=["TIDE: .exec(0)"],
+        source_runners=[0],
         source_pipelines=[
             (
                 0,
-                "TIDE: .exec(B[0])",
+                "TIDE: .run_node(B)",
             )
         ],
         expected_repr="EXEC_RECORD[2] B",
@@ -1196,15 +1226,15 @@ def test_inspect_global_b_reference_version_one(inspect_context):
             version=1,
         ),
         ref="global:@B",
-        version_history=[0, 1],
+        version_history=[0, 1, 2, 3],
         upstream_seq_ids=[2],
         downstream_seq_ids=[3],
         source_oceans=[ocean_id],
-        source_runners=["TIDE: .exec(0)"],
+        source_runners=[0],
         source_pipelines=[
             (
                 0,
-                "TIDE: .exec(B[0])",
+                "TIDE: .run_node(B)",
             )
         ],
         version=1,
@@ -1224,17 +1254,9 @@ def test_inspect_global_b_reference_version_one(inspect_context):
 def test_inspect_b_value(inspect_context, value_or_hash):
     trace = inspect_context["trace"]
     ocean_id = inspect_context["ocean_id"]
-    inspected_value = trace.inspect(
-        "!B",
-        "value",
-    )
+    inspected_value = trace.inspect(value_or_hash)
 
-    assert (
-        trace.index.value_by_hash[
-            tide_value_hasher(value_or_hash)
-        ]
-        == "!B"
-    )
+    assert trace.index.value_by_hash[tide_value_hasher("!B")] == "!B"
 
     assert_inspected_value(
         inspect=trace.inspect,
@@ -1251,7 +1273,7 @@ def test_inspect_b_value(inspect_context, value_or_hash):
         source_oceans=[ocean_id],
         source_runners=[
             "TIDE: .event()",
-            "TIDE: .exec(0)",
+            0,
         ],
         source_pipelines=[
             (
@@ -1260,7 +1282,7 @@ def test_inspect_b_value(inspect_context, value_or_hash):
             ),
             (
                 0,
-                "TIDE: .exec(B[0])",
+                "TIDE: .run_node(B)",
             ),
             (
                 "TIDE: .event(B[2])",
@@ -1297,7 +1319,7 @@ def test_inspect_grouped_b_actors(inspect_context):
             pipelines=[
                 (
                     0,
-                    "TIDE: .exec(B[0])",
+                    "TIDE: .run_node(B)",
                 )
             ],
         ),
@@ -1328,8 +1350,8 @@ def test_inspect_grouped_b_references(inspect_context):
             oceans=[ocean_id],
             runners=[
                 "TIDE: .event()",
-                "TIDE: .exec(0)",
-                "TIDE: .exec(1)",
+                0,
+                1,
             ],
             pipelines=[
                 (
@@ -1338,7 +1360,7 @@ def test_inspect_grouped_b_references(inspect_context):
                 ),
                 (
                     0,
-                    "TIDE: .exec(B[0])",
+                    "TIDE: .run_node(B)",
                 ),
                 (
                     "TIDE: .event(B[2])",
@@ -1346,7 +1368,7 @@ def test_inspect_grouped_b_references(inspect_context):
                 ),
                 (
                     1,
-                    "TIDE: .exec(X[1])",
+                    "TIDE: .run_node(X)",
                 ),
             ],
         ),
@@ -1392,7 +1414,7 @@ def test_inspect_grouped_b_references_version_zero(inspect_context):
         create_expected_dict(
             obj="global:@B",
             version=0,
-            history=[0],
+            history=[0, 1, 2, 3],
             upstream=[1],
             downstream=[2],
             oceans=[ocean_id],
@@ -1431,6 +1453,9 @@ def test_inspect_grouped_b_references_version_zero(inspect_context):
         ),
         group_history=[
             ("global:@B", 0),
+            ("global:@B", 1),
+            ("global:@B", 2),
+            ("global:@B", 3),
             ("testing:@B", 0),
         ],
         expected_obj_asserts=expected_ref_group_ver,

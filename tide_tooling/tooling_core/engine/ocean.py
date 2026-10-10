@@ -1,481 +1,341 @@
 from queue                          import Queue, Empty
 from typing                         import Any
 from collections                    import defaultdict
+import copy
 import threading
+from dataclasses                    import dataclass, field
 from contextvars                    import copy_context
+from contextlib                    import contextmanager
 from tide_tooling.tooling_core                           import debug_print as print
-
-from tide_tooling.tooling_core.engine.classes            import Node, Pipeline
+from tide_tooling.tooling_core.engine.classes            import DataRef, Node, Pipeline
 from tide_tooling.tooling_core.engine.stores             import MemoryKVStore
-from tide_tooling.tooling_core.engine.events             import OceanEvents, PipelineEvents, Event
-from tide_tooling.tooling_core.engine.tide_runtime_logging    import EventLogger, LogTools
+from tide_tooling.tooling_core.engine.events             import Cause, LogEvents, OceanEvents, PipelineEvents, Event
+from tide_tooling.tooling_core.engine.event_payloads     import PipelineRun, PipelineRegistration, RunnerPlan
+from tide_tooling.tooling_core.engine.event_occurrences      import EventLogger
+from tide_tooling.tooling_core.engine.tide_runtime_logging import trace_from_event_log
 from tide_tooling.tooling_core.engine.routers            import EventRouter, StoreRouter
 from tide_tooling.tooling_core.engine.executor           import Executor
-from tide_tooling.tooling_core.engine.interfaces         import EventInterface, StoreInterface
+from tide_tooling.tooling_core.engine.interfaces         import EventInterface
 from tide_tooling.tooling_core.engine.registries         import StoreRegistry
-from tide_tooling.tooling_core.engine.PipelineRunner     import PipelineRunner 
-from tide_tooling.tooling_core.engine.errors             import StoreAlreadyRegisteredError
-
+from tide_tooling.tooling_core.engine.PipelineRunner     import PipelineRunner
+from tide_tooling.tooling_core.engine.errors             import StoreAlreadyRegisteredError, NoExecRecordError
 _USE_OCEAN_TIMEOUT = object()
-
+class NowRequestFailed(RuntimeError):
+    """One immediate Store operation could not be completed by Ocean."""
+@dataclass
+class _EventWork:
+    event: Event
+@dataclass(kw_only=True)
+class _SynchronousWork:
+    completed: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+    scheduler_error: BaseException | None = None
+@dataclass(kw_only=True)
+class _TIDEEventRequest(_SynchronousWork):
+    apply: Any
+@dataclass(kw_only=True)
+class _RegisterPipelineRequest(_SynchronousWork):
+    pipeline: Pipeline
+    name: str | None
+    local_store_templates: dict[str, Any]
+@dataclass(kw_only=True)
+class _NowRequest(_SynchronousWork):
+    operation: str
+    runner_id: int | str
+    runtime: Any
+    effect: Any
 class Ocean:
     __ocean_count__ = 0
     def __init__(
         self,
-        deep_copy=True,
+        default_store="mem",
         timeout=None,
-        max_idle_attempts=400000,
-        track_unrepresented=True,
     ):
-        if not isinstance(track_unrepresented, bool):
-            raise TypeError("track_unrepresented must be a bool")
+        # Retain Ocean identity and run policy.
         self.id = Ocean.__ocean_count__
-        Ocean.__ocean_count__ += 1    
-        self.done = False
+        Ocean.__ocean_count__ += 1
         self.timeout = timeout
-        self.max_idle_attempts = max_idle_attempts
-        self.track_unrepresented = track_unrepresented
+        self.default_store = default_store
+        # Retain Ocean lifecycle state.
+        self.done = False
         self.closed = False
         self.last_trace = None
-        self.thread=None
-        self.trace_bus = None
+        # Retain Ocean scheduler-thread state.
+        self.thread = None
+        self._parent_runner_id = None
+        self._scheduler_error = None
+        self._scheduler_owner_thread_id = None
         self._tick_lock = threading.RLock()
         self._run_lock = threading.Lock()
         self._wake_event = threading.Event()
+        # Retain Pipeline and Runner ownership.
+        self.pipelines = {}
         self.runners = {}
         self.running = {}
-        self.pipelines = {}
-        self.pipeline_to_runners = defaultdict(list)
-        self.runner_to_trace = {}
-        
-        
+        # Route Ocean Events to their lifecycle transitions.
         self.handlers = {
-
-            OceanEvents.SET: self._on_set,
             OceanEvents.QUIT: self._on_quit,
-            OceanEvents.DELETE: self._on_delete,
-
-            OceanEvents.RUN_PIPELINE: self._on_run_pipeline,
-            OceanEvents.KILL_PIPELINE: self._on_kill_pipeline,
             OceanEvents.REGISTER_PIPELINE: self._on_register_pipeline,
-
+            OceanEvents.RUN_PIPELINE: self._on_run_pipeline,
+            OceanEvents.KILL_RUNNER: self._on_kill_runner,
         }
-        # TODO: - Keep an Execution and StoreRouter ref-> value snapshot index. Then flag is exec val and store_set value are different. If so flag mutable/changed, and attr unknown prod.
-        # TODO: The same with StoreRouter read -> DepUseRecord. If StoreRouter snapshot is different to read attr unknown producer and flag mutable/changed.    
-        # Pipeline Event Queue
-        self.event_queue = Queue()
-
-        # Store Registery    
-        self.store_registry: StoreRegistry = StoreRegistry()
-
-        # EventLogger, Router, and Interface (For PipelineRunner(s)) and subscribe ocean to ocean events 
+        # Accept every externally produced scheduler operation through one
+        # FIFO ingress.  Only Ocean's scheduler may apply or route it.
+        self._scheduler_queue = Queue()
+        # Retain the public/internal name while the queue now carries typed
+        # scheduler work rather than bare Events.
+        self.event_queue = self._scheduler_queue
+        # Own the shared Event network.
         self.event_logger = EventLogger()
         self.event_router = EventRouter(self.event_logger)
         self.event_router.subscribe(OceanEvents, self._handle_ocean_event)
-        self.event_interface = EventInterface(self.consume_event, self.event_router.subscribe)
-
-        # Store Router + default stores init
-        self.store_router = StoreRouter(self.store_registry, self.event_interface) 
+        self.event_interface = EventInterface(
+            self.id,
+            self.consume_event,
+            self.event_router.subscribe,
+        )
+        # Own the shared live Store network.
+        self.store_registry = StoreRegistry()
+        self.store_router = StoreRouter(
+            self.store_registry,
+            self.event_interface,
+            consequence_emitter=self.event_router.route,
+        )
         self.register_store("global", MemoryKVStore)
         self.register_store("mem", MemoryKVStore, scope="local")
         self.register_store("__tide__", MemoryKVStore, scope="local")
-        self.register_store("__unnamed__", MemoryKVStore, scope="local")
-        self.store_interface = StoreInterface(self._create_scoped_router)
-
-        # Executor - executes work | Sequential, Threaded, Process, Auto
-        self.executor = Executor(event_interface=self.event_interface)
-        
-        # Logging tools        
-        self.log_tools = LogTools(ocean_id=self.id, runners=self.runners, pipelines=self.pipelines)
-
-    # -- User API -- #
-
-    # | SEND EVENT INTO TIDE | # TODO: add safety features
-    def consume_event(self, event: Event, verbose=False) -> None:
-        """Enqueue an event safely from any producer thread.
-
-        Event handling is performed by ``tick`` under one Ocean-wide lock;
-        producer threads never execute handlers directly.
-        """
-        self.event_queue.put(event)
-        self._wake_event.set()
-
-        if verbose:
-            print(f"[OCEAN] Consumed {event.event_type}")    
-    
-    # | REGISTERING STORES |
-    def register_store(self, name:str=None, store_class=MemoryKVStore, scope:str="global", store_template:Any=None):
-        if not name: name = store_class.reference 
-        store = store_class(name = name, scope=scope, store_template=store_template)
-        
-        if self.store_registry.exists(name):
-            raise StoreAlreadyRegisteredError(f"Store:{name}|{scope} is already registered! Please choose a different name :D", store)
-
-        self.store_registry.register(store)  
-
-    # | REGISTER A PIPELINE DEFINITON | #
-    def register_pipeline(self, pipeline: Pipeline | list[Node], name=None, mem_store_templates: dict[str, Any] | None=None) -> None:
-        if isinstance(pipeline, Pipeline) and name:
-            pipeline.name = name
-        mem_store_templates = mem_store_templates or {}
+        self.register_store("__untracked__", MemoryKVStore, scope="local")
+        # Own shared execution.
+        self.executor = Executor(self.event_interface)
+    def register_store(
+        self,
+        name=None,
+        store_class=MemoryKVStore,
+        scope="global",
+        store_template=None,
+    ):
+        # Setup-only registry mutation cannot race accepted scheduler work.
+        with self._tick_lock:
+            if (
+                self._scheduler_owner_thread_id is not None
+                or self.running
+                or not self._scheduler_queue.empty()
+                or (self.thread is not None and self.thread.is_alive())
+            ):
+                raise RuntimeError(
+                    "Store registration is unavailable while Ocean is scheduling"
+                )
+            return self._register_store(
+                name=name,
+                store_class=store_class,
+                scope=scope,
+                store_template=store_template,
+            )
+    def _register_store(
+        self,
+        name=None,
+        store_class=MemoryKVStore,
+        scope="global",
+        store_template=None,
+    ):
+        # Construct and register one Store definition or instance.
+        self.store_registry.register(store_class(
+            name=name,
+            scope=scope,
+            store_template=store_template,
+        ))
+    def register_pipeline(
+        self,
+        pipeline,
+        name=None,
+        local_store_templates=None,
+    ):
+        # Normalise the supported Pipeline definition carriers.
         if isinstance(pipeline, list):
-            pipeline = Pipeline(stages=pipeline, name=name) 
-        if pipeline.id is not None and pipeline.id in self.pipelines:
-            print(f"[OCEAN] Pipeline [{pipeline.name}] is already registered") 
-            return self.pipelines[pipeline.id][0] 
+            pipeline = Pipeline(pipeline, name=name)
+        elif not isinstance(pipeline, Pipeline):
+            raise TypeError(
+                "register_pipeline() requires a Pipeline or list of Nodes"
+            )
+        # Validate only caller-owned shape before entering scheduler order.
+        if name is not None:
+            if not isinstance(name, str):
+                raise TypeError("Pipeline name must be a string or None")
+        # Normalise the Pipeline's local Store seeds.
+        if local_store_templates is None:
+            local_store_templates = {}
+        elif not isinstance(local_store_templates, dict):
+            raise TypeError("local_store_templates must be a dict or None")
+        request = _RegisterPipelineRequest(
+            pipeline=pipeline,
+            name=name,
+            local_store_templates=dict(local_store_templates),
+        )
+        return self._coordinate_synchronous_work(request)
+    def _on_register_pipeline(self, event):
+        # Assign Ocean identity and retain the registered definition.
+        pipeline = event.payload.pipeline
         pipeline.id = self._next_pipeline_id()
-        self.pipelines[pipeline.id] = (pipeline, mem_store_templates)
-        print(f"[OCEAN] Registered Pipeline [{pipeline.id}] {pipeline.name}")
-
-       
-        return pipeline
-    
-    # | START A PIPELINE RUN FROM SPECIFIED PIPELINE DEFINITON |
-    def run_pipeline(self, pipeline: Pipeline, mode='auto', mem_store_templates: dict[str, Any] | None = None, stay_alive=False, overload_runner_ids_with: str = None, timeout=_USE_OCEAN_TIMEOUT, intent_dynamic_refs=None):
-        """Run one synchronous public pipeline call.
-
-        An Ocean may manage runners created by effects, but its public
-        ``run_pipeline`` result bus belongs to one caller at a time.
-        """
+        self.pipelines[pipeline.id] = (
+            pipeline,
+            event.payload.local_store_templates,
+        )
+    def run_pipeline(
+        self,
+        pipeline,
+        mode="auto",
+        local_store_templates=None,
+        stay_alive=False,
+        timeout=_USE_OCEAN_TIMEOUT,
+        dynamic_ref_plan=None,
+        name=None,
+        default_store=None,
+    ):
+        # One synchronous run_pipeline call owns the Ocean at a time.
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError(
-                "Ocean.run_pipeline does not support concurrent public calls"
+                "Ocean.run_pipeline does not support concurrent calls"
             )
         try:
-            return self._run_pipeline(
-                pipeline,
-                mode=mode,
-                mem_store_templates=mem_store_templates,
-                stay_alive=stay_alive,
-                overload_runner_ids_with=overload_runner_ids_with,
-                timeout=timeout,
-                intent_dynamic_refs=intent_dynamic_refs,
+            selected_store = (
+                self.default_store if default_store is None else default_store
             )
+            token = DataRef.set_default_store(selected_store)
+            try:
+                return self._run_pipeline(
+                    pipeline,
+                    mode,
+                    local_store_templates,
+                    stay_alive,
+                    timeout,
+                    dynamic_ref_plan,
+                    name,
+                )
+            finally:
+                DataRef.reset_default_store(token)
         finally:
             self._run_lock.release()
-
-    def _run_pipeline(self, pipeline: Pipeline, mode='auto', mem_store_templates: dict[str, Any] | None = None, stay_alive=False, overload_runner_ids_with: str = None, timeout=_USE_OCEAN_TIMEOUT, intent_dynamic_refs=None):
+    def _run_pipeline(
+        self,
+        pipeline,
+        mode,
+        local_store_templates,
+        stay_alive,
+        timeout,
+        dynamic_ref_plan,
+        name,
+    ):
+        # Reject runs after shutdown or during an existing scheduling run.
         if self.closed:
             raise RuntimeError("Ocean is closed")
         if self.thread is not None and self.thread.is_alive():
-            raise RuntimeError(
-                "Ocean already has an active scheduling thread; finish or "
-                "close that run before starting another"
-            )
-
-        # ``@pipeline`` exposes a cached builder function.  Accept that public
-        # form as well as an already-built Pipeline so callers do not need to
-        # know about the decorator's internal wrapper.
+            raise RuntimeError("Ocean already has an active scheduling thread")
+        if isinstance(pipeline, list):
+            pipeline = Pipeline(pipeline)
+        # Materialise an @pipeline-decorated definition.
         if callable(pipeline) and not isinstance(pipeline, Pipeline):
             pipeline = pipeline()
-
         if not isinstance(pipeline, Pipeline):
             raise TypeError(
-                "run_pipeline() expected a Pipeline or an @pipeline-decorated "
-                f"callable, got {type(pipeline).__name__}"
+                "run_pipeline() requires a Pipeline or "
+                "@pipeline-decorated callable"
             )
-
-        mem_store_templates = mem_store_templates or {}
-        if pipeline.id in self.pipelines and not mem_store_templates:
-            pipeline, mem_store_templates = self.pipelines[pipeline.id]
+        # Accept only local Store seed mappings.
+        if local_store_templates is None:
+            local_store_templates = {}
+        elif not isinstance(local_store_templates, dict):
+            raise TypeError(
+                "local_store_templates must be a dict or None"
+            )
+        # Register a new Pipeline or inherit its registered Store seeds.
+        if pipeline.id in self.pipelines:
+            pipeline, registered_templates = self.pipelines[pipeline.id]
+            if not local_store_templates:
+                local_store_templates = registered_templates
         else:
-            pipeline = self.register_pipeline(pipeline=pipeline, mem_store_templates=mem_store_templates)
-
-        self.consume_event(Event(source="ocean", source_id=self.id, target_runner_id=None, event_type=OceanEvents.RUN_PIPELINE, payload=(pipeline.id, mode, mem_store_templates, stay_alive, overload_runner_ids_with, intent_dynamic_refs)))
-        trace_bus = self.start_threaded(stay_alive=stay_alive)
-        wait_timeout = self.timeout if timeout is _USE_OCEAN_TIMEOUT else timeout
-
-        try:
-            result = trace_bus.get(timeout=wait_timeout)
-            if isinstance(result, Exception):
-                raise result
-            if (
-                isinstance(result, tuple)
-                and len(result) == 2
-                and isinstance(result[1], Exception)
-            ):
-                trace, error = result
+            pipeline = self.register_pipeline(
+                pipeline,
+                local_store_templates=local_store_templates,
+            )
+        # Start one causal run tree.
+        self._parent_runner_id = None
+        self._scheduler_error = None
+        self.consume_event(Event(
+            ocean_id=self.id,
+            source="ocean",
+            source_id=self.id,
+            type=OceanEvents.RUN_PIPELINE,
+            cause=Cause(description="pipeline run"),
+            payload=PipelineRun(
+                pipeline.id,
+                pipeline.name,
+                mode,
+                dict(local_store_templates),
+                stay_alive,
+                name,
+                dynamic_ref_plan,
+            ),
+        ))
+        self.start_threaded(stay_alive=False)
+        # The scheduler thread ending means the causal run tree has settled.
+        wait_timeout = (
+            self.timeout
+            if timeout is _USE_OCEAN_TIMEOUT
+            else timeout
+        )
+        self.thread.join(timeout=wait_timeout)
+        if self.thread.is_alive():
+            raise TimeoutError(
+                "Timed out waiting for TIDE pipeline evidence; "
+                "the timeout does not terminate a running Python worker"
+            )
+        # Propagate an unexpected scheduler failure with available evidence.
+        if self._scheduler_error is not None:
+            error = self._scheduler_error
+            if self._parent_runner_id in self.runners:
+                trace = self._trace_from_runner(
+                    self.runners[self._parent_runner_id]
+                )
                 self.last_trace = trace
                 error.tide_trace = trace
-                raise error
-
-            if self.thread is not None:
-                self.thread.join(timeout=5)
-
-            self.last_trace = result
-            return result
-
-        except Empty:
-            if self.thread is not None:
-                self.thread.join(timeout=1)
-
-            raise TimeoutError(
-                "Timed out waiting for TIDE pipeline evidence; the timeout "
-                "does not terminate a running Python worker"
+            raise error
+        if self._parent_runner_id not in self.runners:
+            raise RuntimeError(
+                "The run completed without creating its parent PipelineRunner"
             )
-    
-    def run_node(self, node:Node, mode='sequential', stay_alive=False, pipeline_name:str=None, overload_runner_source:str=None, show=False):
-        if not pipeline_name: 
-            pipeline_name = f"PIPELINE[{len(self.pipelines)}]"
-        node_pipeline = Pipeline(stages=[node], name=pipeline_name)
-        node_pipeline._trace_include_prior_events = True
-        print(node_pipeline.stages)
-        trace = self.run_pipeline(pipeline=node_pipeline, mode=mode, stay_alive=stay_alive, overload_runner_ids_with=overload_runner_source)
-        runner_source = overload_runner_source if overload_runner_source is not None else 0
-        inspected_actor = trace.inspect((self.id, runner_source, node.node_name), "actor")
-        if not inspected_actor.history:
-            return trace, None, None
-        inspected_exec = trace.inspect(inspected_actor.history[-1], "exec_record")
-        exec_log = inspected_exec.object.object
-        output = exec_log.output_value
-        # if overload_runner_source is not None:
-        #     exec_log.source_runner = overload_runner_source
-        #     exec_log.source_pipeline = pipeline_name
-        #     producer = exec_log.producer_id
-        #     producer.id = (producer.source_ocean, overload_runner_source, producer.source_actor)
-        if show:
-            trace.show()
-        return trace, exec_log, output
-    
-    # | CREATE REPORT OF RUN | # TODO: finish
-    def create_runner_report(self, runner_id):
-        raise NotImplementedError(
-            "Graph reports are provided by an external TIDE graphing module"
+        # Reconstruct the complete causal run tree from its parent Runner.
+        parent_runner = self.runners[self._parent_runner_id]
+        trace = self._trace_from_runner(parent_runner)
+        self.last_trace = trace
+        # Preserve the parent Runner's ordinary TIDE failure handling.
+        if parent_runner.failure is not None:
+            parent_runner.failure.tide_trace = trace
+            raise parent_runner.failure
+        return trace
+    def _trace_from_runner(self, runner):
+        """Delegate settled runtime evidence to the tracing boundary."""
+        return trace_from_event_log(
+            self.event_logger.freeze(),
+            ocean_id=self.id,
+            runner=runner,
+            pipelines={
+                pipeline_id: pipeline
+                for pipeline_id, (pipeline, _) in self.pipelines.items()
+            },
         )
-
-
-    # -- OCEAN CONTROLS -- #
-    def _next_pipeline_id(self):
-        return len(self.pipelines)
-    
-    def _next_runner_id(self):
-        return len(self.runners)
-
-    # | GET PIPELINE DEFINITON | 
-    def _get_pipeline(self, pipeline_id: int = None) -> Pipeline:
-        
-        registered = self.pipelines.get(pipeline_id, None)
-        if not registered:
-            print(
-                f"pipeline_id {pipeline_id!r} is not registered; "
-                f"known pipelines: {list(self.pipelines)}"
-            )
-            return (None, None)
-        pipeline, pipeline_store_templates = registered
-        return pipeline, pipeline_store_templates
-    
-    # | CREATE PIPELINE RUNNER (INSTANCE) WITH A SELECTED PIPELINE DEFINITON |
-    def _create_pipeline_runner(self, pipeline: Pipeline, parallel_mode: str, mem_store_templates: dict[str, Any], name=None, intent_dynamic_refs=None) -> PipelineRunner:
-        # parallelise/thread runner instances. 
-        runner = PipelineRunner(
-            id=self._next_runner_id(),
-            name=name,
-            pipeline=pipeline,
-            parallel=parallel_mode,
-            event_interface=self.event_interface,
-            store_interface=self.store_interface,
-            mem_store_templates=mem_store_templates,
-            max_attempts=self.max_idle_attempts,
-            track_unrepresented=self.track_unrepresented,
-            intent_dynamic_refs=intent_dynamic_refs,
-        )
-        self.register_pipeline(pipeline)
-
-       
-        self._register_runner(runner)
-        self.pipeline_to_runners[pipeline.id].append(runner.id)
-        return runner
-    
-    # | REGISTER PIPELINE RUNNER |
-    def _register_runner(self, runner: PipelineRunner) -> None:
-        print(f"[OCEAN] Registered Runner [{runner.id}]")
-        self.runners[runner.id] = runner
-
-    # | GET PIPELINE RUNNER | 
-    def _get_runner(self, runner_id: int) -> PipelineRunner:
-        runner = self.runners.get(runner_id)
-        if not runner:
-            print(f"no runner found with runner_id: {runner_id}")
-            return None
-        return runner 
-
-    # | GET ALL RUNNER IDS |
-    def _get_all_runner_ids(self):
-        runner_ids = [id for id in self.runners.keys()]
-        if not runner_ids:
-            print("No runners found at the moment!")
-            return
-        return runner_ids
-    
-    # | CREATE A SCOPED STORE ROUTER INSTANCE FOR PIPELINE RUNNERS |
-    def _create_scoped_router(self, runner_id, mem_store_templates: dict[str, dict] | None = None):
-        mem_store_templates = mem_store_templates or {}
-        aliases = {}
-
-        for store_name in sorted(mem_store_templates):
-            if store_name in self.store_registry._stores:
-                raise ValueError(
-                    "mem_store_templates cannot seed or overwrite global store "
-                    f"{store_name!r}; initialise global data once with "
-                    "Ocean.register_store(..., scope='global', "
-                    "store_template=...)."
-                )
-            if store_name not in self.store_registry._local_templates:
-                raise ValueError(
-                    "mem_store_templates can only seed registered local "
-                    f"MemoryKVStore stores; {store_name!r} is not registered "
-                    "as a local store."
-                )
-            if not isinstance(
-                self.store_registry._local_templates[store_name],
-                MemoryKVStore,
-            ):
-                raise ValueError(
-                    "mem_store_templates can only seed registered local "
-                    f"MemoryKVStore stores; {store_name!r} uses "
-                    f"{type(self.store_registry._local_templates[store_name]).__name__}."
-                )
-
-        for name, store in list(self.store_registry._local_templates.items()):
-            store_name = name
-            scoped_name = store_name + f"_{runner_id}"
-
-            if not self.store_registry.exists(scoped_name):
-                store_template = mem_store_templates.get(store_name, None)
-                self.store_registry.register(type(store)(name=scoped_name, store_template=store_template, scope="local", parent_runner_id=runner_id))
-
-            self.store_router.store_alias[store_name].add(scoped_name)
-            aliases.update({store_name: scoped_name})
-
-        return StoreRouter(
-            self.store_registry,
-            self.event_interface,
-            aliases,
-            subscribe_events=False,
-        )
-    
-    # | START A PIPELINE RUN AND REGISTER AS RUNNING |
-    def _start_runner(self, runner_id: PipelineRunner=None, stay_alive: bool=False) -> None:
-        runner = self._get_runner(runner_id)
-        self.running[runner_id] = runner # register runner as running
-        self.running[runner_id].run(stay_alive)
-
-    # | TICK ALL ACTIVE ('RUNNING') PIPELINE RUNNERS
-    def _advance_pipeline_runners(self):
-        ocean_has_pending_work = (
-            not self.event_queue.empty()
-            or bool(self.store_router.event_queue)
-            or not self.executor.idle()
-        )
-
-        for runner in list(self.running.values()):
-            if runner.purgatory and not runner.stay_alive and runner.complete:
-                print(f"killing runner {runner.id}")
-                self.consume_event(
-                    Event(
-                        source="ocean",
-                        source_id=self.id,
-                        target_runner_id=runner.id,
-                        event_type=OceanEvents.KILL_PIPELINE,
-                    )
-                )
-                continue
-
-            if ocean_has_pending_work and runner.purgatory:
-                continue
-
-            runner.tick()
-                
-    def tick(self, stay_alive=False, external=False):
-        """Advance one serialized Ocean scheduling turn.
-
-        Only one caller may route events, mutate stores, collect executor
-        results, or advance runners at a time, even if ``tick`` is invoked
-        concurrently outside the normal Ocean thread.
-        """
-        with self._tick_lock:
-            try:
-                event = self.event_queue.get_nowait()
-            except Empty:
-                event = None
-
-            if event is not None:
-                try:
-                    self.event_router.route(event)
-                finally:
-                    self.event_queue.task_done()
-
-            self.store_router.tick()
-            self.executor.tick()
-            self._advance_pipeline_runners()
-
-            if self._idle():
-                if external:
-                    print("the tide wanes")
-                    return
-
-                if not stay_alive and not self.running:
-                    print("The tide wanes | ocean is idle!")
-                    self.done = True
-                    print("DONE")
-                    return
-
-        
-
-        
-            
-
-    # | START OCEAN CLI s
-    def start(self, stay_alive=True) -> None:
-        if self.closed:
-            raise RuntimeError("Ocean is closed")
-        self.done = False
-        print("The ocean roars!")
-        # if stay_alive:
-        #     start_event_cli(self.event_interface, self.store_router)
-        
-        while not self.done:
-            self.tick(stay_alive)
-            if not self.done:
-                self._wait_for_scheduler_work(stay_alive)
-        print("Finished")
-
-        self._on_quit(None)
-        
-        
-    
     def start_threaded(self, stay_alive=True):
         if self.closed:
             raise RuntimeError("Ocean is closed")
         if self.thread is not None and self.thread.is_alive():
             raise RuntimeError("Ocean already has an active scheduling thread")
         self.done = False
-        trace_bus = Queue()
-        self.trace_bus = trace_bus
-
+        self._scheduler_error = None
         def run_ocean():
             try:
                 self.start(stay_alive)
-            except Exception as error:
-                if self.running:
-                    runner_id, runner = next(
-                        reversed(self.running.items())
-                    )
-                    self.executor.cancel_runner(runner_id)
-                    trace = self.log_tools.create_trace(
-                        runner,
-                        self.event_logger.log,
-                    )
-                    self.last_trace = trace
-                    self.runner_to_trace[runner_id] = trace
-                    error.tide_trace = trace
-                    self.running.pop(runner_id, None)
-                    self.event_router.subscribed_runners.pop(
-                        runner_id,
-                        None,
-                    )
-                trace_bus.put(error)
-
+            except BaseException as error:
+                self._poison_scheduler(error)
         caller_context = copy_context()
         self.thread = threading.Thread(
             target=caller_context.run,
@@ -483,212 +343,529 @@ class Ocean:
             daemon=True,
         )
         self.thread.start()
-
-        return trace_bus
-
-    # -- OCEAN ON-EVENTS -- #
-
-    # | EVENT CONSUMER |
-    def _handle_ocean_event(self, event: Event) -> None:
-        self.handlers[event.event_type](event)
-    
-    # | ON_EVENT: QUIT OCEAN | # TODO: doesnt actually work rn i thihk at least in event runtime
-    def _on_quit(self, event: Event):
-        print("quitting...")
-        self.done = True
-        return
-
-    # | ON_EVENT: SET VALUE TO STORE |
-    def _on_set(self, event: Event):
-        raise NotImplementedError(
-            "OceanEvents.SET has no store-write payload contract; use "
-            "RouterEvents.STORE_WRITE"
+        return self.thread
+    def run_node(
+        self,
+        node,
+        mode="sequential",
+        local_store_templates=None,
+        stay_alive=False,
+        timeout=_USE_OCEAN_TIMEOUT,
+        dynamic_ref_plan=None,
+        name=None,
+        return_trace=False,
+        default_store=None,
+    ):
+        if not isinstance(node, Node):
+            raise TypeError("run_node() requires a Node")
+        node_def_id = node.id
+        pipeline = Pipeline(
+            nodes=[node],
+            name=f"TIDE: .run_node({node.node_name})",
         )
-    
-    # | ON_EVENT: DELETE VALUE FROM STORE | 
-    def _on_delete(self, event: Event):
-        raise NotImplementedError(
-            "OceanEvents.DELETE has no store-delete payload contract; use "
-            "RouterEvents.DELETE"
+        trace = self.run_pipeline(
+            pipeline,
+            mode=mode,
+            local_store_templates=local_store_templates,
+            stay_alive=stay_alive,
+            timeout=timeout,
+            dynamic_ref_plan=dynamic_ref_plan,
+            name=name,
+            default_store=default_store,
         )
-    
-    # | ON_EVENT: BUILD | NOTE: currently handled in event_runtime, think about moving logic here.
-    def _on_build(self, event: Event):
-        pass
-
-    # | ON_EVENT: REGISTER PIPELINE | NOTE: No current register pipeline event implementation
-    def _on_register_pipeline(self, event: Event):
-        raise NotImplementedError(
-            "OceanEvents.REGISTER_PIPELINE has no event payload contract; "
-            "call Ocean.register_pipeline()"
+        if return_trace:
+            return trace
+        exec_records = [
+            record
+            for record in trace._log
+            if record.pipeline_id == pipeline.id
+            and record.base_node_id == node_def_id
+        ]
+        if not exec_records:
+            error = NoExecRecordError(
+                f"Node {node.node_name!r} did not produce an execution record"
+            )
+            error.tide_trace = trace
+            raise error
+        return exec_records[-1].output_value
+    def _on_run_pipeline(self, event):
+        payload = event.payload
+        pipeline, registered_templates = self._get_pipeline(
+            payload.pipeline_id
         )
-
-    # | ON_EVENT: REGISTER PIPELINE |
-    def _on_run_pipeline(self, event: Event):
-        # Unpack event
-        if len(event.payload) == 5:
-            (
-                pipeline_id,
-                parallel_mode,
-                mem_store_templates,
-                stay_alive,
-                name,
-            ) = event.payload
-            intent_dynamic_refs = None
-        else:
-            (
-                pipeline_id,
-                parallel_mode,
-                mem_store_templates,
-                stay_alive,
-                name,
-                intent_dynamic_refs,
-            ) = event.payload
-        pipeline, pipeline_store_templates = self._get_pipeline(pipeline_id)
-        # Choose store templates
-        mem_store_templates = mem_store_templates or pipeline_store_templates or {} # pipeline_store_templates always defaults already but {} to be safe however probs issue is falling back
-        # Create a pipeline runner instance
+        local_store_templates = (
+            payload.local_store_templates
+            or registered_templates
+        )
         runner = self._create_pipeline_runner(
             pipeline,
-            parallel_mode,
-            mem_store_templates,
-            name=name,
-            intent_dynamic_refs=intent_dynamic_refs,
+            payload.mode,
+            local_store_templates,
+            dynamic_ref_plan=payload.dynamic_ref_plan,
+            name=payload.runner_name,
         )
-        parent_runner = self.runners.get(event.source_id)
-        if getattr(pipeline, "_trace_include_prior_events", False):
-            runner.trace_event_start_id = None
-        elif event.exec_id is not None and parent_runner is not None:
-            runner.trace_event_start_id = getattr(
-                parent_runner,
-                "trace_event_start_id",
-                event.id,
-            )
-        else:
-            runner.trace_event_start_id = event.id
-        # subscribe the runner to PipelineEvents
+        # Retain this Runner's own starting Event.
+        runner.runner_start_event_id = event.event_id
+        # Retain the causal boundary inherited from the source Runner.
+        source_runner = self.runners.get(event.source_id)
+        runner.trace_event_start_id = (
+            source_runner.trace_event_start_id
+            if event.exec_id is not None and source_runner is not None
+            else event.event_id
+        )
+        # Publish the exact immutable plan before any work from this Runner.
+        # Its sole purpose is restoring the same plan onto a later Trace.
+        self.consume_event(Event(
+            ocean_id=self.id,
+            source="runner",
+            source_id=runner.id,
+            type=LogEvents.RUNNER_PLAN,
+            cause=Cause.from_event(event),
+            target_runner_id=runner.id,
+            payload=RunnerPlan(copy.deepcopy(runner._tide_plan)),
+        ))
+        # An Ocean-originated Runner is the parent of this run tree.
+        if (
+            event.source == "ocean"
+            and event.source_id == self.id
+            and event.exec_id is None
+        ):
+            self._parent_runner_id = runner.id
+        runner.remember_initial_ready_nodes(event)
         self.event_router.subscribed_runners[runner.id] = runner
-        print(f"Subscribed runner to router {self.event_router.subscribed_runners}")
-        # start pipeline runner
-        self._start_runner(runner.id, stay_alive=stay_alive)
-
-    # | ON_EVENT: KILL PIPELINE |
-    def _on_kill_pipeline(self, event: Event):
-        # get runner id to kill
-        target_runner_id = event.target_runner_id
-        # if not running - return
-        if target_runner_id not in self.runners:
-            print("Runner doesnt exist!")
+        self._start_runner(runner.id, payload.stay_alive)
+    def _on_kill_runner(self, event):
+        runner_id = event.target_runner_id
+        runner = self.running.pop(runner_id, None)
+        if runner is None:
             return
-        # if running:
-        if target_runner_id in self.running:
-            # remove from running list and unsub from PipelineEvents
-            del self.running[target_runner_id]
-            del self.event_router.subscribed_runners[target_runner_id]
-            
-            # Get the actual runner and call runner.kill() 
-            target_runner = self.runners[target_runner_id]
-            self.executor.cancel_runner(target_runner_id)
-            target_runner.on_kill(Event(source="ocean", source_id=self.id, target_runner_id=target_runner_id, event_type=PipelineEvents.KILL))
-            
-            # Create a trace and process logs
-            trace = self.log_tools.create_trace(target_runner, self.event_logger.log)
-            self.last_trace = trace
-            outcome = (
-                (trace, target_runner.failure)
-                if target_runner.failure is not None
-                else trace
+        # Stop routing and executing work for this Runner.
+        self.event_router.subscribed_runners.pop(runner_id, None)
+        self.event_router.retired_runner_ids.add(runner_id)
+        self.executor.cancel_runner(runner_id)
+        runner.on_kill(event)
+    def _next_pipeline_id(self):
+        return len(self.pipelines)
+    def _next_runner_id(self):
+        return len(self.runners)
+    def _get_pipeline(self, pipeline_id):
+        # Return one registered Pipeline definition and its Store seeds.
+        if pipeline_id not in self.pipelines:
+            raise KeyError(
+                f"Pipeline {pipeline_id!r} is not registered"
             )
-            self.trace_bus.put(outcome)
-            print("PUT trace into bus")
-            self.runner_to_trace[target_runner_id] = trace
-            # trace.show()
-            
-            return
-        print(f"Specified runner {target_runner_id} is not running!")
-        return
-
-    def close(self, wait=True):
-        """Stop Ocean activity and release executor resources."""
-        if self.closed:
-            return
-        self.done = True
-        self._wake_event.set()
-        if (
-            self.trace_bus is not None
-            and self.thread is not None
-            and self.thread.is_alive()
-        ):
-            self.trace_bus.put(
-                RuntimeError("Ocean closed before the active run produced evidence")
+        return self.pipelines[pipeline_id]
+    def _create_pipeline_runner(
+        self,
+        pipeline,
+        mode,
+        local_store_templates=None,
+        dynamic_ref_plan=None,
+        name=None,
+    ):
+        # Assign this Pipeline occurrence its Runner identity.
+        runner_id = self._next_runner_id()
+        # Create the actual local Stores owned by this Runner.
+        self._create_runner_stores(
+            runner_id,
+            local_store_templates,
+        )
+        # Create one Runner for this Pipeline occurrence.
+        runner = PipelineRunner(
+            id=runner_id,
+            ocean_id=self.id,
+            pipeline=pipeline,
+            event_interface=self.event_interface,
+            store_router=self.store_router,
+            now_coordinator=self._coordinate_now,
+            synchronous_event_router=self._route_scheduler_consequence,
+            pipeline_lookup=self._get_pipeline,
+            parallel=mode,
+            dynamic_ref_plan=dynamic_ref_plan,
+            name=name,
+        )
+        self.runners[runner.id] = runner
+        return runner
+    def _get_runner(self, runner_id):
+        # Return one registered Runner.
+        if runner_id not in self.runners:
+            raise KeyError(
+                f"Runner {runner_id!r} is not registered"
             )
-        if (
-            self.thread is not None
-            and self.thread.is_alive()
-            and self.thread is not threading.current_thread()
-        ):
-            self.thread.join(timeout=5 if wait else 0)
+        return self.runners[runner_id]
+    def _start_runner(
+        self,
+        runner_id,
+        stay_alive=False,
+    ):
+        # Register and start one active Runner.
+        runner = self._get_runner(runner_id)
+        self.running[runner.id] = runner
+        runner.run(stay_alive)
+    def _advance_pipeline_runners(self):
+        # Advance every Runner or request removal after proven settlement.
+        for runner in list(self.running.values()):
+            if runner.purgatory and runner.complete and runner._is_idle() and not runner.stay_alive:
+                self.consume_event(Event(
+                    ocean_id=self.id,
+                    source="ocean",
+                    source_id=self.id,
+                    type=OceanEvents.KILL_RUNNER,
+                    cause=Cause(
+                        description="automatic runner completion"
+                    ),
+                    target_runner_id=runner.id,
+                ))
+                continue
+            runner.tick()
+    def _idle(self):
+        # Report whether the complete Ocean has no work in flight.
+        return (
+            self._scheduler_queue.empty()
+            and not self.store_router.event_queue
+            and self.executor.idle()
+            and all(
+                runner._is_idle()
+                for runner in self.running.values()
+            )
+        )
+    def tick(
+        self,
+        stay_alive=False,
+        external=False,
+    ):
+        # Allow only one scheduling turn at a time.
+        with self._scheduler_context():
+            try:
+                try:
+                    work = self._scheduler_queue.get_nowait()
+                except Empty:
+                    work = None
+                if work is not None:
+                    try:
+                        if isinstance(work, _EventWork):
+                            self.event_router.route(work.event)
+                        elif isinstance(work, _SynchronousWork):
+                            self._complete_synchronous_work(work)
+                        else:
+                            raise TypeError(
+                                "Unsupported scheduler work: "
+                                f"{type(work).__name__}"
+                            )
+                    finally:
+                        self._scheduler_queue.task_done()
+                # Advance each runtime authority in dependency order.
+                self.store_router.tick()
+                self.executor.tick()
+                self._advance_pipeline_runners()
+                # Classify every locally inactive Runner at settlement.
+                if self._idle():
+                    for runner in self.running.values():
+                        if not runner.purgatory:
+                            continue
+                        runner.complete = True
+                        runner.deadlock = runner._deadlock_error()
+                        waiting = runner._deadlock_waiting()
+                        if (
+                            waiting
+                            and not runner.stay_alive
+                            and not runner.deadlock_reported
+                        ):
+                            runner.deadlock_reported = True
+                            self.consume_event(Event(
+                                ocean_id=self.id,
+                                source="runner",
+                                source_id=runner.id,
+                                type=LogEvents.RUNNER_DEADLOCK,
+                                cause=Cause(
+                                    description=(
+                                        "runner settled with unavailable "
+                                        "dependencies"
+                                    )
+                                ),
+                                target_runner_id=runner.id,
+                                payload=waiting,
+                            ))
+                if (
+                    not external
+                    and not stay_alive
+                    and not self.running
+                    and self._idle()
+                ):
+                    self.done = True
+            finally:
+                pass
+    @contextmanager
+    def _scheduler_context(self):
+        """Give one synchronous operation explicit scheduler ownership."""
         with self._tick_lock:
-            self.executor.shutdown(wait=wait, cancel_futures=True)
-        self.closed = True
-
-    def __enter__(self):
-        if self.closed:
-            raise RuntimeError("Ocean is closed")
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
-        return False
-    
-    
-# helpers keeping the ocean clean 
+            previous_owner = self._scheduler_owner_thread_id
+            self._scheduler_owner_thread_id = threading.get_ident()
+            try:
+                yield
+            finally:
+                self._scheduler_owner_thread_id = previous_owner
     def _wait_for_scheduler_work(self, stay_alive):
-        """Avoid a busy loop while preserving prompt event handling.
-
-        Worker completion is polled at a short interval because futures do not
-        write directly into Ocean's event queue.  A purgatory runner explicitly
-        kept alive, or an otherwise empty stay-alive Ocean, waits longer for an
-        external event.  ``consume_event`` wakes each wait immediately.
-        """
-        if not self.event_queue.empty() or self.store_router.event_queue:
+        # Continue immediately while routed work is waiting.
+        if (
+            not self._scheduler_queue.empty()
+            or self.store_router.event_queue
+        ):
             return
-
-        wait_timeout = None
+        # Poll only while Python execution is still running.
         if self.executor.running_tasks:
             wait_timeout = 0.001
-        elif self.running and all(
-            runner.stay_alive and runner.purgatory
-            for runner in self.running.values()
+        # Recheck a persistent Runner's stay-alive flag even without an Event.
+        elif (
+            self.running
+            and all(
+                runner.stay_alive and runner.purgatory
+                for runner in self.running.values()
+            )
         ):
             wait_timeout = 0.01
         elif stay_alive and not self.running:
-            wait_timeout = 0.05
-
-        if wait_timeout is None:
+            wait_timeout = None
+        else:
             return
-
+        # Clear, recheck, then wait so an arriving Event cannot be missed.
         self._wake_event.clear()
-        if not self.event_queue.empty() or self.store_router.event_queue:
+        if (
+            not self._scheduler_queue.empty()
+            or self.store_router.event_queue
+        ):
             return
         self._wake_event.wait(timeout=wait_timeout)
-
-    def _idle(self) -> bool:
-        # print(f"[OCEAN {id(self)}] IDLE CHECK q={id(self.event_queue)} size={self.event_queue.qsize()}")
-        queue_empty = self.event_queue.empty()
-        exec_idle = self.executor.idle()
-        all_runners_idle = all([running._is_idle() for running in self.running.values()])
-        store_idle = not self.store_router.event_queue
-
-            
-        if queue_empty and exec_idle and all_runners_idle and store_idle:
-            return True
-        return False 
-    
-    def _build_graph_from_dag(self, dag, name, node_index, runner_id):
-        # Graphviz rendering was intentionally removed from the core package.
-        # Keep this compatibility hook so older callers fail with a useful
-        # boundary rather than a missing optional dependency.
-        raise NotImplementedError(
-            "Graph rendering is provided by an external TIDE graphing module"
+    def start(self, stay_alive=True):
+        if self.closed:
+            raise RuntimeError("Ocean is closed")
+        self.done = False
+        try:
+            while not self.done:
+                self.tick(stay_alive=stay_alive)
+                if not self.done:
+                    self._wait_for_scheduler_work(stay_alive)
+        except BaseException as error:
+            self._fail_pending_synchronous_work(error)
+            raise
+        finally:
+            if self.done:
+                self._fail_pending_synchronous_work(
+                    RuntimeError("Ocean scheduler stopped")
+                )
+    def consume_event(self, event):
+        # Queue one Event and wake the Ocean scheduler.
+        if not isinstance(event, Event):
+            raise TypeError("Ocean scheduler accepts only Event evidence")
+        if self.closed:
+            raise RuntimeError("Ocean is closed")
+        if event.ocean_id != self.id:
+            raise ValueError(
+                "Event ocean identity disagrees with its destination Ocean: "
+                f"{event.ocean_id!r} != {self.id!r}"
+            )
+        with self._tick_lock:
+            self._scheduler_queue.put(_EventWork(event))
+        self._wake_event.set()
+    def _poison_scheduler(self, error):
+        """Permanently close an Ocean after an unexpected scheduler fault."""
+        self._scheduler_error = error
+        self.done = True
+        self.closed = True
+        self._wake_event.set()
+        self._fail_pending_synchronous_work(error)
+        # No queued Event or partially active Runner may survive into another
+        # run. The immutable Event history remains available for diagnosis.
+        while True:
+            try:
+                self._scheduler_queue.get_nowait()
+            except Empty:
+                break
+            else:
+                self._scheduler_queue.task_done()
+        active_runner_ids = tuple(self.running)
+        for runner_id in active_runner_ids:
+            self.executor.cancel_runner(runner_id)
+            self.event_router.retired_runner_ids.add(runner_id)
+        self.running.clear()
+        self.event_router.subscribed_runners.clear()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+    def _coordinate_now(self, operation, runner_id, runtime, effect):
+        """Apply one immediate operation at Ocean's linearization point."""
+        return self._coordinate_synchronous_work(_NowRequest(
+            operation=operation,
+            runner_id=runner_id,
+            runtime=runtime,
+            effect=effect,
+        ))
+    def _coordinate_tide_event(self, apply):
+        return self._coordinate_synchronous_work(
+            _TIDEEventRequest(apply=apply)
         )
+    def _coordinate_synchronous_work(self, request):
+        if threading.get_ident() == self._scheduler_owner_thread_id:
+            return self._apply_synchronous_work(request)
+        with self._tick_lock:
+            if self.closed:
+                raise RuntimeError("Ocean is closed")
+            self._scheduler_queue.put(request)
+            scheduler_running = (
+                self.thread is not None and self.thread.is_alive()
+            )
+        self._wake_event.set()
+        if scheduler_running:
+            request.completed.wait()
+        else:
+            while not request.completed.is_set():
+                self.tick(external=True)
+        if request.error is not None:
+            if request.scheduler_error is not None:
+                raise request.error from request.scheduler_error
+            raise request.error
+        return request.result
+    def _complete_synchronous_work(self, request):
+        try:
+            request.result = self._apply_synchronous_work(request)
+        except BaseException as error:
+            if isinstance(request, _NowRequest):
+                request.error = NowRequestFailed(
+                    f"Immediate {request.operation} operation failed"
+                )
+                request.scheduler_error = error
+            else:
+                request.error = error
+        finally:
+            request.completed.set()
+    def _apply_synchronous_work(self, request):
+        if isinstance(request, _TIDEEventRequest):
+            return request.apply()
+        if isinstance(request, _RegisterPipelineRequest):
+            if request.pipeline.id in self.pipelines:
+                return self.pipelines[request.pipeline.id][0]
+            if request.name is not None:
+                request.pipeline.name = request.name
+            event = Event(
+                ocean_id=self.id,
+                source="ocean",
+                source_id=self.id,
+                type=OceanEvents.REGISTER_PIPELINE,
+                cause=Cause(description="public pipeline registration"),
+                payload=PipelineRegistration(
+                    request.pipeline,
+                    request.local_store_templates,
+                ),
+            )
+            self._route_scheduler_consequence(event)
+            return request.pipeline
+        if isinstance(request, _NowRequest):
+            return self._apply_now_request(
+                request.operation,
+                request.runner_id,
+                request.runtime,
+                request.effect,
+            )
+        raise TypeError(
+            "Unsupported synchronous scheduler work: "
+            f"{type(request).__name__}"
+        )
+    def _apply_now_request(self, operation, runner_id, runtime, effect):
+        runner = self._get_runner(runner_id)
+        return runner._apply_now(operation, runtime, effect)
+    def _route_scheduler_consequence(self, event):
+        if threading.get_ident() != self._scheduler_owner_thread_id:
+            raise RuntimeError(
+                "Only Ocean's scheduler may synchronously route an Event"
+            )
+        self.event_router.route(event)
+    def _fail_pending_synchronous_work(self, scheduler_error):
+        retained = []
+        while True:
+            try:
+                work = self._scheduler_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if isinstance(work, _SynchronousWork):
+                    if isinstance(work, _NowRequest):
+                        work.error = NowRequestFailed(
+                            f"Immediate {work.operation} operation was interrupted"
+                        )
+                    else:
+                        work.error = RuntimeError(
+                            "Synchronous scheduler operation was interrupted"
+                        )
+                    work.scheduler_error = scheduler_error
+                    work.completed.set()
+                else:
+                    retained.append(work)
+            finally:
+                self._scheduler_queue.task_done()
+        for work in retained:
+            self._scheduler_queue.put(work)
+    def _handle_ocean_event(self, event):
+        # Dispatch one Ocean Event to its registered transition.
+        self.handlers[event.type](event)
+    def _on_quit(self, event):
+        # End the active Ocean scheduler.
+        self.done = True
+        self._wake_event.set()
+    def close(self, wait=True):
+        # Stop the scheduler and wake it if it is waiting.
+        if self.closed:
+            return
+        if self._run_lock.locked() and self._scheduler_error is None:
+            self._scheduler_error = RuntimeError(
+                "Ocean closed before the active run produced evidence"
+            )
+        self.done = True
+        self._wake_event.set()
+        # Wait for the scheduler unless close() was called by that scheduler.
+        if (
+            wait
+            and self.thread is not None
+            and self.thread.is_alive()
+            and self.thread is not threading.current_thread()
+        ):
+            self.thread.join()
+        # Stop outstanding execution and release the worker pool.
+        with self._tick_lock:
+            self.executor.shutdown(
+                wait=wait,
+                cancel_futures=True,
+            )
+        self.closed = True
+    def __enter__(self):
+        # A closed Ocean cannot be reopened.
+        if self.closed:
+            raise RuntimeError("Ocean is closed")
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Leaving the context always releases Ocean resources.
+        self.close()
+        return False
+    def _create_runner_stores(self, runner_id, local_store_templates=None):
+        local_store_templates = local_store_templates or {}
+        # Accept seeds only for registered local Store templates.
+        for store_name in sorted(local_store_templates):
+            if self.store_registry.exists(store_name):
+                raise ValueError(
+                    f"Cannot seed or overwrite global Store {store_name!r}"
+                )
+            if not self.store_registry.exists(store_name, template=True):
+                raise ValueError(
+                    f"{store_name!r} is not a registered local Store template"
+                )
+        # Create one actual local Store for this Runner from each template.
+        for store_name, template in self.store_registry._local_templates.items():
+            actual_name = f"{store_name}_{runner_id}"
+            if self.store_registry.exists(actual_name):
+                continue
+            initial = copy.deepcopy(
+                local_store_templates.get(store_name)
+            )
+            self.store_registry.register(type(template)(
+                name=actual_name,
+                store_template=initial,
+                scope="local",
+                parent_runner_id=runner_id,
+            ))

@@ -36,8 +36,8 @@ def edge_identity(edge):
     return (
         edge.producer_exec_id,
         edge.consumer_exec_id,
-        edge.produced_ref,
-        edge.produced_ver,
+        edge.read.unscoped_reference,
+        edge.read.resolved_version,
     )
 
 
@@ -66,14 +66,9 @@ def challenge_model(challenge_source):
 
 @pytest.fixture(scope="module")
 def challenge_trace(challenge_model):
-    with pytest.warns(
-        RuntimeWarning,
-        match="does not establish host provenance",
-    ):
-        return TIDE.from_model(
-            copy.deepcopy(challenge_model),
-            assign_unknown=True,
-        )
+    return TIDE.from_model(
+        copy.deepcopy(challenge_model),
+    )
 
 
 def test_fixture_keeps_claimed_and_inferred_outputs_separate(
@@ -91,11 +86,11 @@ def test_fixture_keeps_claimed_and_inferred_outputs_separate(
     )
 
 
-def test_boundary_states_remain_an_explicit_import_decision(
+def test_boundary_states_receive_external_projection_without_changing_model(
     challenge_model,
     challenge_trace,
 ):
-    original_report = TIDE.validate_model(challenge_model)
+    original_report = TIDE.report_model_validity(challenge_model)
     producer_errors = {
         error
         for error in original_report["errors"]
@@ -105,30 +100,17 @@ def test_boundary_states_remain_an_explicit_import_decision(
     assert original_report["semantically_valid"] is False
     assert len(producer_errors) == 2
 
-    with pytest.raises(ValueError, match="assign_unknown=True"):
-        TIDE.from_model(copy.deepcopy(challenge_model))
+    assert challenge_trace.model_context["external_producer"] == {
+        "exec_id": "TIDE: External",
+        "state_ids": ["s:csv_root_path", "s:job_id"],
+    }
 
-    assert challenge_trace.model_context["assigned_unknown_states"] == [
-        "s:csv_root_path",
-        "s:job_id",
-    ]
+    exported = challenge_trace.to_model(enrich=False)
 
-    with pytest.raises(ValueError, match="assign_unknown=True"):
-        challenge_trace.to_model(include_hashes=False)
-
-    with pytest.warns(
-        RuntimeWarning,
-        match="does not establish host provenance",
-    ):
-        exported = challenge_trace.to_model(
-            include_hashes=False,
-            assign_unknown=True,
-        )
-
-    assert TIDE.validate_model(exported)["semantically_valid"] is True
+    assert TIDE.report_model_validity(exported)["semantically_valid"] is False
 
 
-def test_trace_literal_and_structural_views_keep_the_same_history(
+def test_trace_literal_and_structural_views_include_external_projection(
     challenge_trace,
 ):
     literal = challenge_trace.show(color=False)
@@ -138,11 +120,11 @@ def test_trace_literal_and_structural_views_keep_the_same_history(
     )
     data = challenge_trace.to_dict()
 
-    assert "TRACE | 13 executions found" in literal
+    assert "TRACE | 13 executions shown" in literal
     assert "e:08:load_csv_file_into_table" in literal
-    assert "TRACE | 13 executions found" in structural
+    assert "TRACE | 13 executions shown" in structural
     assert data["host"] == "Third Provenance Challenge"
-    assert data["model_context"]["identity_mode"] == "host"
+    assert data["model_context"]["identity_mode"] == "literal"
     json.dumps(data)
 
 
@@ -295,7 +277,6 @@ def test_core_query_2_range_check_has_the_selected_database_input(
 
     assert path.exists()
     assert path.count() == 1
-    assert path.execution_route_count() == 1
     assert "s:database_v2_computed" in path.show(color=False)
 
 
@@ -347,7 +328,6 @@ def test_core_queries_1_5_and_13_expose_file_to_database_structure(
 
     assert entry_to_loaded.count() == 2
     assert root_to_computed.count() == 2
-    assert root_to_computed.execution_route_count() == 2
 
 
 def test_downstream_starts_from_the_selected_state_not_sibling_outputs(
@@ -357,11 +337,11 @@ def test_downstream_starts_from_the_selected_state_not_sibling_outputs(
         "csv_root_path",
         "reference",
     )
-    root_edges = stream.stream["unknown"]["root"]
+    root_edges = stream.stream["TIDE: External"]["root"]
 
     assert root_edges
     assert {
-        edge.produced_ref
+            edge.read.unscoped_reference
         for edge in root_edges
     } == {scoped("s:csv_root_path")}
 
@@ -372,7 +352,7 @@ def test_downstream_starts_from_the_selected_state_not_sibling_outputs(
         for edge in edges
     ]
     assert not any(
-        edge.produced_ref == scoped("s:job_id")
+        edge.read.unscoped_reference == scoped("s:job_id")
         for edge in all_edges
     )
     assert len({edge_identity(edge) for edge in all_edges}) == len(
@@ -386,7 +366,7 @@ def test_upstream_preserves_both_real_fan_in_branches(challenge_trace):
         "reference",
     )
     edge_refs = {
-        edge.produced_ref
+           edge.read.unscoped_reference
         for layers in stream.stream.values()
         for edges in layers.values()
         for edge in edges
@@ -406,7 +386,7 @@ def test_value_lookup_exposes_only_the_template_opaque_state(
     shown = capsys.readouterr().out
 
     assert isinstance(value, list) and len(value) == 1
-    assert "TIDEModelState" in repr(value[0])
+    assert repr(value[0]) == "opaque<TIDEUnknownValue>"
     assert "VALUE" in shown
     assert reference in shown
 
@@ -478,17 +458,23 @@ def test_all_public_inspection_results_render_and_return_json(
         json.dumps(compared.to_dict())
 
 
-def test_assign_unknown_context_survives_diff_and_bundle_round_trip(
+def test_external_producer_context_survives_comparison_and_bundle_round_trip(
     challenge_trace,
 ):
     restored = TIDE.from_bundle(challenge_trace.to_bundle())
 
-    assert challenge_trace.diff(challenge_trace).same
-    assert restored.diff(challenge_trace).same
-    assert restored.model_context["assigned_unknown_states"] == [
-        "s:csv_root_path",
-        "s:job_id",
-    ]
+    assert challenge_trace.compare(
+        challenge_trace,
+        mapping="literal",
+    ).complete_agreement
+    assert restored.compare(
+        challenge_trace,
+        mapping="literal",
+    ).complete_agreement
+    assert restored.model_context["external_producer"] == {
+        "exec_id": "TIDE: External",
+        "state_ids": ["s:csv_root_path", "s:job_id"],
+    }
     assert restored.path(
         "database_v2_computed",
         "is_match_table_column_ranges",

@@ -3,9 +3,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from tide_tooling.tooling_core.engine.classes import Event
-from tide_tooling.tooling_core.engine.classes import Node, Pipeline
-from tide_tooling.tooling_core.engine.events import OceanEvents, RouterEvents
+from tide_tooling import TIDE, WRITE_NOW, node, pipeline
+from tide_tooling.tooling_core.engine.classes import DataRef, Node, Pipeline
+from tide_tooling.tooling_core.engine.events import (
+    Cause,
+    Event,
+    LogEvents,
+    OceanEvents,
+    PipelineEvents,
+    RouterEvents,
+)
+from tide_tooling.tooling_core.engine.event_occurrences import EventLogger
 from tide_tooling.tooling_core.engine.ocean import Ocean
 from tide_tooling.tooling_core.engine.registries import StoreRegistry
 from tide_tooling.tooling_core.engine.routers import EventRouter, StoreRouter
@@ -42,6 +50,57 @@ def test_memory_store_methods_are_safe_for_concurrent_callers():
     assert len(store.keys()) == 800
 
 
+def test_competing_now_writes_share_one_authoritative_order():
+    start = threading.Barrier(4)
+
+    def make_writer(label):
+        @node(targets=[f"global:finished_{label}"])
+        def writer():
+            start.wait(timeout=2)
+            assert WRITE_NOW("global:race", label) is True
+            return label
+
+        return writer
+
+    writers = [make_writer(label) for label in ("a", "b", "c", "d")]
+
+    @pipeline
+    def race():
+        return [writer() for writer in writers]
+
+    tide = TIDE()
+    trace = tide.ocean.run_pipeline(race, mode="thread")
+    state_events = [
+        event
+        for event in trace.events
+        if event.type in {
+            PipelineEvents.DEP_AVAILABLE,
+            PipelineEvents.DEP_UPDATED,
+        }
+        and DataRef.to_string(event.payload.ref, prefix=False) == "global:race"
+    ]
+    event_positions = {
+        event.event_id: position
+        for position, event in enumerate(trace.events)
+    }
+
+    assert len(state_events) == 4
+    assert tide.ocean.store_router.get("global", "race") == (
+        state_events[-1].payload.value
+    )
+    assert trace.value_of("global:race")[-1] == state_events[-1].payload.value
+    for state_event in state_events:
+        effect_event = next(
+            event
+            for event in trace.events
+            if event.event_id == state_event.cause.event_id
+        )
+        assert effect_event.type == LogEvents.EFFECT
+        assert event_positions[effect_event.event_id] < event_positions[
+            state_event.event_id
+        ]
+
+
 def test_memory_store_dump_is_a_mapping_snapshot():
     store = MemoryKVStore(store_template={"before": 1})
 
@@ -55,8 +114,10 @@ def test_memory_store_dump_is_a_mapping_snapshot():
 def test_store_router_never_handles_two_queued_events_at_once():
     router = StoreRouter(
         StoreRegistry(),
-        event_interface=SimpleNamespace(emit_event_to_ocean=lambda event: None),
-        subscribe_events=False,
+        event_interface=SimpleNamespace(
+            emit_event_to_ocean=lambda event: None,
+            event_subscriber=lambda *args: None,
+        ),
     )
     first_entered = threading.Event()
     second_entered = threading.Event()
@@ -72,7 +133,7 @@ def test_store_router_never_handles_two_queued_events_at_once():
             active += 1
             maximum_active = max(maximum_active, active)
             position = len(handled)
-            handled.append(event.id)
+            handled.append(event.event_id)
         if position == 0:
             first_entered.set()
             assert release_first.wait(timeout=2)
@@ -82,8 +143,8 @@ def test_store_router_never_handles_two_queued_events_at_once():
             active -= 1
 
     router.event_handlers[RouterEvents.STORE_WRITE] = handle
-    router.consume_event(Event(event_type=RouterEvents.STORE_WRITE))
-    router.consume_event(Event(event_type=RouterEvents.STORE_WRITE))
+    router.consume_event(Event(source="test", source_id="test", type=RouterEvents.STORE_WRITE, cause=Cause(description="test"), ocean_id=0))
+    router.consume_event(Event(source="test", source_id="test", type=RouterEvents.STORE_WRITE, cause=Cause(description="test"), ocean_id=0))
 
     first_tick = threading.Thread(target=router.tick)
     second_tick = threading.Thread(target=router.tick)
@@ -116,7 +177,7 @@ def test_ocean_never_executes_two_scheduling_turns_at_once():
             active += 1
             maximum_active = max(maximum_active, active)
             position = len(routed)
-            routed.append(event.id)
+            routed.append(event.event_id)
         if position == 0:
             first_entered.set()
             assert release_first.wait(timeout=2)
@@ -126,8 +187,10 @@ def test_ocean_never_executes_two_scheduling_turns_at_once():
             active -= 1
 
     ocean.event_router.route = route
-    ocean.consume_event(Event(event_type=OceanEvents.SET))
-    ocean.consume_event(Event(event_type=OceanEvents.SET))
+    first = Event(source="test", source_id="test", type=OceanEvents.QUIT, cause=Cause(description="test"), ocean_id=ocean.id)
+    second = Event(source="test", source_id="test", type=OceanEvents.QUIT, cause=Cause(description="test"), ocean_id=ocean.id)
+    ocean.consume_event(first)
+    ocean.consume_event(second)
 
     first_tick = threading.Thread(target=ocean.tick, kwargs={"external": True})
     second_tick = threading.Thread(target=ocean.tick, kwargs={"external": True})
@@ -141,7 +204,7 @@ def test_ocean_never_executes_two_scheduling_turns_at_once():
     _join(second_tick)
     ocean.close(wait=False)
 
-    assert routed == sorted(routed)
+    assert routed == [first.event_id, second.event_id]
     assert maximum_active == 1
 
 
@@ -158,7 +221,7 @@ def test_ocean_can_kill_a_runner_while_its_thread_worker_is_still_running():
 
     ocean = Ocean(timeout=2)
     pipeline = Pipeline(
-        stages=[Node(long_running_worker, targets=["@result"])],
+        nodes=[Node(long_running_worker, targets=["@result"])],
         name="kill-responsive",
     )
 
@@ -175,10 +238,12 @@ def test_ocean_can_kill_a_runner_while_its_thread_worker_is_still_running():
     assert worker_started.wait(timeout=2)
 
     runner_id = next(iter(ocean.running))
-    ocean.consume_event(Event(
+    ocean.consume_event(Event(ocean_id=ocean.id, 
         source="test",
+        source_id="test",
         target_runner_id=runner_id,
-        event_type=OceanEvents.KILL_PIPELINE,
+        type=OceanEvents.KILL_RUNNER,
+        cause=Cause(description="test"),
     ))
 
     finished_while_worker_blocked = caller_finished.wait(timeout=0.5)
@@ -188,7 +253,7 @@ def test_ocean_can_kill_a_runner_while_its_thread_worker_is_still_running():
 
     assert finished_while_worker_blocked
     assert "error" not in outcome
-    assert outcome["trace"] is ocean.runner_to_trace[runner_id]
+    assert outcome["trace"] is ocean.last_trace
 
 
 def test_ocean_rejects_a_second_public_run_while_one_is_active():
@@ -202,11 +267,11 @@ def test_ocean_rejects_a_second_public_run_while_one_is_active():
 
     ocean = Ocean(timeout=2)
     first_pipeline = Pipeline(
-        stages=[Node(long_running_worker, targets=["@first"])],
+        nodes=[Node(long_running_worker, targets=["@first"])],
         name="first-run",
     )
     second_pipeline = Pipeline(
-        stages=[Node(lambda: "second", targets=["@second"])],
+        nodes=[Node(lambda: "second", targets=["@second"])],
         name="second-run",
     )
     first_outcome = {}
@@ -223,16 +288,20 @@ def test_ocean_rejects_a_second_public_run_while_one_is_active():
 
     with pytest.raises(
         RuntimeError,
-        match="does not support concurrent public calls",
+        match="does not support concurrent calls",
     ):
         ocean.run_pipeline(second_pipeline, mode="sequential")
 
     runner_id = next(iter(ocean.running))
-    ocean.consume_event(Event(
+    ocean.consume_event(Event(ocean_id=ocean.id, 
         source="test",
+        source_id="test",
         target_runner_id=runner_id,
-        event_type=OceanEvents.KILL_PIPELINE,
+        type=OceanEvents.KILL_RUNNER,
+        cause=Cause(description="test"),
     ))
+    first_caller.join(timeout=0.5)
+    assert not first_caller.is_alive()
     release_worker.set()
     _join(first_caller)
     ocean.close()
@@ -254,7 +323,7 @@ def test_closed_ocean_rejects_all_start_boundaries():
 def test_unknown_execution_mode_is_rejected_with_the_valid_modes():
     ocean = Ocean(timeout=1)
     pipeline = Pipeline(
-        stages=[Node(lambda: "value", targets=["global:result"])],
+        nodes=[Node(lambda: "value", targets=["global:result"])],
         name="invalid-mode",
     )
 
@@ -265,29 +334,19 @@ def test_unknown_execution_mode_is_rejected_with_the_valid_modes():
 
 
 def test_event_router_rejects_an_event_type_without_a_subscriber():
-    router = EventRouter(SimpleNamespace(log_event=lambda event: None))
+    router = EventRouter(EventLogger())
 
-    with pytest.raises(ValueError, match="No event subscriber"):
-        router.route(Event(event_type="unknown"))
+    with pytest.raises(TypeError, match="Unsupported Event type"):
+        router.route(Event(source="test", source_id="test", type="unknown", cause=Cause(description="test"), ocean_id=0))
 
 
-@pytest.mark.parametrize(
-    ("event_type", "message"),
-    [
-        (OceanEvents.SET, "RouterEvents.STORE_WRITE"),
-        (OceanEvents.DELETE, "RouterEvents.DELETE"),
-        (OceanEvents.REGISTER_PIPELINE, "Ocean.register_pipeline"),
-    ],
-)
-def test_unimplemented_ocean_events_fail_at_the_exact_boundary(
-    event_type,
-    message,
-):
+def test_register_pipeline_records_the_definition():
     ocean = Ocean()
+    pipeline = Pipeline(nodes=[])
+    registered = ocean.register_pipeline(pipeline)
 
-    with pytest.raises(NotImplementedError, match=message):
-        ocean._handle_ocean_event(Event(event_type=event_type))
-
+    assert registered is pipeline
+    assert ocean.pipelines[pipeline.id][0] is pipeline
     ocean.close(wait=False)
 
 
@@ -304,7 +363,7 @@ def test_close_unblocks_an_active_public_run_without_waiting_for_worker():
 
     ocean = Ocean()
     pipeline = Pipeline(
-        stages=[Node(long_running_worker, targets=["global:result"])],
+        nodes=[Node(long_running_worker, targets=["global:result"])],
         name="close-responsive",
     )
 

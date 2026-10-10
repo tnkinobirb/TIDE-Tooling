@@ -81,19 +81,17 @@ CHALLENGE_MODEL["S"] = sorted({
 
 @pytest.fixture
 def challenge_trace():
-    with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
-        return TIDE.from_model(
-            copy.deepcopy(CHALLENGE_MODEL),
-            assign_unknown=True,
-        )
+    return TIDE.from_model(
+        copy.deepcopy(CHALLENGE_MODEL),
+    )
 
 
 def edge_tuple(edge):
     return (
         edge.producer_exec_id,
         edge.consumer_exec_id,
-        edge.produced_ref,
-        edge.produced_ver,
+        edge.read.unscoped_reference,
+        edge.read.resolved_version,
     )
 
 
@@ -106,8 +104,7 @@ def test_unbounded_upstream_walks_complete_challenge_ancestry_once_per_layer(
     )
     root = "e:10:slicer"
 
-    assert stream.count() == 64
-    assert stream.execution_route_count() == 4
+    assert stream.count() == 4
     assert stream.truncated is False
     assert {
         layer: len(edges)
@@ -125,7 +122,11 @@ def test_unbounded_upstream_walks_complete_challenge_ancestry_once_per_layer(
         for edge in edges
     }
     assert len(edge_keys) == 30
-    assert len(stream.to_dict()["edges"]) == 30
+    assert sum(
+        len(layer["handoffs"])
+        for root in stream.to_dict()["stream"]
+        for layer in root["layers"]
+    ) == 30
 
 
 def test_stream_depth_zero_is_direct_and_positive_depth_adds_layers(
@@ -142,9 +143,9 @@ def test_stream_depth_zero_is_direct_and_positive_depth_adds_layers(
         depth=1,
     )
 
-    assert direct.count() == 2
+    assert direct.count() == 1
     assert set(direct.stream["e:10:slicer"]) == {"root"}
-    assert one_layer.count() == 16
+    assert one_layer.count() == 4
     assert {
         layer: len(edges)
         for layer, edges in one_layer.stream["e:10:slicer"].items()
@@ -155,16 +156,16 @@ def test_unbounded_stream_has_an_explicit_path_budget(challenge_trace):
     stream = challenge_trace.upstream(
         "atlas_x_slice",
         "reference",
-        max_paths=10,
+        max_paths=2,
     )
 
-    assert stream.count() == 10
+    assert stream.count() == 2
     assert stream.truncated is True
     assert stream.to_dict()["truncated"] is True
-    assert "truncated at 10 paths" in stream.show(color=False)
+    assert "truncated at 2 paths" in stream.show(color=False)
 
 
-def test_path_distinguishes_exact_state_paths_from_execution_routes(
+def test_path_groups_parallel_handoffs_into_execution_paths(
     challenge_trace,
 ):
     from_softmean = challenge_trace.path(
@@ -180,57 +181,58 @@ def test_path_distinguishes_exact_state_paths_from_execution_routes(
         "reference",
     )
 
-    assert from_softmean.count() == 2
-    assert from_softmean.execution_route_count() == 1
-    assert from_align.count() == 16
-    assert from_align.execution_route_count() == 4
+    assert from_softmean.count() == 1
+    assert from_align.count() == 4
 
     output = from_align.show(color=False)
-    assert "16 paths found | 4 execution routes" in output
+    assert "4 paths found" in output
     assert "e:13:convert" in output
 
-    with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
-        exported = challenge_trace.to_model(
-            include_hashes=False,
-            assign_unknown=True,
-        )
+    exported = challenge_trace.to_model(enrich=False)
     producers = {
         edge["exec_id"]
         for edge in exported["O"]
         if edge["state_id"] == "s:atlas_x_graphic"
     }
     assert producers == {"e:13:convert"}
-    assert TIDE.validate_model(exported)["checks"]["unique_creation"] is True
+    assert TIDE.report_model_validity(exported)["unique_creation"] is False
 
 
-def test_model_diff_reuses_recorded_unknown_assignment_policy(challenge_trace):
-    compared = challenge_trace.diff(challenge_trace)
+def test_model_compare_reuses_recorded_external_producer_policy(challenge_trace):
+    compared = challenge_trace.compare(challenge_trace, mapping="literal")
 
-    assert compared.same is True
-    assert compared.before_report["semantically_valid"] is True
-    assert compared.after_report["semantically_valid"] is True
+    assert compared.complete_agreement is True
+    assert compared["models"]["source"]["semantically_valid"] is False
+    assert compared["models"]["target"]["semantically_valid"] is False
+
+    represented = challenge_trace.compare(
+        challenge_trace,
+        mapping="literal",
+        represent_unknown_producers=True,
+    )
+    assert represented.complete_agreement is True
+    assert represented["models"]["source"]["semantically_valid"] is True
+    assert represented["models"]["target"]["semantically_valid"] is True
 
     restored = TIDE.from_bundle(challenge_trace.to_bundle())
-    assert restored.model_context["assigned_unknown_states"]
-    assert restored.diff(challenge_trace).same is True
+    assert restored.model_context["external_producer"]
+    assert restored.compare(challenge_trace, mapping="literal").complete_agreement
 
-    with pytest.raises(ValueError, match="assign_unknown=True"):
-        challenge_trace.to_model(include_hashes=False)
+    exported = challenge_trace.to_model(enrich=False)
+    assert TIDE.report_model_validity(exported)["semantically_valid"] is False
 
 
 def test_from_model_rejects_a_trace_with_an_actionable_boundary_message(
     challenge_trace,
 ):
-    with pytest.raises(
-        TypeError,
-        match=r"received Trace.*trace\.to_model",
-    ):
-        TIDE.from_model(challenge_trace, assign_unknown=True)
+    with pytest.raises(ValueError, match="structurally invalid TIDE Model"):
+        TIDE.from_model(challenge_trace)
 
-    with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
-        model_with_unknown = challenge_trace.to_model(
-            include_hashes=False,
-            assign_unknown=True,
-        )
-    reimported = TIDE.from_model(model_with_unknown)
-    assert reimported.diff(challenge_trace).same is True
+    exported = challenge_trace.to_model(enrich=False)
+    reimported = TIDE.from_model(
+        exported,
+    )
+    assert reimported.compare(
+        challenge_trace,
+        mapping="literal",
+    ).complete_agreement is True

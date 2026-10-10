@@ -37,9 +37,9 @@ def test_value_of_rejects_a_conflicting_inspected_reference_version(trace):
 
 
 def test_value_of_rejects_an_inspected_non_reference(trace):
-    inspected = trace.inspect(trace.exec_log[0].exec_id, "exec_record")
+    inspected = trace.inspect(trace.log[0].exec_id, "exec_record")
 
-    with pytest.raises(TypeError, match="inspected reference"):
+    with pytest.raises(TypeError, match="reference or value hash"):
         trace.value_of(inspected)
 
 

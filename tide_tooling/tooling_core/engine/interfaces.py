@@ -7,13 +7,9 @@ if TYPE_CHECKING:
 from typing import Callable
 
 
-class StoreInterface:
-    def __init__(self, create_scoped_router: Callable):
-        self.create_scoped_router = create_scoped_router
-
-        
 class EventInterface:
-    def __init__(self, event_emitter: Callable, event_subscriber) -> None:
+    def __init__(self, ocean_id, event_emitter: Callable, event_subscriber) -> None:
+        self.ocean_id = ocean_id
         self._event_emitter = event_emitter # or ocean_queue
         self.event_subscriber = event_subscriber
     

@@ -107,7 +107,7 @@ def test_node_wrappers_support_manual_event_tracing_with_real_values():
     assert data == {"value": 2}
     assert processed_data == {"value": 4}
     assert trust is True
-    assert [record.func_name for record in trace.exec_log] == [
+    assert [record.func_name for record in trace.log] == [
         "create_data",
         "process_data",
         "trust_check_data",
@@ -116,24 +116,27 @@ def test_node_wrappers_support_manual_event_tracing_with_real_values():
 
 
 def test_effects_are_ordinary_descriptive_values_outside_tide_runtime():
-    from tide_tooling import READ, WRITE, node
-    from tide_tooling.tooling_core.engine.classes import __TIDE_TEMPLATE_VALUE__
+    from tide_tooling import READ, WRITE, node, DataRef
+    from tide_tooling.tooling_core.engine.classes import __fallback__
 
     @node
     def request_write():
-        return WRITE("global:result", preserve_output=3)
+        return WRITE("global:result", 3, output=3)
 
     effect = request_write()
 
     assert effect.to_dict() == {
-        "effect": "WRITE",
-        "preserve_output": 3,
-        "targets": ["global:result"],
+        "effect": "write",
+        "output": 3,
+        "targets": ((DataRef(store="global", key="result"), 3),),
     }
-    assert str(effect) == "WRITE(targets=['global:result'])"
+    assert str(effect) == (
+        "write(targets=((DataRef(key='result', store='global', count=None, "
+        "max=None, literal=False), 3),))"
+    )
     assert isinstance(
         READ("global:unavailable"),
-        __TIDE_TEMPLATE_VALUE__,
+        __fallback__,
     )
 
 
@@ -148,7 +151,7 @@ def test_read_effect_returns_value_and_records_runtime_evidence(capsys):
 
     output = tide.exec(copy_source, writes="copied")
     trace = tide.trace()
-    effects = trace.exec_log[-1].effects
+    effects = trace.log[-1].effects
 
     assert output == 41
     assert trace.value_of("global:copied", 0) == 41
@@ -157,7 +160,7 @@ def test_read_effect_returns_value_and_records_runtime_evidence(capsys):
     assert effects[0].targets == ("global:source", 0)
     assert effects[0].output == 41
 
-    read_record = trace.exec_log[-1].deps[-1]
+    read_record = trace.log[-1].deps[-1]
     assert read_record.associated_input[0] == "runtime_read"
     assert read_record.unscoped_reference == "global:source"
     assert read_record.resolved_version == 0
@@ -183,7 +186,7 @@ def test_read_effect_returns_value_and_records_runtime_evidence(capsys):
     assert "via READ effect" in coloured
 
     imported = TIDE.from_bundle(trace.to_bundle())
-    imported_read = imported.exec_log[-1].deps[-1]
+    imported_read = imported.log[-1].deps[-1]
     assert imported_read.associated_input[0] == "runtime_read"
     assert imported_read.unscoped_reference == "global:source"
     assert imported.path(
@@ -194,30 +197,28 @@ def test_read_effect_returns_value_and_records_runtime_evidence(capsys):
     ).exists()
 
 
-def test_read_effect_requeues_explicit_process_execution_to_thread_pool():
-    from tide_tooling.tooling_core.engine.classes import Node
-    from tide_tooling import Effects, TIDE
+def test_read_effect_fails_under_explicit_process_execution():
+    from tide_tooling.tooling_core.engine.classes import Node, Pipeline
+    from tide_tooling import TIDE
+    from tide_tooling.tooling_core.engine.errors import (
+        ReadInsideProcessPoolError,
+    )
 
     tide = TIDE()
     tide.declare("source", 41)
-    trace, record, output = tide.ocean.run_node(
-        Node(
-            func=_read_source_from_explicit_process_node,
-            targets=["global:copied"],
-        ),
-        mode="process",
-    )
-
-    assert output == 41
-    assert record.status == "succeeded"
-    assert trace.value_of("global:copied", 0) == 41
-    assert record.deps[-1].unscoped_reference == "global:source"
-    assert record.effects[0].effect == Effects.READ
+    with pytest.raises(ReadInsideProcessPoolError):
+        tide.ocean.run_pipeline(
+            Pipeline(nodes=[Node(
+                func=_read_source_from_explicit_process_node,
+                targets=["global:copied"],
+            )]),
+            mode="process",
+        )
 
 
 def test_read_effect_uses_template_fallback_and_still_records_attempt():
     from tide_tooling import Effects, READ, TIDE
-    from tide_tooling.tooling_core.engine.classes import __TIDE_TEMPLATE_VALUE__
+    from tide_tooling.tooling_core.engine.classes import __fallback__
 
     def read_missing():
         return READ("global:not_there")
@@ -225,16 +226,16 @@ def test_read_effect_uses_template_fallback_and_still_records_attempt():
     tide = TIDE()
     output = tide.exec(read_missing, writes="fallback")
     trace = tide.trace()
-    effect = trace.exec_log[-1].effects[0]
+    effect = trace.log[-1].effects[0]
 
-    assert isinstance(output, __TIDE_TEMPLATE_VALUE__)
+    assert isinstance(output, __fallback__)
     assert isinstance(
         trace.value_of("global:fallback", 0),
-        __TIDE_TEMPLATE_VALUE__,
+        __fallback__,
     )
     assert effect.effect == Effects.READ
-    assert effect.targets == ("global:not_there", 0)
-    assert isinstance(effect.output, __TIDE_TEMPLATE_VALUE__)
+    assert effect.targets == ("global:not_there", None)
+    assert isinstance(effect.output, __fallback__)
 
 
 def test_public_decorators_run_pipeline_after_import():
@@ -263,8 +264,8 @@ def test_public_decorators_run_pipeline_after_import():
     # functions run while the decorated pipeline graph is being constructed.
     # Their resulting plain dict is now represented by one observer execution
     # before trust_check_data consumes it.
-    observer, trust_check = trace.exec_log
-    assert observer.func_name == "TIDE_OBSERVER"
+    observer, trust_check = trace.log
+    assert observer.func_name == "TIDE: External"
     assert trust_check.func_name == "trust_check_data"
     assert trust_check.deps[0].producer_exec_id == observer.exec_id
 
@@ -291,7 +292,7 @@ def test_public_decorators_build_and_run_three_link_pipeline():
     trace = TIDE().ocean.run_pipeline(subtle_bug)
 
     assert trace is not None
-    assert [record.func_name for record in trace.exec_log] == [
+    assert [record.func_name for record in trace.log] == [
         "create_data",
         "process_data",
         "trust_check_data",
@@ -360,10 +361,12 @@ def test_line_by_line_pipeline_collects_chain_without_return():
     built = line_by_line()
     trace = TIDE().ocean.run_pipeline(built)
 
-    assert len(built.stages) == 1
-    assert len(built.stages[0].nodes) == 1
-    assert built.stages[0].nodes[0].node_name == "trust_check_data"
-    assert [record.func_name for record in trace.exec_log] == [
+    assert [node.node_name for node in built.nodes] == [
+        "create_data",
+        "process_data",
+        "trust_check_data",
+    ]
+    assert [record.func_name for record in trace.log] == [
         "create_data",
         "process_data",
         "trust_check_data",
@@ -389,25 +392,24 @@ def test_line_by_line_pipeline_keeps_disconnected_nodes_as_roots():
     built = disconnected()
     trace = TIDE().ocean.run_pipeline(built)
 
-    assert [node.node_name for node in built.stages[0].nodes] == [
+    assert [node.node_name for node in built.nodes] == [
         "write_left",
         "write_right",
     ]
-    assert {record.func_name for record in trace.exec_log} == {
+    assert {record.func_name for record in trace.log} == {
         "write_left",
         "write_right",
     }
 
 
-def test_empty_line_by_line_pipeline_raises_clear_error():
+def test_empty_line_by_line_pipeline_is_a_valid_starting_state():
     from tide_tooling import pipeline
 
     @pipeline
     def empty_pipeline():
         pass
 
-    with pytest.raises(ValueError, match="did not build or return any nodes"):
-        empty_pipeline()
+    assert empty_pipeline().nodes == []
 
 
 def test_parameterised_pipeline_builds_fresh_nodes_for_each_call():
@@ -423,8 +425,8 @@ def test_parameterised_pipeline_builds_fresh_nodes_for_each_call():
 
     first = parameterised("first")
     second = parameterised("second")
-    first_node = first.stages[0].nodes[0]
-    second_node = second.stages[0].nodes[0]
+    first_node = first.nodes[0]
+    second_node = second.nodes[0]
 
     assert first is not second
     assert first_node is not second_node
@@ -445,7 +447,7 @@ def test_repeated_node_calls_create_distinct_occurrences_in_one_build():
         observe("second")
 
     built = repeated()
-    nodes = built.stages[0].nodes
+    nodes = built.nodes
 
     assert len(nodes) == 2
     assert nodes[0] is not nodes[1]
@@ -469,7 +471,7 @@ def test_tide_exec_unwraps_decorated_node_function():
     assert output == 3
     assert trace.value_of("global:exec_target", 0) == 3
     assert "global:decorator_target" not in trace.index.seen_refs
-    assert trace.exec_log[-1].func_name == "add_one"
+    assert trace.log[-1].func_name == "add_one"
 
 
 def test_tide_exec_accepts_called_node_definition_and_inherits_inputs_and_targets():
@@ -511,7 +513,7 @@ def test_tide_exec_context_builds_and_executes_nested_node_graph():
     trace = tide.trace()
 
     assert output is True
-    assert [record.func_name for record in trace.exec_log] == [
+    assert [record.func_name for record in trace.log] == [
         "create_data",
         "process_data",
         "trust_check_data",
@@ -535,7 +537,7 @@ def test_tide_exec_is_quiet_until_show_is_requested(capsys):
     tide.trace().show(color=False)
     shown = capsys.readouterr().out
 
-    assert "TRACE | 1 execution found" in shown
+    assert "TRACE | 1 execution shown" in shown
     assert "produce" in shown
 
 
@@ -555,18 +557,18 @@ def test_tide_exec_accepts_a_single_write_string():
 def test_single_decorator_effect_is_inherited_by_tide_exec():
     from tide_tooling import Effects, TIDE, WRITE, node
 
-    @node(effects=WRITE("global:effect_output", preserve_output=7))
+    @node(effects=WRITE("global:effect_output", 7))
     def produce():
         return 5
 
     tide = TIDE()
     output = tide.exec(produce)
     trace = tide.trace()
-    record = trace.exec_log[-1]
+    record = trace.log[-1]
 
     assert output == 5
     assert trace.value_of("global:effect_output", 0) == 7
-    assert record.declared_effects[0].targets[0].key == "effect_output"
+    assert record.declared_effects[0].targets[0][0].key == "effect_output"
     assert record.effects[0].effect == Effects.WRITE
 
 
@@ -579,7 +581,7 @@ def test_tide_exec_accepts_an_explicit_effect():
     tide = TIDE()
     output = tide.exec(
         produce,
-        effects=WRITE("global:effect_output", preserve_output=11),
+        effects=WRITE("global:effect_output", 11),
     )
     tide.exec(
         lambda value: value + 1,
@@ -587,34 +589,34 @@ def test_tide_exec_accepts_an_explicit_effect():
         writes="after_effect",
     )
     trace = tide.trace()
-    producer_record = trace.exec_log[0]
-    consumer_record = trace.exec_log[1]
+    producer_record = trace._log[0]
+    consumer_record = trace._log[1]
     effect_record = producer_record.effects[0]
+    index = trace._index
 
     assert output == "ordinary output"
     assert trace.value_of("global:effect_output", 0) == 11
     assert effect_record.effect == Effects.WRITE
     assert effect_record.targets == ("global:effect_output", 0)
-    assert trace.index.effect_records_by_type[Effects.WRITE] == [effect_record]
-    assert trace.index.effect_records_by_target[
+    occurrences = list(index.effect_occurrences_by_type[Effects.WRITE])
+    assert [
+        index.effect_by_occurrence[occurrence][1]
+        for occurrence in occurrences
+    ] == [effect_record]
+    assert list(index.effect_occurrences_by_target[
         (Effects.WRITE, "global:effect_output")
-    ] == [effect_record]
-    assert trace.index.effect_records_by_versioned_target[
+    ]) == occurrences
+    assert list(index.effect_occurrences_by_ref_version[
         (Effects.WRITE, "global:effect_output", 0)
-    ] == [effect_record]
+    ]) == occurrences
+    affected_records = index.affected_records_by_effect_occurrence[
+        occurrences[0]
+    ]
     assert consumer_record.exec_id in {
         affected.affected_exec_id
-        for entry in trace.index.effect_type_to_affected[Effects.WRITE]
-        for affected in entry.values()
+        for affected in affected_records
     }
-    assert trace.index.effect_affected_input_positions[
-        (
-            Effects.WRITE,
-            "global:effect_output",
-            0,
-            consumer_record.exec_id,
-        )
-    ]
+    assert any(affected.affected_inputs for affected in affected_records)
 
     inspected_type = trace.find(Effects.WRITE).first("effect")
     inspected_target = trace.inspect(
@@ -638,25 +640,34 @@ def test_tide_exec_accepts_an_explicit_effect():
 
 def test_tide_event_accepts_and_applies_reference_effects():
     from tide_tooling import DELETE, Effects, TIDE, WRITE
+    from tide_tooling.tooling_core.engine.classes import __fallback__
+    from tide_tooling.tooling_core.engine.events import LogEvents
 
     tide = TIDE()
     tide.event(
         "effect writer",
-        effects=WRITE("global:event_effect", preserve_output=13),
+        effects=WRITE("global:event_effect", 13),
     )
     write_trace = tide.trace()
-    write_record = write_trace.exec_log[-1]
+    write_record = write_trace.log[-1]
 
     assert write_trace.value_of("global:event_effect", 0) == 13
-    assert write_record.declared_effects[0].preserve_output == 13
+    assert isinstance(write_record.declared_effects[0].output, __fallback__)
     assert write_record.effects[0].effect == Effects.WRITE
+    write_event = next(entry for entry in tide.ocean.event_logger.events if entry.type == LogEvents.EFFECT)
+    assert write_record.effects[0].event_id == write_event.event_id
+    assert write_event.cause.event_id is not None
 
     tide.event("effect deleter", effects=DELETE("global:event_effect"))
     delete_trace = tide.trace()
-    delete_record = delete_trace.exec_log[-1]
+    delete_record = delete_trace.log[-1]
 
     assert not tide.ocean.store_router.exists("global", "event_effect")
     assert delete_record.effects[0].effect == Effects.DELETE
+    delete_event = [entry for entry in tide.ocean.event_logger.events if entry.type == LogEvents.EFFECT][-1]
+    assert delete_record.effects[0].event_id == delete_event.event_id
+    assert delete_record.effects[0].target_existed is True
+    assert delete_event.payload.found == (True,)
 
 
 def test_effect_lists_support_investigate_path_and_diff(capsys):
@@ -672,8 +683,8 @@ def test_effect_lists_support_investigate_path_and_diff(capsys):
         produce,
         reads="seed",
         effects=[
-            WRITE("global:effect_output", preserve_output=7),
-            WRITE("global:audit_output", preserve_output=9),
+            WRITE("global:effect_output", 7),
+            WRITE("global:audit_output", 9),
         ],
     )
     tide.exec(
@@ -684,12 +695,12 @@ def test_effect_lists_support_investigate_path_and_diff(capsys):
     trace = tide.trace()
     effect_producer = next(
         record
-        for record in trace.exec_log
+        for record in trace.log
         if record.func_name == "produce"
     )
     effect_consumer = next(
         record
-        for record in trace.exec_log
+        for record in trace.log
         if record.func_name == "<lambda>"
     )
 
@@ -717,7 +728,7 @@ def test_effect_lists_support_investigate_path_and_diff(capsys):
     assert effect_path.exists()
     effect_path.show(color=False)
     shown = capsys.readouterr().out
-    assert "affected by WRITE effect" in shown
+    assert "WRITE at global:effect_output[v0]" in shown
     assert "global:effect_output[v0]" in shown
     assert trace.path(
         "global:seed",
@@ -745,13 +756,9 @@ def test_trace_uses_the_single_exec_source_for_its_header():
     tide.exec(produce.as_node(), writes="result")
     trace = tide.trace()
 
-    assert trace.run == "TIDE: .exec(0)"
-    assert trace.pipeline == "TIDE: .exec(produce[0])"
-    assert trace.execution_sources == ({
-        "run": "TIDE: .exec(0)",
-        "pipeline_id": 0,
-        "pipeline": "TIDE: .exec(produce[0])",
-    },)
+    assert trace.runs == (0,)
+    assert trace._sources() == ((0, 0),)
+    assert trace.pipelines[0] == "TIDE: .run_node(produce)"
 
 
 def test_trace_shows_each_source_when_exec_calls_are_combined(capsys):
@@ -768,14 +775,26 @@ def test_trace_shows_each_source_when_exec_calls_are_combined(capsys):
     tide.exec(second, reads="first", writes="second")
     trace = tide.trace()
 
-    assert trace.run == "MULTIPLE (2)"
-    assert trace.pipeline == "MULTIPLE (2)"
+    assert trace.runs == (0, 1)
+    assert trace._sources() == (
+        (0, 0),
+        (1, 1),
+    )
+    assert set(trace.pipelines.values()) == {
+        "TIDE: .run_node(first)",
+        "TIDE: .run_node(second)",
+    }
 
     trace.show(color=False)
     shown = capsys.readouterr().out
 
     assert "Tide Runs: MULTIPLE (2)" in shown
     assert "Pipelines: MULTIPLE (2)" in shown
+    assert "Sources:" not in shown
+
+    trace.show(color=False, show_sources=True)
+    shown = capsys.readouterr().out
+
     assert "Sources:    2" in shown
-    assert "TIDE: .exec(first[0])" in shown
-    assert "TIDE: .exec(second[1])" in shown
+    assert "TIDE: .run_node(first)" in shown
+    assert "TIDE: .run_node(second)" in shown

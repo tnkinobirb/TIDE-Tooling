@@ -1,74 +1,114 @@
-from dataclasses import dataclass, field
-from tide_tooling.tooling_core.engine.classes import RunnerNode,  Dag, Node, DataRef
-from typing import Callable, DefaultDict
 from collections import defaultdict
-from tide_tooling.tooling_core import debug_print as print
+from dataclasses import dataclass, field
+from typing import DefaultDict
 
-## PipelineIndex dataclass definitions ##
-# Index of stages
-@dataclass
-class StageIndex:
-    stage_dict      : dict = field(default_factory=dict)
+from .classes import DataRef, IntentDag, RunnerNode, RuntimeDag, __TEMPLATE_VAL__
 
-# Index nodes
+
+def _project_pipeline_index_to_tide_plan(
+    pipeline_index,
+    dynamic_ref_plan=None,
+    *,
+    runner_id=None,
+    resolve_ref=None,
+):
+    nodes = pipeline_index.node_index.node_list
+    dynamic_ref_plan = dynamic_ref_plan or {}
+    resolve_ref = resolve_ref or (lambda reference: reference)
+
+    E = {node.node.id for node in nodes}
+    I = {
+        (node.node.id, resolve_ref(state))
+        for node in nodes
+        for state in node.deps
+    }
+    O = {
+        (node.node.id, resolve_ref(state))
+        for node in nodes
+        for state in node.targets
+    }
+    S = {state for _, state in I | O}
+    D = {
+        state: dynamic_ref_plan.get(state, __TEMPLATE_VAL__)
+        for node in nodes
+        for state in node.deps
+        if state.dynamic
+    }
+    node_specs = [
+        {
+            "definition_id": node.node.id,
+            "runner_id": runner_id,
+            "actor_name": node.func.__name__,
+            "one_shot": node.one_shot,
+            "dependencies": [
+                {
+                    "declared": dependency,
+                    "reference": resolve_ref(dependency),
+                    "dynamic": dependency.dynamic,
+                }
+                for dependency in node.deps
+            ],
+            "targets": [resolve_ref(target) for target in node.targets],
+        }
+        for node in nodes
+    ]
+    return {
+        "E": E,
+        "S": S,
+        "I": I,
+        "O": O,
+        "D": D,
+        "nodes": node_specs,
+    }
+
+
 @dataclass
 class NodeIndex:
-    node_counter    : int = 0
-    node_list       : list[RunnerNode] = field(default_factory=list)
-    target_list     : list[DataRef] = field(default_factory=list)
-    node_by_id      : dict[int, RunnerNode] = field(default_factory=dict)
-    node_by_name    : dict[str, RunnerNode] = field(default_factory=dict)
-    node_by_target  : DefaultDict[DataRef, list[RunnerNode]] = field(default_factory=lambda: defaultdict(list))
-    node_by_content_id  : dict[str, RunnerNode] = field(default_factory=dict)
-    node_id_to_definiton_node: dict[int, Node] = field(default_factory=dict)
-    
+    # Preserve indexed node occurrence order.
+    node_list: list[RunnerNode] = field(default_factory=list)
 
-    def _next_node_id(self) -> int:
-       nid = self.node_counter
-       self.node_counter += 1
-       return nid
-    
-    def _index_node(self, node: Node | RunnerNode): # index node
-        if isinstance(node, Node): runner_node = RunnerNode(node, self._next_node_id())
-        else: runner_node = node
+    # Resolve nodes by each identity used by the runtime.
+    node_by_id: dict[int, RunnerNode] = field(default_factory=dict)
+    node_by_definition_id: dict[str, RunnerNode] = field(default_factory=dict)
+    node_by_target: DefaultDict[DataRef, list[RunnerNode]] = field(default_factory=lambda: defaultdict(list))
+    node_by_content_id: dict[bytes, RunnerNode] = field(default_factory=dict)
 
-        print(f"{runner_node.id} Indexing node!")
-        if runner_node.node_name in self.node_by_name:
-            print(f"_index_node warn: duplicate node found! {runner_node.node_name}")
-            if runner_node.id == self.node_by_name[runner_node.node_name].id:
-                # add option to replace instead of version  
-                return 
-            else:
-                runner_node.original_node_name = runner_node.node_name
-                runner_node.node_name  = f"{runner_node.node_name}"
-                print(f"_index_node warn: found a NEW node [{runner_node.node_name}] with the same name as existing node: {runner_node.node_name}! Original = {runner_node.original_node_name} ")
+    def index_node(self, definition, emitted_by_exec_id=None):
+        # Return the runtime node already representing this definition.
+        existing = self.node_by_definition_id.get(definition.id)
+        if existing is not None:
+            return existing
 
-        
-        self.node_list.append(runner_node)
-        self.node_id_to_definiton_node[runner_node.id] = node
+        # Give one newly discovered definition its runtime identity.
+        node = RunnerNode(definition, len(self.node_list))
+        node.emitted_by_exec_id = emitted_by_exec_id
 
-        for target in runner_node.targets:    
-            self.target_list.append(target) # should always  # TODO-NOTE: Support target lists [X]
-            self.node_by_target[target].append(runner_node) # TODO-NOTE: Support target lists [X]
+        # Retain occurrence order and every required lookup.
+        self.node_list.append(node)
+        self.node_by_id[node.id] = node
+        self.node_by_definition_id[definition.id] = node
+        self.node_by_content_id.setdefault(node.content_id, node)
 
-        self.node_by_name[runner_node.node_name] = runner_node 
-        
-        self.node_by_id[runner_node.id] = runner_node
-        self.node_by_content_id[runner_node.content_id] = runner_node
-        runner_node.state.indexed = True
-        print(f"{runner_node.id} Indexing node successful!")
-        return runner_node
+        for target in node.targets:
+            self.node_by_target[target].append(node)
 
-# Index of DAG
-@dataclass 
-class DAGIndex:
-    intent_dag      : Dag = field(default_factory=Dag)
-    expanded_dag    : Dag = field(default_factory=Dag)
-    post_runtime_dag: Dag = field(default_factory=Dag) 
-    
-# Collective Pipeline index
-@dataclass 
+        return node
+
+    def assign_implicit_target(self, definition, target):
+        # Update one already-indexed producer when its nested use reveals a target.
+        runner_node = self.node_by_definition_id[definition.id]
+        if runner_node.targets or definition.targets != [target]:
+            raise ValueError("Expected one newly inferred target")
+
+        runner_node.targets = [target]
+        self.node_by_target[target].append(runner_node)
+
+
+@dataclass
 class PipelineIndex:
-    stage_index     : StageIndex  = field(default_factory=StageIndex)
-    node_index      : NodeIndex = field(default_factory=NodeIndex)
-    dag_index       : DAGIndex = field(default_factory=DAGIndex)
+    # Index declared and subsequently discovered nodes.
+    node_index: NodeIndex = field(default_factory=NodeIndex)
+
+    # Preserve the intended and final dependency structures.
+    intent_dag: IntentDag = field(default_factory=IntentDag)
+    post_runtime_dag: RuntimeDag | None = None

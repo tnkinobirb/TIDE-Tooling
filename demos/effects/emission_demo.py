@@ -29,8 +29,8 @@ if __name__ == "__main__":
         emission_pipeline,
         mode="sequential",
     )
-
-    emitter_record = trace.exec_log[0]
+    trace.show()
+    emitter_record = trace.log[0]
     print("ORDERED EMISSION OCCURRENCES")
     for occurrence in emitter_record.emitted_nodes:
         print(f"{occurrence.origin}: {occurrence.func_name}")

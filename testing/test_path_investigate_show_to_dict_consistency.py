@@ -1,3 +1,4 @@
+import json
 import re
 
 import pytest
@@ -71,14 +72,18 @@ def test_inspect_exec_record_to_dict_preserves_reads_and_writes(show_dict_trace)
     assert set(data) == {
         "type",
         "id",
-        "ocean",
-        "source",
-        "pipeline",
+        "version",
+        "source_oceans",
+        "source_runners",
+        "source_pipelines",
         "history",
         "upstream_seeds",
         "downstream_seeds",
         "grouped",
         "exists",
+        "divergence",
+        "parents",
+        "children",
     }
     assert data["type"] == "exec_record"
     assert data["id"] == inspected.id
@@ -118,11 +123,16 @@ def test_investigate_exec_record_to_dict_preserves_reads_and_writes(show_dict_tr
         "summary",
         "appearances",
         "history",
+        "inputs",
+        "output",
         "reads",
         "writes",
         "upstream",
         "downstream",
         "navigation",
+        "divergence",
+        "parents",
+        "children",
     }
     assert [read["id"] for read in data["reads"]] == [
         "global:@A[v0]",
@@ -160,7 +170,14 @@ def test_path_to_dict_no_path_has_no_fake_edges(show_dict_trace):
     assert not path.exists()
     assert data["exists"] is False
 
-    assert data["path_by_root"] == {}
+    assert data["paths"] == []
+
+
+def test_path_to_dict_is_json_compatible(show_dict_trace):
+    source = ref(show_dict_trace, "global:@A", version=0)
+    target = actor(show_dict_trace, "UseTwice", grouped=False)
+
+    json.dumps(show_dict_trace.path(source, target).to_dict())
 
 
 def test_path_show_reports_correct_path_count(show_dict_trace):
@@ -172,8 +189,8 @@ def test_path_show_reports_correct_path_count(show_dict_trace):
     output = shown(path, show_input_positions=True)
 
     assert path.exists()
-    assert path.count() == 2
-    assert "2 paths found" in output or "2 path found" in output
+    assert path.count() == 1
+    assert "1 path found" in output
     assert "args[0]" in output
     assert "args[1]" in output
 
@@ -205,17 +222,19 @@ def test_path_show_output_versions_are_subset_of_path_to_dict_or_path_object(sho
     assert path.exists()
     edge_dicts = [
         edge
-        for paths in data["path_by_root"].values()
-        for one_path in paths
-        for edge in one_path
-        if isinstance(edge, dict)
+        for path in data["paths"]
+        for handoffs in path["handoffs"]
+        for edge in handoffs
+        if edge["type"] == "read_edge"
     ]
     assert any(
-        edge["ref"] == "global:@A" and edge["version"] == 0
+        edge["state"]["ref"] == "global:@A"
+        and edge["state"]["version"] == 0
         for edge in edge_dicts
     )
     assert not any(
-        edge["ref"] == "global:@A" and edge["version"] == 1
+        edge["state"]["ref"] == "global:@A"
+        and edge["state"]["version"] == 1
         for edge in edge_dicts
     )
     assert "global:@A[v0]" in output

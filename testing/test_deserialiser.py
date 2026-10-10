@@ -100,6 +100,25 @@ def test_deserialise_bundle_preserves_aliases_and_cycles(deserialiser):
     assert cycle_restored[0] is cycle_restored
 
 
+def test_deserialise_bundle_preserves_indirect_immutable_cycle(deserialiser):
+    items = []
+    value = (items,)
+    items.append(value)
+
+    restored = deserialiser.deserialise_bundle(TIDEBundler().bundle(value))
+
+    assert restored[0][0] is restored
+
+
+def test_deserialise_bundle_rejects_immutable_only_cycle(deserialiser):
+    bundle = TIDEBundler().bundle(())
+    root = bundle["root"]
+    bundle["records"][root]["items"] = [{"$ref": root}]
+
+    with pytest.raises(ValueError, match="immutable-only cycle"):
+        deserialiser.deserialise_bundle(bundle)
+
+
 def test_trusted_deserialiser_rebuilds_object_state_modes():
     deserialiser = TIDEDeserialiser(trusted=True)
     values = [

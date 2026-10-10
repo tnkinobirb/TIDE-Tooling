@@ -27,10 +27,27 @@ benefit of, or as part of the activities of any company, employer, client,
 university, research institution, charity, nonprofit organisation, government
 body, or other organisation.
 
-3. Uses Requiring Permission
+3. Recruitment and Hiring Evaluation
 
-Any use outside Personal Evaluation Use requires prior written permission from
-the copyright holder.
+Notwithstanding Section 2, a recruiter, hiring manager, interviewer, or
+prospective employer may view, download, install, and run the unmodified
+Software solely to evaluate the project and its author in connection with a
+potential employment or independent-contractor engagement.
+
+This permission is limited to internal recruitment and hiring evaluation. It
+does not permit production or operational use, use for the organisation's
+business or research activities, incorporation into another product, service,
+library, platform, or system, redistribution, publication of modified
+versions, sublicensing, or any other commercial or professional use.
+
+No rights are granted to use the Software after the evaluation except with
+prior written permission from the copyright holder.
+
+4. Uses Requiring Permission
+
+Except for Recruitment and Hiring Evaluation permitted under Section 3, any
+use outside Personal Evaluation Use requires prior written permission from the
+copyright holder.
 
 This includes, without limitation:
 
@@ -51,7 +68,7 @@ To request permission for any such use, contact:
 
 tidetooling@gmail.com
 
-4. Modification
+5. Modification
 
 You may modify the Software privately only as part of permitted Personal
 Evaluation Use.
@@ -60,14 +77,14 @@ Permission to modify the Software does not grant permission to distribute,
 publish, sublicense, sell, deploy, or otherwise use the modified Software
 outside Personal Evaluation Use.
 
-5. Redistribution
+6. Redistribution
 
 Except for rights necessarily provided through the GitHub service, you may not
 redistribute, republish, sublicense, sell, or otherwise provide copies of the
 Software or modified versions of the Software to another person or entity
 without prior written permission.
 
-6. GitHub
+7. GitHub
 
 If the Software is hosted in a public GitHub repository, rights granted by
 GitHub's Terms of Service for viewing, using, displaying, performing, and
@@ -78,13 +95,13 @@ Those GitHub-provided rights do not constitute an additional license from the
 copyright holder for use of the Software outside GitHub or outside the
 permissions expressly granted by this license.
 
-7. No Trademark Rights
+8. No Trademark Rights
 
 This license does not grant permission to use the names "TIDE",
 "TIDE-Tooling", "Ocean", or associated names, logos, or branding in a manner
 that suggests endorsement, sponsorship, or affiliation.
 
-8. Future Licensing
+9. Future Licensing
 
 This license applies to copies of the Software distributed under this version
 of the license.
@@ -95,7 +112,7 @@ license terms at the copyright holder's discretion.
 A future change of license does not retroactively alter rights already granted
 to a copy of the Software under an earlier license.
 
-9. Termination
+10. Termination
 
 Any rights granted under this license terminate automatically if you materially
 breach its terms.
@@ -103,19 +120,19 @@ breach its terms.
 Following termination, you must cease any use of the Software that relied upon
 the permissions granted by this license.
 
-10. Disclaimer of Warranty
+11. Disclaimer of Warranty
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
 FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
 
-11. Limitation of Liability
+12. Limitation of Liability
 
 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER SHALL
 NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF,
 OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
 
-12. Reservation of Rights
+13. Reservation of Rights
 
 All rights not expressly granted by this license are reserved by the copyright
 holder.

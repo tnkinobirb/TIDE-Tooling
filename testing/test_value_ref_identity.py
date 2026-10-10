@@ -94,6 +94,21 @@ def test_raw_string_find_does_not_become_exact_value_lookup(same_value_two_store
     assert searched.values == []
 
 
+def test_trace_show_can_include_recorded_values(same_value_two_store_trace):
+    shown = same_value_two_store_trace.show(values=True, color=False)
+
+    assert "str 'same' as global:@A[v0]" in shown
+
+
+def test_investigate_show_can_include_recorded_values(same_value_two_store_trace):
+    shown = same_value_two_store_trace.investigate(
+        "global:@A",
+        "reference",
+    ).show(values=True, color=False)
+
+    assert "global:@A[v0] = str 'same'" in shown
+
+
 def test_same_value_written_to_two_global_refs_preserves_two_value_appearances():
     tide = TIDE()
 

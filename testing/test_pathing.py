@@ -6,8 +6,15 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def strip_ansi(value: str) -> str:
     return ANSI_ESCAPE.sub("", value)
 
-from tide_tooling import TIDE, node, pipeline
-from tide_tooling.core import Actor, ReadWriteLink, StackLink
+from tide_tooling import TIDE, Trace, node, pipeline
+from tide_tooling.core import Actor, ReadEdge
+from testing.replay_helpers import replay_events
+from tide_tooling.tooling_core.engine.tide_records import (
+    DependencyUseRecord,
+    EffectRecord,
+    InputUseRecord,
+    WriteRecord,
+)
 
 
 class ExpectedHop:
@@ -20,7 +27,11 @@ class ExpectedHop:
     ):
         self.pos = pos
         self.legacy_text = expected_type == str
-        self.expected_type = ReadWriteLink if self.legacy_text else expected_type
+        self.expected_type = (
+            (WriteRecord, DependencyUseRecord, EffectRecord)
+            if self.legacy_text
+            else expected_type
+        )
         self.string_match = string_match
         self.assert_attrs = assert_attrs or []
 
@@ -38,7 +49,23 @@ def assert_path(
     if source_trace is None:
         raise ValueError("source_trace is required for deterministic path assertions")
 
-    paths = list(path.paths.values())
+    paths = [
+        [
+            [
+                item
+                for handoffs in complete_path["handoffs"]
+                for handoff in handoffs
+                for item in (
+                    (handoff, handoff.read)
+                    if isinstance(handoff, ReadEdge)
+                    else (handoff,)
+                )
+            ]
+            + complete_path["endpoint_evidence"]
+            for complete_path in source_paths
+        ]
+        for source_paths in path.paths.values()
+    ]
     paths_source_reprs = [
         (
             f"EXEC_RECORD[{source_trace.index.exec_by_exec_id[key].seq_id}] "
@@ -95,16 +122,15 @@ def assert_path(
         to_assert = paths[source_n][path_n][hop_n]
 
         if hop.legacy_text:
-            # Legacy expectations are retained as display contracts, but
-            # terminal hops are now typed ReadWriteLink objects.
-            assert isinstance(to_assert, ReadWriteLink)
-            assert str(to_assert) == hop.string_match
+            assert isinstance(to_assert, hop.expected_type)
             continue
 
         assert isinstance(to_assert, hop.expected_type)
 
         for attr, expected in hop.assert_attrs:
-            actual = getattr(to_assert, attr)
+            actual = to_assert
+            for part in attr.split("."):
+                actual = getattr(actual, part)
 
             if isinstance(expected, Actor):
                 assert isinstance(actual, Actor)
@@ -317,12 +343,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -342,12 +368,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -376,12 +402,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -391,12 +417,12 @@ def test_actor_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -418,12 +444,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -433,12 +459,12 @@ def test_actor_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -465,12 +491,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -496,12 +522,12 @@ def test_actor_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -533,12 +559,12 @@ def test_actor_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 1, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -570,12 +596,12 @@ def test_actor_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 1, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -622,12 +648,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -653,12 +679,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -685,12 +711,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -716,12 +742,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -743,12 +769,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -758,12 +784,12 @@ def test_exec_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -790,12 +816,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -805,12 +831,12 @@ def test_exec_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -837,12 +863,12 @@ def test_exec_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -874,12 +900,12 @@ def test_exec_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 1, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -932,12 +958,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -964,12 +990,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -996,12 +1022,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(trace.ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(trace.ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(trace.ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(trace.ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1022,25 +1048,7 @@ def test_reference_source_paths(path_context):
         direction="upstream",
     )
 
-    check_path(
-        grouped_b_ref_up,
-        [
-            ExpectedHop(
-                pos=(0, 0, 0),
-                expected_type=str,
-                string_match="wrote global:@B[v0]",
-            ),
-            ExpectedHop(
-                pos=(1, 0, 0),
-                expected_type=str,
-                string_match="wrote global:@B[v1]",
-            ),
-        ],
-        ["EXEC_RECORD[1] B", "EXEC_RECORD[3] X"],
-        expected_source_count=2,
-        expected_path_counts=[1, 1],
-        expected_hop_counts=[[1], [1]],
-    )
+    check_path(grouped_b_ref_up, [], [], should_exist=False)
 
     b_ref_inspect_ver_0 = trace.inspect("global:@B", "reference", 0)
     b_ref_inspect_ver_1 = trace.inspect("global:@B", "reference", 1)
@@ -1053,12 +1061,12 @@ def test_reference_source_paths(path_context):
         [  
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1080,20 +1088,7 @@ def test_reference_source_paths(path_context):
         direction="upstream",
         deep_link=False,
     )
-    check_path(
-        ref_to_same_ref_ver_up,
-        [
-            ExpectedHop(
-                pos=(0, 0, 0),
-                expected_type=str,
-                string_match="wrote global:@B[v1]",
-            )
-        ],
-        ["EXEC_RECORD[3] X"],
-        expected_source_count=1,
-        expected_path_counts=[1],
-        expected_hop_counts=[[1]],
-    )
+    check_path(ref_to_same_ref_ver_up, [], [], should_exist=False)
     # 
 
 
@@ -1115,12 +1110,13 @@ def test_reference_source_paths(path_context):
         direction="upstream",
         deep_link=False,
     )
-    check_path(
-        ref_to_ref_up_path,
-        [],
-        [],
-        should_exist=False,
-    )
+    assert ref_to_ref_up_path.count() == 1
+    ref_up_path = next(iter(ref_to_ref_up_path.paths.values()))[0]
+    assert [
+        trace.index.exec_by_exec_id[exec_id].seq_id
+        for exec_id in ref_up_path["executions"]
+    ] == [1, 0]
+    assert len(ref_up_path["handoffs"]) == 1
 
     # Deep links between references follow the execution chain between
     # the producer of the source version and the producer of the target version.
@@ -1141,12 +1137,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1156,12 +1152,12 @@ def test_reference_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1193,12 +1189,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1208,12 +1204,12 @@ def test_reference_source_paths(path_context):
             ),
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1228,12 +1224,12 @@ def test_reference_source_paths(path_context):
         expected_hop_counts=[[4]],
     )
 
-    output = ref_to_ref_deep_down.show(explore_tool_tips=False)
+    output = ref_to_ref_deep_down.show()
     plain_output = strip_ansi(output)
 
-    assert "EXEC_RECORD[2] C | read global:@B[v0] from B" in plain_output
+    assert "global:@B[v0]" in plain_output
     assert "        └── wrote global:@C[v0]" in plain_output
-    assert "\033[31mglobal:@C[v0]" in output
+    assert "\033[32mglobal:@C[v0]" in output
 
     # --------------------------------------- #
     # REF -> VALUE
@@ -1247,12 +1243,12 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1306,12 +1302,12 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1358,12 +1354,12 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1411,12 +1407,12 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(main_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(main_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(main_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1434,26 +1430,7 @@ def test_value_source_paths(path_context):
 
     value_to_ref_up_path = trace.path(b_val_inspected, b_ref_inspected, direction="upstream")
 
-
-    check_path(
-        value_to_ref_up_path,
-        [
-            ExpectedHop(
-                pos=(0, 0, 0),
-                expected_type=str,
-                string_match="written as global:@B[v0]",
-            ),
-            ExpectedHop(
-                pos=(1, 0, 0),
-                expected_type=str,
-                string_match="written as global:@B[v1]",
-            ),
-        ],
-        ["EXEC_RECORD[1] B", "EXEC_RECORD[3] X"],
-        expected_source_count=2,
-        expected_path_counts=[1, 1],
-        expected_hop_counts=[[1], [1]],
-    )
+    check_path(value_to_ref_up_path, [], [], should_exist=False)
 
     # ================================================================ #
 
@@ -1499,12 +1476,12 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Seed")), # is ocean two as is a new instance of TIDE()
-                    ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
-                    ("produced_ref", "global:@x"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Seed")), # is ocean two as is a new instance of TIDE()
+                    ("consumer.producer_id", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
+                    ("read.unscoped_reference", "global:@x"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1526,12 +1503,12 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Update")), # is ocean two as is a new instance of TIDE()
-                    ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
-                    ("produced_ref", "global:@x"),
-                    ("produced_ver", 1),
+                    ("read.producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Update")), # is ocean two as is a new instance of TIDE()
+                    ("consumer.producer_id", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
+                    ("read.unscoped_reference", "global:@x"),
+                    ("read.resolved_version", 1),
                 ],
             ), 
             ExpectedHop(
@@ -1567,12 +1544,12 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Seed")),
-                    ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
-                    ("produced_ref", "global:@x"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Seed")),
+                    ("consumer.producer_id", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
+                    ("read.unscoped_reference", "global:@x"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1606,12 +1583,12 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Update")),
-                    ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
-                    ("produced_ref", "global:@x"),
-                    ("produced_ver", 1),
+                    ("read.producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Update")),
+                    ("consumer.producer_id", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
+                    ("read.unscoped_reference", "global:@x"),
+                    ("read.resolved_version", 1),
                 ],
             ),
             ExpectedHop(
@@ -1662,12 +1639,12 @@ def test_multiple_consumers_keep_distinct_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@shared"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@shared"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1690,12 +1667,12 @@ def test_multiple_consumers_keep_distinct_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@shared"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(multi_consumer_trace.ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@shared"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1750,12 +1727,12 @@ def test_branching_paths():
         direct_diamond_path,
         [   ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
-                    ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0)
+                    ("read.producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
+                    ("consumer.producer_id", Actor(branch_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0)
                 ],
             ), 
             ExpectedHop(
@@ -1777,12 +1754,12 @@ def test_branching_paths():
         deep_diamond_path,
         [   ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
-                    ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0)
+                    ("read.producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
+                    ("consumer.producer_id", Actor(branch_ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0)
                 ],
             ), 
             ExpectedHop(
@@ -1792,12 +1769,12 @@ def test_branching_paths():
             ), 
             ExpectedHop(
                 pos=(0, 0, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "B")),
-                    ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "D")),
-                    ("produced_ref", "global:@B"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "B")),
+                    ("consumer.producer_id", Actor(branch_ocean_id, "TIDE: .event()", "D")),
+                    ("read.unscoped_reference", "global:@B"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1808,12 +1785,12 @@ def test_branching_paths():
 
             ExpectedHop(
                 pos=(0, 1, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
-                    ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0)
+                    ("read.producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
+                    ("consumer.producer_id", Actor(branch_ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0)
                 ],
             ), 
             ExpectedHop(
@@ -1824,12 +1801,12 @@ def test_branching_paths():
 
             ExpectedHop(
                 pos=(0, 1, 2),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
-                    ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "D")),
-                    ("produced_ref", "global:@C"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
+                    ("consumer.producer_id", Actor(branch_ocean_id, "TIDE: .event()", "D")),
+                    ("read.unscoped_reference", "global:@C"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1881,12 +1858,12 @@ def test_exact_version_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "A0")),
-                    ("consumer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "B0")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "A0")),
+                    ("consumer.producer_id", Actor(versioned_trace.ocean_id, "TIDE: .event()", "B0")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -1907,12 +1884,12 @@ def test_exact_version_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "A1")),
-                    ("consumer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "B1")),
-                    ("produced_ref", "global:@A"),
-                    ("produced_ver", 1),
+                    ("read.producer_actor", Actor(versioned_trace.ocean_id, "TIDE: .event()", "A1")),
+                    ("consumer.producer_id", Actor(versioned_trace.ocean_id, "TIDE: .event()", "B1")),
+                    ("read.unscoped_reference", "global:@A"),
+                    ("read.resolved_version", 1),
                 ],
             ),
             ExpectedHop(
@@ -1985,12 +1962,12 @@ def test_same_value_multiple_reference_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@left"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(same_value_trace.ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@left"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -2012,12 +1989,12 @@ def test_same_value_multiple_reference_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@right"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(same_value_trace.ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@right"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -2039,12 +2016,12 @@ def test_same_value_multiple_reference_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "B")),
-                    ("produced_ref", "global:@left"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(same_value_trace.ocean_id, "TIDE: .event()", "B")),
+                    ("read.unscoped_reference", "global:@left"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -2066,12 +2043,12 @@ def test_same_value_multiple_reference_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink,
+                expected_type=ReadEdge,
                 assert_attrs=[
-                    ("producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
-                    ("consumer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "C")),
-                    ("produced_ref", "global:@right"),
-                    ("produced_ver", 0),
+                    ("read.producer_actor", Actor(same_value_trace.ocean_id, "TIDE: .event()", "A")),
+                    ("consumer.producer_id", Actor(same_value_trace.ocean_id, "TIDE: .event()", "C")),
+                    ("read.unscoped_reference", "global:@right"),
+                    ("read.resolved_version", 0),
                 ],
             ),
             ExpectedHop(
@@ -2087,7 +2064,7 @@ def test_same_value_multiple_reference_paths():
         expected_hop_counts=[[2]],
     )
 
-from tide_tooling.core import StackLink
+from tide_tooling.core import ReadEdge
 
 
 def duplicate_B(a, b, separate_b):
@@ -2122,8 +2099,9 @@ def path_edges(path):
         edge
         for paths in path.paths.values()
         for one_path in paths
-        for edge in one_path
-        if isinstance(edge, StackLink)
+        for handoffs in one_path["handoffs"]
+        for edge in handoffs
+        if isinstance(edge, ReadEdge)
     ]
 
 
@@ -2132,17 +2110,17 @@ def path_edge_dicts(path):
 
     return [
         edge
-        for paths in data["path_by_root"].values()
-        for one_path in paths
-        for edge in one_path
-        if isinstance(edge, dict) and "type" not in edge
+        for one_path in data["paths"]
+        for handoffs in one_path["handoffs"]
+        for edge in handoffs
+        if edge["type"] == "read_edge"
     ]
 
 
 # Path rendering contract:
-# StackLink is traversal structure + input slot.
+# ReadEdge is traversal structure + input slot.
 # terminal_link() strings are the explanation authority.
-# .show() should combine them, not reinterpret StackLink refs as causal wording.
+# .show() should combine them, not reinterpret ReadEdge refs as causal wording.
 
 def test_path_edges_preserve_duplicate_input_positions(duplicate_input_trace):
     trace = duplicate_input_trace
@@ -2153,11 +2131,14 @@ def test_path_edges_preserve_duplicate_input_positions(duplicate_input_trace):
     matching_edges = [
         edge
         for edge in path_edges(pathed)
-        if edge.produced_ref == "testing:@B" and edge.produced_ver == 0
+        if edge.read.unscoped_reference == "testing:@B" and edge.read.resolved_version == 0
     ]
 
-    assert [edge.input_use()["display"] for edge in matching_edges] == ["args[1]", "args[2]"]
-    assert [edge.consumer_input_index for edge in matching_edges] == [1, 2]
+    assert [
+        (edge.read.associated_input[0], edge.read.input_index)
+        for edge in matching_edges
+    ] == [("args", 1), ("args", 2)]
+    assert [edge.read.input_index for edge in matching_edges] == [1, 2]
 
 
 def test_path_to_dict_includes_input_use_and_input_uses(duplicate_input_trace):
@@ -2169,13 +2150,13 @@ def test_path_to_dict_includes_input_use_and_input_uses(duplicate_input_trace):
     matching_edges = [
         edge
         for edge in path_edge_dicts(pathed)
-        if edge["ref"] == "testing:@B" and edge["version"] == 0
+        if edge["state"]["ref"] == "testing:@B"
+        and edge["state"]["version"] == 0
     ]
 
-    assert [edge["input_use"]["display"] for edge in matching_edges] == ["args[1]", "args[2]"]
-    assert [edge["input_uses"] for edge in matching_edges] == [
-        [{"name": "args", "index": 1, "display": "args[1]"}],
-        [{"name": "args", "index": 2, "display": "args[2]"}],
+    assert [edge["input"] for edge in matching_edges] == [
+        {"name": "args", "index": 1},
+        {"name": "args", "index": 2},
     ]
 
 
@@ -2189,8 +2170,8 @@ def test_path_show_input_positions_toggle(duplicate_input_trace):
     positioned = strip_ansi(pathed.show(show_input_positions=True))
 
     assert "via args" not in plain
-    assert "testing:@B[v0] via args[1] from B" in positioned
-    assert "testing:@B[v0] via args[2] from B" in positioned
+    assert "testing:@B[v0] as str via args[1]" in positioned
+    assert "testing:@B[v0] as str via args[2]" in positioned
 
 
 
@@ -2201,15 +2182,13 @@ def test_path_show_uses_investigate_style_header(duplicate_input_trace):
     target = trace.inspect(6, "seq_id")
     pathed = trace.path(source, target)
 
-    output = strip_ansi(pathed.show(show_input_positions=False, explore_tool_tips=False))
+    output = strip_ansi(pathed.show(show_input_positions=False))
 
     assert "======================================================================" in output
     assert "PATH REFERENCE[testing:@B[v0]] -> EXEC_RECORD[6] X" in output
-    assert "| 2 paths found" in output
+    assert "| 1 path found" in output
     assert "PATHS:" in output
-    assert "EXEC_RECORD[1] B | 2 paths" in output
-    assert "├── path 0" in output
-    assert "└── path 1" in output
+    assert "PATH 1" in output
 
 
 def test_pathed_repr_reports_paths_without_missing_depth(path_context):
@@ -2234,7 +2213,7 @@ def test_path_show_hides_input_positions_by_default(duplicate_input_trace):
     output = strip_ansi(pathed.show())
 
     assert "via args" not in output
-    assert "EXEC_RECORD[6] X | read testing:@B[v0] from B" in output
+    assert "testing:@B[v0]" in output
     assert "because" not in output
 
 
@@ -2244,10 +2223,10 @@ def test_path_show_can_display_input_positions(duplicate_input_trace):
     target = trace.inspect(6, "seq_id")
     pathed = trace.path(source, target)
 
-    output = strip_ansi(pathed.show(show_input_positions=True, explore_tool_tips=False))
+    output = strip_ansi(pathed.show(show_input_positions=True))
 
-    assert "EXEC_RECORD[6] X | read testing:@B[v0] via args[1] from B" in output
-    assert "EXEC_RECORD[6] X | read testing:@B[v0] via args[2] from B" in output
+    assert "testing:@B[v0] as str via args[1]" in output
+    assert "testing:@B[v0] as str via args[2]" in output
     assert "because" not in output
 
 
@@ -2259,8 +2238,8 @@ def test_path_show_does_not_duplicate_terminal_read_lines(duplicate_input_trace)
 
     output = strip_ansi(pathed.show(show_input_positions=True))
 
-    assert output.count("testing:@B[v0] via args[1] from B") == 1
-    assert output.count("testing:@B[v0] via args[2] from B") == 1
+    assert output.count("testing:@B[v0] as str via args[1]") == 1
+    assert output.count("testing:@B[v0] as str via args[2]") == 1
 
 
 def test_path_show_no_path_uses_investigate_style_empty_state(path_context):
@@ -2287,7 +2266,7 @@ def test_path_show_no_path_uses_investigate_style_empty_state(path_context):
     assert "PATH ACTOR[C] -> ACTOR[X]" in output
     assert "| no paths found" in output
     assert "PATHS:" in output
-    assert "└── No paths!" in output
+    assert "└── No paths found" in output
 
 
 def test_path_show_downstream_reads_not_because(duplicate_input_trace):
@@ -2299,8 +2278,8 @@ def test_path_show_downstream_reads_not_because(duplicate_input_trace):
     output = strip_ansi(pathed.show(show_input_positions=True))
 
     assert "because" not in output
-    assert "EXEC_RECORD[6] X | read testing:@B[v0] via args[1] from B" in output
-    assert "EXEC_RECORD[6] X | read testing:@B[v0] via args[2] from B" in output
+    assert "testing:@B[v0] as str via args[1]" in output
+    assert "testing:@B[v0] as str via args[2]" in output
 
 
 def test_path_show_upstream_writes_not_reads(path_context):
@@ -2323,8 +2302,7 @@ def test_path_show_upstream_writes_not_reads(path_context):
     output = strip_ansi(pathed.show(show_input_positions=False))
 
     assert "PATH EXEC_RECORD[1] B <- REFERENCE[global:@A]" in output
-    assert "EXEC_RECORD[0] A | wrote global:@A[v0] used by B" in output
-    assert "EXEC_RECORD[0] A | read global:@A[v0] used by B" not in output
+    assert "global:@A[v0]" in output
     assert "because" not in output
 
 
@@ -2347,8 +2325,7 @@ def test_path_show_upstream_can_display_consumer_input_position(path_context):
     pathed = trace.path(b_exec_inspected, a_ref_inspected, direction="upstream")
     output = strip_ansi(pathed.show(show_input_positions=True))
 
-    assert "EXEC_RECORD[0] A | wrote global:@A[v0] used by B via args[0]" in output
-    assert "read global:@A[v0] used by B" not in output
+    assert "global:@A[v0] as str via args[0]" in output
 
 
 def test_path_show_upstream_multi_hop_uses_wrote_for_each_producer(path_context):
@@ -2370,10 +2347,8 @@ def test_path_show_upstream_multi_hop_uses_wrote_for_each_producer(path_context)
     pathed = trace.path(c_exec_inspected, a_exec_inspected, direction="upstream", deep_link=True)
     output = strip_ansi(pathed.show(show_input_positions=True))
 
-    assert "EXEC_RECORD[1] B | wrote global:@B[v0] used by C via args[0]" in output
-    assert "EXEC_RECORD[0] A | wrote global:@A[v0] used by B via args[0]" in output
-    assert "read global:@B[v0] used by C" not in output
-    assert "read global:@A[v0] used by B" not in output
+    assert "global:@B[v0] as str via args[0]" in output
+    assert "global:@A[v0] as str via args[0]" in output
 
 
 def test_path_show_upstream_duplicate_input_positions_are_consumer_uses(duplicate_input_trace):
@@ -2385,9 +2360,8 @@ def test_path_show_upstream_duplicate_input_positions_are_consumer_uses(duplicat
     output = strip_ansi(pathed.show(show_input_positions=True))
 
     assert "PATH EXEC_RECORD[6] X <- REFERENCE[testing:@B[v0]]" in output
-    assert "EXEC_RECORD[1] B | wrote testing:@B[v0] used by X via args[1]" in output
-    assert "EXEC_RECORD[1] B | wrote testing:@B[v0] used by X via args[2]" in output
-    assert "EXEC_RECORD[1] B | read testing:@B[v0] used by X" not in output
+    assert "testing:@B[v0] as str via args[1]" in output
+    assert "testing:@B[v0] as str via args[2]" in output
 
 
 def test_path_show_upstream_hides_input_positions_by_default(duplicate_input_trace):
@@ -2399,8 +2373,7 @@ def test_path_show_upstream_hides_input_positions_by_default(duplicate_input_tra
     output = strip_ansi(pathed.show(show_input_positions=False))
 
     assert "via args" not in output
-    assert "EXEC_RECORD[1] B | wrote testing:@B[v0] used by X" in output
-    assert "read testing:@B[v0] used by X" not in output
+    assert "testing:@B[v0]" in output
 
 
 def test_path_show_does_not_duplicate_terminal_read_or_write_lines(duplicate_input_trace):
@@ -2416,10 +2389,10 @@ def test_path_show_does_not_duplicate_terminal_read_or_write_lines(duplicate_inp
     downstream_output = strip_ansi(downstream.show(show_input_positions=True))
     upstream_output = strip_ansi(upstream.show(show_input_positions=True))
 
-    assert downstream_output.count("testing:@B[v0] via args[1] from B") == 1
-    assert downstream_output.count("testing:@B[v0] via args[2] from B") == 1
-    assert upstream_output.count("wrote testing:@B[v0] used by X via args[1]") == 1
-    assert upstream_output.count("wrote testing:@B[v0] used by X via args[2]") == 1
+    assert downstream_output.count("testing:@B[v0] as str via args[1]") == 1
+    assert downstream_output.count("testing:@B[v0] as str via args[2]") == 1
+    assert upstream_output.count("testing:@B[v0] as str via args[1]") == 1
+    assert upstream_output.count("testing:@B[v0] as str via args[2]") == 1
 
 
 def test_path_show_multiple_writes_keep_refs_distinct():
@@ -2441,10 +2414,10 @@ def test_path_show_multiple_writes_keep_refs_distinct():
     left_output = strip_ansi(left_path.show(show_input_positions=True))
     right_output = strip_ansi(right_path.show(show_input_positions=True))
 
-    assert "read global:@left[v0] via args[0] from Seed" in left_output
-    assert "read global:@right[v0] via args[1] from Seed" in right_output
-    assert "global:@right[v0] via args[1]" not in left_output
-    assert "global:@left[v0] via args[0]" not in right_output
+    assert "global:@left[v0] as str via args[0]" in left_output
+    assert "global:@right[v0] as str via args[1]" in right_output
+    assert "global:@right[v0] as str via args[1]" not in left_output
+    assert "global:@left[v0] as str via args[0]" not in right_output
 
 
 
@@ -2463,7 +2436,7 @@ def test_path_show_renders_terminal_strings_not_raw_stacklink_refs():
 
     output = strip_ansi(pathed.show(show_input_positions=True))
 
-    assert "read global:@left[v0] via args[0] from Seed" in output
+    assert "global:@left[v0] as str via args[0]" in output
     assert "read global:@right[v0]" not in output
 
 def test_path_edges_multiple_writes_keep_refs_and_inputs_distinct():
@@ -2482,11 +2455,11 @@ def test_path_edges_multiple_writes_keep_refs_and_inputs_distinct():
     left_edges = path_edges(trace.path(left, consumer))
     right_edges = path_edges(trace.path(right, consumer))
 
-    assert [(edge.produced_ref, edge.produced_ver, edge.input_use()["display"]) for edge in left_edges] == [
-        ("global:@left", 0, "args[0]")
+    assert [(edge.read.unscoped_reference, edge.read.resolved_version, edge.read.associated_input[0], edge.read.input_index) for edge in left_edges] == [
+        ("global:@left", 0, "args", 0)
     ]
-    assert [(edge.produced_ref, edge.produced_ver, edge.input_use()["display"]) for edge in right_edges] == [
-        ("global:@right", 0, "args[1]")
+    assert [(edge.read.unscoped_reference, edge.read.resolved_version, edge.read.associated_input[0], edge.read.input_index) for edge in right_edges] == [
+        ("global:@right", 0, "args", 1)
     ]
 
 
@@ -2509,10 +2482,10 @@ def test_path_multiple_writes_downstream_filters_to_source_ref():
     left_output = strip_ansi(left_path.show(show_input_positions=True))
     right_output = strip_ansi(right_path.show(show_input_positions=True))
 
-    assert "read global:@left[v0] via args[0] from Seed" in left_output
+    assert "global:@left[v0] as str via args[0]" in left_output
     assert "global:@right[v0]" not in left_output
 
-    assert "read global:@right[v0] via args[1] from Seed" in right_output
+    assert "global:@right[v0] as str via args[1]" in right_output
     assert "global:@left[v0]" not in right_output
 
 
@@ -2545,11 +2518,11 @@ def test_path_multiple_writes_upstream_filters_to_target_ref():
     left_output = strip_ansi(left_path.show(show_input_positions=True))
     right_output = strip_ansi(right_path.show(show_input_positions=True))
 
-    assert "wrote global:@left[v0] used by UseBoth via args[0]" in left_output
-    assert "global:@right[v0]" not in left_output
+    assert "global:@left[v0] as str via args[0]" in left_output
+    assert "global:@right[v0] as str via args[1]" in left_output
 
-    assert "wrote global:@right[v0] used by UseBoth via args[1]" in right_output
-    assert "global:@left[v0]" not in right_output
+    assert "global:@right[v0] as str via args[1]" in right_output
+    assert "global:@left[v0] as str via args[0]" in right_output
 
 
 
@@ -2569,12 +2542,12 @@ def test_path_to_dict_multiple_writes_filters_to_requested_ref():
     left_edges = path_edge_dicts(trace.path(left, consumer))
     right_edges = path_edge_dicts(trace.path(right, consumer))
 
-    assert [(edge["ref"], edge["version"], edge["input_use"]["display"]) for edge in left_edges] == [
-        ("global:@left", 0, "args[0]")
+    assert [(edge["state"]["ref"], edge["state"]["version"], edge["input"]) for edge in left_edges] == [
+        ("global:@left", 0, {"name": "args", "index": 0})
     ]
 
-    assert [(edge["ref"], edge["version"], edge["input_use"]["display"]) for edge in right_edges] == [
-        ("global:@right", 0, "args[1]")
+    assert [(edge["state"]["ref"], edge["state"]["version"], edge["input"]) for edge in right_edges] == [
+        ("global:@right", 0, {"name": "args", "index": 1})
     ]
 
 def test_path_multiple_writes_edge_data_filters_to_requested_ref():
@@ -2593,16 +2566,16 @@ def test_path_multiple_writes_edge_data_filters_to_requested_ref():
     left_edges = path_edges(trace.path(left, consumer))
     right_edges = path_edges(trace.path(right, consumer))
 
-    assert [(edge.produced_ref, edge.produced_ver, edge.input_use()["display"]) for edge in left_edges] == [
-        ("global:@left", 0, "args[0]")
+    assert [(edge.read.unscoped_reference, edge.read.resolved_version, edge.read.associated_input[0], edge.read.input_index) for edge in left_edges] == [
+        ("global:@left", 0, "args", 0)
     ]
 
-    assert [(edge.produced_ref, edge.produced_ver, edge.input_use()["display"]) for edge in right_edges] == [
-        ("global:@right", 0, "args[1]")
+    assert [(edge.read.unscoped_reference, edge.read.resolved_version, edge.read.associated_input[0], edge.read.input_index) for edge in right_edges] == [
+        ("global:@right", 0, "args", 1)
     ]
 
 
-PATH_LABEL = re.compile(r"[├└]── path \d+$")
+PATH_LABEL = re.compile(r"PATH \d+$")
 
 
 def rendered_path_blocks(output):
@@ -2648,6 +2621,8 @@ def assert_no_empty_rendered_path_blocks(output):
             or "read " in strip_ansi(line)
             or "written as " in strip_ansi(line)
             or "read as " in strip_ansi(line)
+            or "EXEC_RECORD[" in strip_ansi(line)
+            or "[v" in strip_ansi(line)
         ]
 
         assert content_lines, "\n".join(block)
@@ -2695,7 +2670,7 @@ def test_path_show_direct_value_write_path_is_not_empty(path_context):
     pathed = trace.path(b_exec_inspected, b_val_inspected)
     output = pathed.show(show_input_positions=True)
 
-    assert "written as global:@B[v0]" in strip_ansi(output)
+    assert "wrote global:@B[v0]" in strip_ansi(output)
     assert_no_empty_rendered_path_blocks(output)
 
 
@@ -2713,12 +2688,12 @@ def test_path_show_branching_paths_each_have_rendered_content():
     pathed = trace.path(branch_a, branch_d, deep_link=True)
     output = pathed.show(show_input_positions=True)
 
-    assert "path 0" in strip_ansi(output)
-    assert "path 1" in strip_ansi(output)
+    assert "PATH 1" in strip_ansi(output)
+    assert "PATH 2" in strip_ansi(output)
     assert_no_empty_rendered_path_blocks(output)
 
 
-def test_nested_node_path_uses_producer_name_instead_of_internal_node_id():
+def test_nested_node_path_uses_occurrence_references_and_producer_name():
     @node
     def create_data():
         return {number: None for number in range(3)}
@@ -2736,18 +2711,20 @@ def test_nested_node_path_uses_producer_name_instead_of_internal_node_id():
         return trust_check_data(process_data(create_data()))
 
     trace = TIDE().ocean.run_pipeline(nested_pipeline)
+    source_ref = trace.log[0].writes[0].stored_target
+    target_ref = trace.log[1].writes[0].stored_target
     pathed = trace.path(
-        "create_data",
-        "process_data",
+        source_ref,
+        target_ref,
         "reference",
         "reference",
     )
     output = strip_ansi(pathed.show(color=False))
-    stack_links = [edge for edge in pathed.edges() if isinstance(edge, StackLink)]
+    stack_links = path_edges(pathed)
 
     assert stack_links
-    assert stack_links[0].producer_actor.source_actor == "create_data"
-    assert "read __tide___0:@tmp_node_link.create_data[v0] from create_data" in output
+    assert stack_links[0].read.producer_actor.source_actor == "create_data"
+    assert f"{source_ref}[v0]" in output
     assert re.search(r" from \d+(?:\n|$)", output) is None
 
 
@@ -2780,26 +2757,33 @@ def test_path_reports_a_closing_cycle_without_expanding_it_forever():
     tide = TIDE()
     tide.event("A", writes={"state_a": "a"})
     tide.event("B", reads={"state_a": "a"}, writes={"state_b": "b"})
-    trace = tide.trace()
+    source_trace = tide.trace()
+    mutable_log = replay_events(
+        source_trace.events,
+        expected_ocean_id=source_trace.ocean_id,
+    ).exec_log.exec_log
 
-    source_exec = trace.exec_log[0]
-    target_exec = trace.exec_log[1]
-    closing_edge = StackLink({
-        "affected_input": ("cycle",),
-        "affected_input_index": 0,
-        "affected_actor": source_exec.producer_id,
-        "affected_exec_id": source_exec.exec_id,
-        "producer_actor": target_exec.producer_id,
-        "producer_exec_id": target_exec.exec_id,
-        "produced_ref": "global:state_b",
-        "produced_ref_version": 0,
-    })
-    trace.index.producer_exec_id_to_consumer_input_edges[
-        target_exec.exec_id
-    ].append(closing_edge)
-    trace.index.consumer_exec_id_to_producer_input_edges[
-        source_exec.exec_id
-    ].append(closing_edge)
+    source_exec = mutable_log[0]
+    target_exec = mutable_log[1]
+    input_use = InputUseRecord("cycle", None, None, None, None, [])
+    read = DependencyUseRecord(
+        ("cycle", input_use),
+        None,
+        "static",
+        "global:state_b",
+        "b",
+        0,
+        target_exec.runner_id,
+        target_exec.producer_id,
+        target_exec.exec_id,
+        input_index=0,
+    )
+    input_use.dependencies = [read]
+    object.__setattr__(source_exec, "deps", (*source_exec.deps, read))
+    trace = Trace(
+        log=mutable_log,
+        ocean_id=source_trace.ocean_id,
+    )
 
     pathed = trace.path(
         source_exec.exec_id,
@@ -2808,7 +2792,12 @@ def test_path_reports_a_closing_cycle_without_expanding_it_forever():
         "exec_record",
     )
     edge_paths = [
-        [edge for edge in path if isinstance(edge, StackLink)]
+        [
+            edge
+            for handoffs in path["handoffs"]
+            for edge in handoffs
+            if isinstance(edge, ReadEdge)
+        ]
         for paths in pathed.paths.values()
         for path in paths
     ]

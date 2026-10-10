@@ -68,7 +68,7 @@ def test_raise_writes_error_as_value_and_does_not_leak_task():
     tide = TIDE()
     result = tide.exec(fail_explicitly, writes="handled_error")
     trace = tide.trace()
-    handled_record = trace.exec_log[-1]
+    handled_record = trace.log[-1]
 
     assert isinstance(result, ValueError)
     assert str(result) == "invalid payload"
@@ -77,8 +77,8 @@ def test_raise_writes_error_as_value_and_does_not_leak_task():
     assert str(stored_error) == "invalid payload"
     assert not tide.ocean.executor.running_tasks
     assert PipelineEvents.RESULT_READY in [
-        entry["event_type"]
-        for entry in tide.ocean.event_logger.log
+        entry.type
+        for entry in tide.ocean.event_logger.events
     ]
     assert handled_record.func_name == "fail_explicitly"
     assert handled_record.status == "handled_raise"
@@ -90,22 +90,9 @@ def test_raise_writes_error_as_value_and_does_not_leak_task():
     assert refs_from_writes(handled_record) == [("global:handled_error", 0)]
 
 
-def test_raise_preserves_nested_effect_descriptions_for_callers():
-    raised = RAISE(
-        "stop now",
-        effects=[{"effect": "audit", "reason": "invalid"}],
-        preserve_output={"accepted": False},
-    )
-
-    payload = raised.to_dict()
-
-    assert isinstance(raised.exception, Exception)
-    assert str(raised.exception) == "stop now"
-    assert payload["effect"] == "RAISE"
-    assert payload["preserve_output"] == {"accepted": False}
-    assert payload["effects"] == [
-        {"effect": "audit", "reason": "invalid"}
-    ]
+def test_raise_rejects_non_effect_fallthrough_entries():
+    with pytest.raises(TypeError, match="RAISE effects must be Effect objects or classes"):
+        RAISE("stop now", effects=[{"effect": "audit"}])
 
 
 def test_raise_dispatches_effects_and_returns_fallback_without_stopping():
@@ -118,16 +105,16 @@ def test_raise_dispatches_effects_and_returns_fallback_without_stopping():
             effects=[
                 WRITE(
                     "global:failure_marker",
-                    preserve_output={"handled": True},
+                    {"handled": True},
                 ),
                 DELETE("global:cleanup"),
             ],
-            preserve_output={"accepted": False},
+            output={"accepted": False},
         )
 
     result = tide.exec(fail_with_fallthrough, writes="handled_result")
     trace = tide.trace()
-    handled_record = trace.exec_log[-1]
+    handled_record = trace.log[-1]
 
     assert result == {"accepted": False}
     assert tide.ocean.store_router.get(
@@ -150,10 +137,10 @@ def test_raise_dispatches_effects_and_returns_fallback_without_stopping():
     assert {
         effect_record.effect
         for effect_record in handled_record.effects
-    } == {"write", "DELETE"}
+    } == {Effects.WRITE, Effects.DELETE, Effects.RAISE}
 
     imported = TIDE.from_bundle(trace.to_bundle().to_dict())
-    imported_record = imported.exec_log[-1]
+    imported_record = imported.log[-1]
     assert imported_record.status == "handled_raise"
     assert imported_record.handled_raise is True
     assert imported_record.output_value == {"accepted": False}
@@ -161,7 +148,10 @@ def test_raise_dispatches_effects_and_returns_fallback_without_stopping():
         WRITE,
         DELETE,
     ]
-    assert len(imported_record.effects) == 2
+    assert {
+        effect_record.effect
+        for effect_record in imported_record.effects
+    } == {Effects.WRITE, Effects.DELETE, Effects.RAISE}
 
 
 def test_raise_run_effect_launches_recovery_and_pipeline_continues():
@@ -205,15 +195,15 @@ def test_raise_run_effect_launches_recovery_and_pipeline_continues():
 
     assert calls == ["failed", "recovery"]
     assert any(
-        entry["event_type"] == LogEvents.EFFECT
-        and entry["payload"][0] == Effects.RUN
-        for entry in tide.ocean.event_logger.log
+        entry.type == LogEvents.EFFECT
+        and entry.payload.effect == Effects.RUN
+        for entry in tide.ocean.event_logger.events
     )
     assert any(
         record.func_name == "fail"
         and record.status == "handled_raise"
         and record.handled_raise
-        for record in trace.exec_log
+        for record in trace.log
     )
 
 
@@ -232,10 +222,12 @@ def test_ocean_node_error_always_carries_failed_tide_trace(mode):
         tide.ocean.run_pipeline(flow, mode=mode)
 
     failed_trace = raised.value.tide_trace
-    failed_record = failed_trace.exec_log[-1]
+    failed_record = failed_trace.log[-1]
     assert failed_record.func_name == "fail"
     assert failed_record.status == "failed"
-    assert failed_record.error is raised.value
+    assert type(failed_record.error) is type(raised.value)
+    assert failed_record.error.args == raised.value.args
+    assert failed_trace._log[-1].error is not raised.value
     assert failed_record.writes == []
 
 
@@ -247,7 +239,7 @@ def test_ocean_raise_is_written_and_consumed_without_stopping(mode):
     def fail():
         raise RAISE(
             ValueError("explicit failure"),
-            preserve_output="fallback",
+            output="fallback",
         )
 
     @node
@@ -263,10 +255,10 @@ def test_ocean_raise_is_written_and_consumed_without_stopping(mode):
     trace = tide.ocean.run_pipeline(flow, mode=mode)
 
     handled_record = next(
-        record for record in trace.exec_log if record.func_name == "fail"
+        record for record in trace.log if record.func_name == "fail"
     )
     consumer_record = next(
-        record for record in trace.exec_log if record.func_name == "consume"
+        record for record in trace.log if record.func_name == "consume"
     )
     assert observed == ["fallback"]
     assert handled_record.status == "handled_raise"
@@ -281,38 +273,18 @@ def test_returned_raise_uses_the_same_controlled_value_semantics():
     def return_controlled_raise():
         return RAISE(
             ValueError("returned signal"),
-            preserve_output=False,
+            output=False,
         )
 
     tide = TIDE()
     result = tide.exec(return_controlled_raise, writes="fallback")
-    record = tide.trace().exec_log[-1]
+    record = tide.trace().log[-1]
 
     assert result is False
     assert tide.ocean.store_router.get("global", "fallback") is False
     assert record.status == "handled_raise"
     assert record.handled_raise is True
     assert isinstance(record.error, ValueError)
-
-
-def test_raise_handling_failure_is_explicit_and_carries_both_errors():
-    def invalid_controlled_raise():
-        raise RAISE(
-            ValueError("user failure"),
-            effects=[{"effect": "not-a-runtime-effect"}],
-        )
-
-    tide = TIDE()
-    with pytest.raises(RaiseHandlingError) as raised:
-        tide.exec(invalid_controlled_raise)
-
-    assert isinstance(raised.value.raised_error, ValueError)
-    assert str(raised.value.raised_error) == "user failure"
-    assert isinstance(raised.value.handling_error, TypeError)
-    assert "RAISE effects must be TIDE Effect objects" in str(
-        raised.value.handling_error
-    )
-    assert raised.value.tide_trace.exec_log[-1].status == "handled_raise"
 
 
 def test_event_read_list_imports_stored_ref():
@@ -465,7 +437,7 @@ def test_exec_deleted_after_static_dependency_available_before_resolution_does_n
     def intercept_event(event):
         original_emit_event_to_ocean(event)
 
-        if event.event_type == PipelineEvents.DEP_AVAILABLE and not deleted.is_set():
+        if event.type == PipelineEvents.DEP_AVAILABLE and not deleted.is_set():
             deleted.set()
             tide.ocean.store_router.delete("global", "@A")
 
@@ -499,10 +471,7 @@ def test_exec_deleted_after_static_dependency_available_before_resolution_does_n
 
     assert trace.events
     
-    event_names = [
-        event["event_type"] if isinstance(event, dict) else event.event_type
-        for event in trace.events
-    ]
+    event_names = [event.type for event in trace.events]
 
     assert LogEvents.MISSING_REFS in event_names
 
@@ -525,7 +494,7 @@ def test_exec_deleted_after_dynamic_concretisation_before_resolution_does_not_ex
     def intercept_event(event):
         original_emit_event_to_ocean(event)
 
-        if event.event_type == LogEvents.DEP_CONCRETISED and not deleted.is_set():
+        if event.type == LogEvents.DEP_CONCRETISED and not deleted.is_set():
             deleted.set()
             tide.ocean.store_router.delete("global", "@alpha_one")
 

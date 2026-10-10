@@ -4,6 +4,14 @@ Implementation modules remain internal for now, but applications can use the
 names below without reaching into that internal layout.
 """
 
+import os
+
+
+if os.environ.get("TIDE_NOW_CAPTURE") == "1":
+    from tide_tooling._now_compat import install_now_argument_binding_patch
+
+    install_now_argument_binding_patch()
+
 from tide_tooling.tooling_core.engine.classes import (
     DataRef,
     DELETE,
@@ -15,8 +23,11 @@ from tide_tooling.tooling_core.engine.classes import (
     Pipeline,
     RAISE,
     READ,
+    READ_EFFECT,
     RUN,
     WRITE,
+    WRITE_NOW,
+    __fallback__
 )
 from tide_tooling.tooling_core.engine.decorators import node, pipeline
 from tide_tooling.tooling_core.engine.events import Effects
@@ -24,12 +35,12 @@ from tide_tooling.tooling_core.engine.errors import (
     DeleteNowInsideProcessPoolError,
     RaiseHandlingError,
     ReadInsideProcessPoolError,
+    WriteNowInsideProcessPoolError,
 )
 from tide_tooling.tooling_core.engine.tide_links import (
-    AffectedStackLink,
-    EmittedStackLink,
-    ReadWriteLink,
-    StackLink,
+    EffectEdge,
+    EmissionEdge,
+    ReadEdge,
 )
 from tide_tooling.tooling_core.engine.tide_records import (
     AffectedRecord,
@@ -46,7 +57,9 @@ from tide_tooling.tooling_core.engine.tide_records import (
 from tide_tooling.tooling_core.engine.tide_query_results import (
     Compared,
     ConsumedBy,
+    Definition,
     Downstream,
+    ExecutionAncestry,
     Inspected,
     InspectedGroup,
     Investigate,
@@ -55,8 +68,8 @@ from tide_tooling.tooling_core.engine.tide_query_results import (
     Pathed,
     ProducedBy,
     Searched,
-    TIDEModelCompared,
     Upstream,
+    UsedAs,
 )
 from tide_tooling.tooling_core.engine.tide_logging import Trace
 from tide_tooling.tooling_core.engine.tide_rendering import strip_ansi
@@ -64,19 +77,26 @@ from tide_tooling.tooling_core.engine.ocean import Ocean
 from tide_tooling.tooling_core.engine.stores import MemoryKVStore
 from tide_tooling.tooling_core.bundling.TIDEBundle import TIDEBundle
 from tide_tooling.tooling_core.bundling.TIDEOpaqueValue import TIDEOpaqueValue
-from tide_tooling.core import TIDE, TIDEModelReport
-from tide_tooling.comparator import TIDEComparatorReport, comparator
-from tide_tooling.intent import IntentIdentityMap, IntentMap
+from tide_tooling.core import TIDE, TIDEModelValidityReport
+from tide_tooling.comparator import TIDEModelComparisonReport
+from tide_tooling.TIDEAdapters import (
+    NOWAdapter,
+    NOWMeta,
+    OpenInferenceAdapter,
+    OpenLineageAdapter,
+    OpenTelemetryAdapter,
+)
 
 
 __all__ = [
     "TIDE",
-    "TIDEModelReport",
-    "TIDEModelCompared",
-    "TIDEComparatorReport",
-    "comparator",
-    "IntentMap",
-    "IntentIdentityMap",
+    "TIDEModelValidityReport",
+    "TIDEModelComparisonReport",
+    "OpenLineageAdapter",
+    "OpenTelemetryAdapter",
+    "NOWAdapter",
+    "NOWMeta",
+    "OpenInferenceAdapter",
     "TIDEBundle",
     "TIDEOpaqueValue",
     "Trace",
@@ -85,8 +105,11 @@ __all__ = [
     "Pathed",
     "Upstream",
     "Downstream",
+    "ExecutionAncestry",
     "ProducedBy",
     "ConsumedBy",
+    "UsedAs",
+    "Definition",
     "Actor",
     "Compared",
     "DataRef",
@@ -94,7 +117,7 @@ __all__ = [
     "Pipeline",
     "ExecRecord",
     "EmittedNodeRecord",
-    "EmittedStackLink",
+    "EmissionEdge",
     "DependencyUseRecord",
     "ExpandedDepRecord",
     "InputUseRecord",
@@ -107,9 +130,8 @@ __all__ = [
     "InspectedGroup",
     "Investigate",
     "Object",
-    "ReadWriteLink",
-    "StackLink",
-    "AffectedStackLink",
+    "ReadEdge",
+    "EffectEdge",
     "Ocean",
     "MemoryKVStore",
     "node",
@@ -117,10 +139,13 @@ __all__ = [
     "Effect",
     "Effects",
     "ReadInsideProcessPoolError",
+    "WriteNowInsideProcessPoolError",
     "DeleteNowInsideProcessPoolError",
     "RaiseHandlingError",
     "READ",
+    "READ_EFFECT",
     "WRITE",
+    "WRITE_NOW",
     "END",
     "DELETE",
     "DELETE_NOW",

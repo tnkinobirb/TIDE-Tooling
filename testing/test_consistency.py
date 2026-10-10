@@ -1,8 +1,9 @@
 import inspect
+from types import SimpleNamespace
 
 from tide_tooling.tooling_core.engine.tide_logging import (
-    AffectedStackLink,
     Actor,
+    EffectEdge,
     Investigate,
     Inspected,
     Nearby,
@@ -17,7 +18,6 @@ from tide_tooling import TIDE
 
 RENDERABLES = [
     Actor,
-    AffectedStackLink,
     Upstream,
     Pathed,
     Searched,
@@ -44,7 +44,6 @@ def test_renderable_show_color_false_is_plain_text():
     )
     nearby = Nearby("writer")
     searched = Searched(
-        trace.inspect,
         "writer",
         [],
         [],
@@ -55,29 +54,16 @@ def test_renderable_show_color_false_is_plain_text():
     )
     objects = [
         Actor(0, "run", "writer"),
-        AffectedStackLink(
-            "producer-exec",
-            Actor(0, "run", "producer"),
-            "effect",
-            "global:@value",
-            0,
-            "consumer-exec",
-            Actor(0, "run", "consumer"),
-            ["args"],
-        ),
         inspected,
         Investigate(trace, trace.inspect, inspected),
         searched,
         Upstream(inspected, {}, {}),
         Pathed(
-            trace.inspect,
-            trace.index,
             inspected,
-            [],
             inspected,
-            [],
             {},
-            direction="downstream",
+            "downstream",
+            inspect=trace.inspect,
         ),
         ProducedBy(trace.inspect, inspected, [], [], {}),
     ]
@@ -87,30 +73,14 @@ def test_renderable_show_color_false_is_plain_text():
         assert "\x1b[" not in output, type(obj).__name__
 
 
-def test_affected_stack_link_is_serialisable_and_diffable():
-    first = AffectedStackLink(
-        "producer-exec",
-        Actor(0, "run", "producer"),
-        "effect",
-        "global:@value",
-        0,
-        "consumer-exec",
-        Actor(0, "run", "consumer"),
-        ["args"],
-    )
-    second = AffectedStackLink(
-        "producer-exec",
-        Actor(0, "run", "producer"),
-        "effect",
-        "global:@other",
-        0,
-        "consumer-exec",
-        Actor(0, "run", "consumer"),
-        ["args"],
-    )
+def test_effect_edge_keeps_record_ownership_and_derived_exec_ids():
+    producer = SimpleNamespace(exec_id="producer-exec")
+    effect_record = object()
+    affected_record = SimpleNamespace(affected_exec_id="consumer-exec")
+    edge = EffectEdge(producer, effect_record, affected_record)
 
-    assert first.to_dict()["ref"] == "global:@value"
-    assert first.diff(second).changed["ref"] == {
-        "before": "global:@value",
-        "after": "global:@other",
-    }
+    assert edge.producer is producer
+    assert edge.effect_record is effect_record
+    assert edge.affected_record is affected_record
+    assert edge.producer_exec_id == "producer-exec"
+    assert edge.consumer_exec_id == "consumer-exec"

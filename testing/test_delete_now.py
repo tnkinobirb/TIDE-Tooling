@@ -2,6 +2,7 @@ import pytest
 
 from tide_tooling import DELETE_NOW, READ, TIDE, Effects, node, pipeline
 from tide_tooling.tooling_core.engine.classes import DataRef
+from tide_tooling.tooling_core.engine.errors import DeleteNowInsideProcessPoolError
 from tide_tooling.tooling_core.engine.events import LogEvents, PipelineEvents
 
 
@@ -11,9 +12,9 @@ def _delete_now_from_process_worker():
 
 def _effect_kinds(tide):
     return [
-        entry["payload"][0]
-        for entry in tide.ocean.event_logger.log
-        if entry["event_type"] == LogEvents.EFFECT
+        entry.payload.effect
+        for entry in tide.ocean.event_logger.events
+        if entry.type == LogEvents.EFFECT
     ]
 
 
@@ -22,10 +23,10 @@ def test_delete_now_is_safe_and_side_effect_free_outside_tide_runtime():
 
 
 def test_delete_now_requires_one_static_reference():
-    with pytest.raises(ValueError, match="exactly one static"):
+    with pytest.raises(TypeError, match="string or DataRef"):
         DELETE_NOW(["global:a", "global:b"])
 
-    with pytest.raises(ValueError, match="dynamic references"):
+    with pytest.raises(ValueError, match="one static reference"):
         DELETE_NOW(DataRef("item_*", "global"))
 
 
@@ -48,8 +49,8 @@ def test_delete_now_missing_reference_returns_false_and_records_attempt():
     assert result is False
     assert tide.trace().find(Effects.DELETE).exists("effect") == (True, False)
     assert PipelineEvents.DEP_DELETED not in [
-        entry["event_type"]
-        for entry in tide.ocean.event_logger.log
+        entry.type
+        for entry in tide.ocean.event_logger.events
     ]
 
 
@@ -104,7 +105,7 @@ def test_delete_now_works_inside_an_ocean_pipeline_without_returning_effect():
     assert trace.find(Effects.DELETE).exists("effect") == (True, False)
 
 
-def test_delete_now_replays_explicit_process_execution_in_thread_pool():
+def test_delete_now_fails_under_explicit_process_execution():
     process_node = node(
         targets="global:deleted",
     )(_delete_now_from_process_worker)
@@ -115,13 +116,7 @@ def test_delete_now_replays_explicit_process_execution_in_thread_pool():
 
     tide = TIDE()
     tide.declare("temporary", "present")
-    trace = tide.ocean.run_pipeline(process_pipeline, mode="process")
+    with pytest.raises(DeleteNowInsideProcessPoolError):
+        tide.ocean.run_pipeline(process_pipeline, mode="process")
 
-    assert trace.value_of("global:deleted") == [True]
-    assert not tide.ocean.store_router.exists("global", "temporary")
-    completion = next(
-        entry
-        for entry in tide.ocean.event_logger.log
-        if entry["event_type"] == PipelineEvents.RESULT_READY
-    )
-    assert completion["payload"][2].execution_mode == "thread"
+    assert tide.ocean.store_router.exists("global", "temporary")

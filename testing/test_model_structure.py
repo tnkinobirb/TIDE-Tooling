@@ -3,7 +3,8 @@ import random
 
 import pytest
 
-from tide_tooling import TIDE
+from tide_tooling import TIDE, Trace
+from tide_tooling.tooling_core.engine.tide_model import TIDEModel
 
 
 BASE_MODEL = {
@@ -31,6 +32,16 @@ BASE_MODEL = {
         {"e": "archive", "s": "archive-record"},
     ],
 }
+
+
+def test_model_contract_has_one_implementation_owner():
+    assert not hasattr(TIDE, "_normalise_model")
+    assert not hasattr(TIDE, "_trace_from_model")
+    assert not hasattr(Trace, "_project_trace_to_model")
+    assert not hasattr(Trace, "_reconcile_event_model")
+    assert callable(TIDEModel.normalise)
+    assert callable(TIDEModel.to_trace)
+    assert callable(TIDEModel.from_trace)
 
 
 def _pairs(entries):
@@ -94,36 +105,76 @@ def test_structural_model_is_invariant_to_ids_order_duplicates_and_enrichment():
     renamed = _renamed(BASE_MODEL)
 
     left = TIDE.from_model(BASE_MODEL).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
     right = TIDE.from_model(renamed).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
     assert left["I"] == right["I"]
     assert left["O"] == right["O"]
-    assert set(left) == {"schema", "schema_version", "host", "E", "S", "I", "O"}
+    assert set(left) == {"host", "E", "S", "I", "O", "executions", "states"}
     assert "host_record" not in right
-    assert "executions" not in right
-    assert "states" not in right
+    for field, carrier in (("executions", "E"), ("states", "S")):
+        assert {entry["original_id"] for entry in right[field].values()} == set(renamed[carrier])
+        assert all(set(entry) == {"original_id"} for entry in right[field].values())
+
+
+def test_structural_model_keeps_origin_without_schema_metadata():
+    canonical = TIDE.from_model({
+        "host": "NOW",
+        "E": ["run"],
+        "S": ["result"],
+        "I": [],
+        "O": [["run", "result"]],
+    }).to_model(enrich=False, identity_mode="structural")
+
+    assert canonical == {
+        "host": "NOW",
+        "E": ["exec_0"],
+        "S": ["state_0"],
+        "I": [],
+        "O": [{"exec_id": "exec_0", "state_id": "state_0"}],
+        "executions": {"exec_0": {"original_id": "run"}},
+        "states": {"state_0": {"original_id": "result"}},
+    }
+
+
+def test_structural_import_keeps_explicit_host_when_model_omits_it():
+    canonical = TIDE.from_model({
+        "E": ["run"],
+        "S": ["result"],
+        "I": [],
+        "O": [["run", "result"]],
+    }, host="NOW", identity_mode="structural").to_model(
+        enrich=False,
+        identity_mode="structural",
+    )
+
+    assert canonical["host"] == "NOW"
 
 
 def test_structural_model_is_idempotent():
     canonical = TIDE.from_model(BASE_MODEL).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
     repeated = TIDE.from_model(
         canonical,
         identity_mode="structural",
     ).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
-    assert repeated == canonical
+    # Canonical structure is idempotent; enrichment identifies this invocation's input IDs.
+    assert {field: repeated[field] for field in ("host", "E", "S", "I", "O")} == {
+        field: canonical[field] for field in ("host", "E", "S", "I", "O")
+    }
+    for field, carrier in (("executions", "E"), ("states", "S")):
+        assert {entry["original_id"] for entry in repeated[field].values()} == set(canonical[carrier])
 
 
 def test_structural_import_builds_only_canonical_trace_identities():
@@ -134,16 +185,21 @@ def test_structural_import_builds_only_canonical_trace_identities():
 
     assert all(
         str(record.exec_id).startswith("exec_")
-        for record in trace.exec_log
+        for record in trace.log
     )
     assert all(
         str(record.func_name).startswith("exec_")
-        for record in trace.exec_log
+        for record in trace.log
     )
-    assert all(
-        projection["state_id"].startswith("state_")
-        for projection in trace.model_context["state_projection"]
-    )
+    references = {
+        reference
+        for record in trace.log
+        for reference in (
+            *(dependency.unscoped_reference for dependency in record.deps),
+            *(write.stored_target for write in record.writes),
+        )
+    }
+    assert all(reference.startswith("__model__:state_") for reference in references)
 
 
 def test_symmetric_branches_do_not_need_host_identity_tie_breaking():
@@ -173,11 +229,11 @@ def test_symmetric_branches_do_not_need_host_identity_tie_breaking():
     }
 
     first_view = TIDE.from_model(first).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
     second_view = TIDE.from_model(second).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
@@ -203,7 +259,7 @@ def test_large_symmetric_fan_out_is_pruned_by_proven_interchangeability():
     }
 
     canonical = TIDE.from_model(model).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
@@ -213,6 +269,40 @@ def test_large_symmetric_fan_out_is_pruned_by_proven_interchangeability():
         edge["exec_id"]
         for edge in canonical["O"]
     } == {"exec_0"}
+
+
+def test_disconnected_symmetric_components_are_canonicalised_independently():
+    component_count = 40
+    original = {
+        "E": [f"execution-{index}" for index in range(component_count)],
+        "S": [f"state-{index}" for index in range(component_count)],
+        "I": [],
+        "O": [
+            [f"execution-{index}", f"state-{index}"]
+            for index in range(component_count)
+        ],
+    }
+    relabelled = {
+        "E": [f"host-execution-{index}" for index in reversed(range(component_count))],
+        "S": [f"host-state-{index}" for index in reversed(range(component_count))],
+        "I": [],
+        "O": [
+            [f"host-execution-{index}", f"host-state-{index}"]
+            for index in reversed(range(component_count))
+        ],
+    }
+
+    original_view = TIDE.from_model(original).to_model(
+        enrich=False,
+        identity_mode="structural",
+    )
+    relabelled_view = TIDE.from_model(relabelled).to_model(
+        enrich=False,
+        identity_mode="structural",
+    )
+
+    for field in ("E", "S", "I", "O"):
+        assert original_view[field] == relabelled_view[field]
 
 
 def test_structural_view_is_stable_across_relabelled_dag_cases():
@@ -259,11 +349,11 @@ def test_structural_view_is_stable_across_relabelled_dag_cases():
         }
 
         original_view = TIDE.from_model(original).to_model(
-            include_hashes=False,
+            enrich=False,
             identity_mode="structural",
         )
         relabelled_view = TIDE.from_model(relabelled).to_model(
-            include_hashes=False,
+            enrich=False,
             identity_mode="structural",
         )
 
@@ -279,55 +369,52 @@ def test_structural_comparison_still_distinguishes_different_relations():
         if edge != {"e": "archive", "s": "merged"}
     ]
 
-    compared = TIDE.from_model(BASE_MODEL).diff(
+    compared = TIDE.from_model(BASE_MODEL).compare(
         TIDE.from_model(changed),
-        identity_mode="structural",
+        mapping="structural",
     )
 
-    assert compared.same is False
-    assert compared.same_kernel is False
+    assert compared.conformant is False
+    assert compared.complete_agreement is False
 
 
 def test_empty_relation_kernel_has_a_stable_structural_view():
     canonical = TIDE.from_model({"E": [], "S": [], "I": [], "O": []}).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
     assert canonical["I"] == []
     assert canonical["O"] == []
     assert canonical == TIDE.from_model(canonical).to_model(
-        include_hashes=False,
+        enrich=False,
         identity_mode="structural",
     )
 
 
-def test_structural_import_keeps_tool_assigned_producer_explicit():
-    with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
-        trace = TIDE.from_model(
-            {
-                "E": ["consumer"],
-                "S": ["boundary"],
-                "I": [["consumer", "boundary"]],
-                "O": [],
-            },
-            identity_mode="structural",
-            assign_unknown=True,
-        )
+def test_structural_import_keeps_tool_assigned_producer_internal():
+    trace = TIDE.from_model(
+        {
+            "E": ["consumer"],
+            "S": ["boundary"],
+            "I": [["consumer", "boundary"]],
+            "O": [],
+        },
+        identity_mode="structural",
+    )
 
+    external = trace.model_context["external_producer"]
     assigned = [
         record
-        for record in trace.exec_log
-        if record.node_options.get("assigned_unknown") is True
+        for record in trace.log
+        if record.exec_id == external["exec_id"]
     ]
 
     assert len(assigned) == 1
     assert assigned[0].exec_id.startswith("exec_")
-    with pytest.raises(ValueError, match="assign_unknown=True"):
-        trace.to_model(include_hashes=False)
-    with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
-        exported = trace.to_model(
-            include_hashes=False,
-            assign_unknown=True,
-        )
-    assert ("unknown", "state_0") in _pairs(exported["O"])
+    exported = trace.to_model(
+        enrich=False,
+        identity_mode="structural",
+    )
+    assert exported["O"] == []
+    assert TIDE.report_model_validity(exported)["unique_creation"] is False

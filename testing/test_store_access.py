@@ -3,7 +3,35 @@ import pytest
 from tide_tooling import TIDE
 from tide_tooling.core import Actor,  Ocean, Node, Pipeline
 from tide_tooling.tooling_core.engine.errors import MissingStoreError, StoreAlreadyRegisteredError
-from tide_tooling.tooling_core.engine.stores import StoreTemplate
+from tide_tooling.tooling_core.engine.stores import MemoryKVStore, StoreTemplate
+from tide_tooling.tooling_core.engine.registries import StoreRegistry
+
+
+def test_local_template_is_not_a_live_store_and_aliases_require_runner_ownership():
+    registry = StoreRegistry()
+    registry.register(MemoryKVStore(name="mem", scope="local"))
+
+    assert registry.exists("mem", template=True)
+    assert not registry.exists("mem")
+    with pytest.raises(MissingStoreError):
+        registry.get("mem")
+
+    actual = MemoryKVStore(name="mem_7", scope="local", parent_runner_id=7)
+    registry.register(actual)
+    assert registry.resolve_runner_store(7, "mem") == "mem_7"
+    assert registry.resolve_pipeline_store(7, "mem_7") == "mem"
+    assert registry.resolve_pipeline_store(8, "mem_7") == "mem_7"
+    assert registry.get("mem_7") is actual
+
+    with pytest.raises(StoreAlreadyRegisteredError):
+        registry.register(MemoryKVStore(name="mem", scope="global"))
+
+
+def test_store_template_rejects_wrong_scope_and_backing_type():
+    with pytest.raises(ValueError, match="scope"):
+        MemoryKVStore(scope="unknown")
+    with pytest.raises(TypeError, match="store_template requires dict"):
+        MemoryKVStore(store_template=[])
 
 
 
@@ -49,13 +77,13 @@ def input_name(read):
     return associated_input
 
 
-def input_uses_from_reads(exec_record):
+def input_paths_from_reads(exec_record):
     return [
         (
             read.unscoped_reference,
             read.resolved_version,
             input_name(read),
-            read.input_index,
+            read.input_path,
         )
         for read in exec_record.reads
     ]
@@ -564,9 +592,9 @@ def test_exec_duplicate_scoped_input_occurrences_preserve_input_positions_withou
         ("testing:@A", 0),
     ]
 
-    assert input_uses_from_reads(use_exec) == [
-        ("testing:@A", 0, "args", 0),
-        ("testing:@A", 0, "args", 1),
+    assert input_paths_from_reads(use_exec) == [
+        ("testing:@A", 0, "args", (0,)),
+        ("testing:@A", 0, "args", (1,)),
     ]
 
 # @pytest.mark.xfail(reason="Unregistered store behavior is not finalized yet.", strict=False)
@@ -870,18 +898,18 @@ def assert_single_local_mem_write(exec_record, key, version=0):
     return ref
 
 
-def run_ocean_pipeline(nodes, name, mem_store_templates=None):
+def run_ocean_pipeline(nodes, name, local_store_templates=None):
     ocean = Ocean()
-    pipeline = Pipeline(stages=nodes, name=name)
+    pipeline = Pipeline(nodes=nodes, name=name)
 
     return ocean.run_pipeline(
         pipeline,
         mode="sequential",
-        mem_store_templates=mem_store_templates or {},
+        local_store_templates=local_store_templates or {},
     )
 
 
-def test_ocean_mem_store_templates_seed_named_local_memory_store_for_one_run():
+def test_ocean_local_store_templates_seed_named_local_memory_store_for_one_run():
     def ReadSeed(value):
         return f"read-{value}"
 
@@ -890,7 +918,7 @@ def test_ocean_mem_store_templates_seed_named_local_memory_store_for_one_run():
 
     trace = ocean.run_pipeline(
         Pipeline(
-            stages=[
+            nodes=[
                 Node(
                     ReadSeed,
                     args=["@data_store:stored_data"],
@@ -900,7 +928,7 @@ def test_ocean_mem_store_templates_seed_named_local_memory_store_for_one_run():
             name="named-local-template",
         ),
         mode="sequential",
-        mem_store_templates={
+        local_store_templates={
             "data_store": {
                 "stored_data": "DATA",
             },
@@ -912,7 +940,7 @@ def test_ocean_mem_store_templates_seed_named_local_memory_store_for_one_run():
     assert refs_from_reads(read_exec) == [("data_store_0:stored_data", 0)]
 
 
-def test_ocean_mem_store_templates_reject_global_store_without_overwriting_it():
+def test_ocean_local_store_templates_reject_global_store_without_overwriting_it():
     ocean = Ocean()
     ocean.register_store(
         name="data_store",
@@ -921,7 +949,7 @@ def test_ocean_mem_store_templates_reject_global_store_without_overwriting_it():
     )
 
     pipeline = Pipeline(
-        stages=[
+        nodes=[
             Node(
                 lambda value: value,
                 args=["@data_store:stored_data"],
@@ -937,12 +965,12 @@ def test_ocean_mem_store_templates_reject_global_store_without_overwriting_it():
 
     with pytest.raises(
         ValueError,
-        match="mem_store_templates cannot seed or overwrite global store",
+        match="Cannot seed or overwrite global Store",
     ):
         ocean.run_pipeline(
             pipeline,
             mode="sequential",
-            mem_store_templates={
+            local_store_templates={
                 "data_store": {
                     "stored_data": "DATA",
                 },
@@ -954,7 +982,7 @@ def test_ocean_mem_store_templates_reject_global_store_without_overwriting_it():
     }
 
 
-def test_ocean_mem_store_templates_reject_non_memory_local_store():
+def test_ocean_local_store_templates_accept_storetemplate_subclass():
     class NonMemoryStore(StoreTemplate):
         reference = "non_memory"
 
@@ -976,18 +1004,15 @@ def test_ocean_mem_store_templates_reject_non_memory_local_store():
         scope="local",
     )
 
-    with pytest.raises(
-        ValueError,
-        match="mem_store_templates can only seed registered local MemoryKVStore",
-    ):
-        ocean.run_pipeline(
-            Pipeline(
-                stages=[Node(lambda: None)],
-                name="non-memory-template-is-invalid",
-            ),
-            mode="sequential",
-            mem_store_templates={"custom_store": {"key": "value"}},
-        )
+    ocean.run_pipeline(
+        Pipeline(
+            nodes=[Node(lambda: None)],
+            name="non-memory-template-is-valid",
+        ),
+        mode="sequential",
+        local_store_templates={"custom_store": {"key": "value"}},
+    )
+    assert ocean.store_registry.exists("custom_store_0")
 
 
 def test_ocean_default_unscoped_node_write_is_local_mem_not_global():
@@ -1096,7 +1121,7 @@ def test_ocean_mem_store_template_read_routes_to_physical_scoped_runner_store():
             ),
         ],
         name="local-mem-template-read",
-        mem_store_templates={
+        local_store_templates={
             "mem": {
                 "local_seed": "local-template-value",
             },
@@ -1146,7 +1171,7 @@ def test_ocean_global_read_and_local_mem_read_with_same_key_route_to_different_s
             ),
         ],
         name="global-vs-local-same-key",
-        mem_store_templates={
+        local_store_templates={
             "mem": {
                 "shared": "local-value",
             },
@@ -1180,7 +1205,7 @@ def test_ocean_local_mem_store_isolation_between_pipeline_runs():
 
     first_trace = ocean.run_pipeline(
         Pipeline(
-            stages=[
+            nodes=[
                 Node(
                     ReadLocalOne,
                     args=["@mem:shared"],
@@ -1190,7 +1215,7 @@ def test_ocean_local_mem_store_isolation_between_pipeline_runs():
             name="local-mem-run-one",
         ),
         mode="sequential",
-        mem_store_templates={
+        local_store_templates={
             "mem": {
                 "shared": "first-local-value",
             },
@@ -1199,7 +1224,7 @@ def test_ocean_local_mem_store_isolation_between_pipeline_runs():
 
     second_trace = ocean.run_pipeline(
         Pipeline(
-            stages=[
+            nodes=[
                 Node(
                     ReadLocalTwo,
                     args=["@mem:shared"],
@@ -1209,11 +1234,16 @@ def test_ocean_local_mem_store_isolation_between_pipeline_runs():
             name="local-mem-run-two",
         ),
         mode="sequential",
-        mem_store_templates={
+        local_store_templates={
             "mem": {
                 "shared": "second-local-value",
             },
         },
+    )
+
+    assert all(
+        runner.store_router is ocean.store_router
+        for runner in ocean.runners.values()
     )
 
     first_exec = exec_for_actor(first_trace, "ReadLocalOne", grouped=False)
@@ -1233,6 +1263,38 @@ def test_ocean_local_mem_store_isolation_between_pipeline_runs():
     assert first_ref != second_ref
     assert first_exec.object.output_value == "one-first-local-value"
     assert second_exec.object.output_value == "two-second-local-value"
+
+
+def test_dynamic_ref_reads_every_runner_local_store_value():
+    def consume(values):
+        return values
+
+    trace = run_ocean_pipeline(
+        [
+            Node(
+                consume,
+                args=["@mem:!"],
+                targets=["@result"],
+            ),
+        ],
+        name="local-store-dynamic-ref",
+        local_store_templates={
+            "mem": {
+                "first": "one",
+                "second": "two",
+            },
+        },
+    )
+
+    execution = exec_for_actor(trace, "consume", grouped=False)
+    assert execution.object.output_value == ["one", "two"]
+    assert [
+        (read.dep.key, read.resolved_version)
+        for read in execution.reads[0].expanded_to
+    ] == [
+        ("first", 0),
+        ("second", 0),
+    ]
 
 
 def test_ocean_explicit_physical_mem_store_ref_does_not_alias_to_current_runner_local_mem():
@@ -1270,7 +1332,7 @@ def test_ocean_explicit_physical_mem_store_ref_does_not_alias_to_current_runner_
             ),
         ],
         name="local-mem-physical-isolation",
-        mem_store_templates={
+        local_store_templates={
             "mem": {
                 "leak_check": "second-run-local",
             },

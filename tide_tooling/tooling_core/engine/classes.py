@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from contextvars import ContextVar
 from typing import Callable, DefaultDict, List, Self, Dict, Any, Hashable, Iterable, ClassVar
-from .errors import NodeDefinitionError, StageDefinitionError, NodeToDagRegistrationError, RuntimeDagConsumptionError, DataRefInitError, MissingDepKeyError, MissingStoreError, ReadInsideProcessPoolError, DeleteNowInsideProcessPoolError
+from .errors import NodeDefinitionError, RuntimeDagConsumptionError, DataRefInitError, MissingDepKeyError, MissingStoreError, ReadInsideProcessPoolError, WriteNowInsideProcessPoolError, DeleteNowInsideProcessPoolError
 from collections import deque, defaultdict
 from tide_tooling.tooling_core.engine.events import Event 
 from warnings import warn
 from tide_tooling.tooling_core.engine.utils import DedupedList
+from tide_tooling.tooling_core.engine.tide_evidence import SealableEvidence
+import copy
 import time
 from enum import Enum, StrEnum
 from .events import RouterEvents, PipelineEvents, ExecutorEvents, Effects
@@ -17,64 +19,49 @@ import re
 from tide_tooling.tooling_core import debug_print as print
 # Do
 
-## Pipeline Node amd Stage Definitions ##
+## Pipeline and Node definitions ##
 
 
-class __TIDE_TEMPLATE_VALUE__:
+class __fallback__:
 
     def __repr__(self):
         return "unknown"
 
     def __eq__(self, other):
-        return isinstance(other, __TIDE_TEMPLATE_VALUE__)
+        return isinstance(other, __fallback__)
     pass
         
-__TEMPLATE_VAL__ = __TIDE_TEMPLATE_VALUE__()
+__TEMPLATE_VAL__ = __fallback__()
 
-# Stage - DedupedList or tuple of Nodes dataclasses and a name
 @dataclass
 class Pipeline:
-    stages: DedupedList[Node] | DedupedList[Stage] = field(default_factory=DedupedList)
-    name: str = None
-    id: int | str = None
-    _pipeline_counter: int = 0
-    
-    def __post_init__(self): 
-        #apply and increment id
-        Pipeline._pipeline_counter += 1
-
-        if not self.name:
-            self.name = f"Pipeline_{self.id}"
-
-        if isinstance(self.stages, Node):
-            self.stages = [Stage("default_stage", [self.stages])]
-            return
-        if isinstance(self.stages[0], Node):
-            self.stages = [Stage("default_stage", self.stages)]
-            return
-@dataclass
-class Stage:
-    id: int = field(init=False)
-    name: str
-    nodes: DedupedList[Node] | tuple[Node]
-
-    _stage_counter: int = 0
+    nodes: list[Node] | tuple[Node, ...] | Node = field(default_factory=list)
+    name: str | None = None
+    id: int | str | None = None
 
     def __post_init__(self):
-        self.id = Stage._stage_counter
-        Stage._stage_counter += 1
-        # DedupedList name - if no name given
-        if not self.name:
-            self.name = f"stage_{self.id}"
-        elif not isinstance(self.name, str):
-            raise StageDefinitionError(f"StageDefinitonError[@SessionID:{self.id}] | Name [self.name]: {self.name} must be a string!")
-        
-        if not isinstance(self.nodes, (list, tuple)):
-            raise StageDefinitionError(f"StageDefinitonError[@SessionID:{self.id}] | Node_DedupedList [self.nodes]: Node_DedupedList [{self.nodes}] must be a DedupedList or tuple - was {type(self.nodes)}!")
+        # Normalise a Node or collection of Nodes into one list.
+        if isinstance(self.nodes, Node):
+            self.nodes = [self.nodes]
+        elif isinstance(self.nodes, (list, tuple)):
+            self.nodes = list(self.nodes)
+        else:
+            raise NodeDefinitionError(
+                "Pipeline nodes must be a Node or a list/tuple "
+                "containing Node objects"
+            )
 
-        invalid = [n for n in self.nodes if not isinstance(n, Node)]
-        if invalid:
-            raise StageDefinitionError(f"StageDefinitonError[@SessionID:{self.id}] | Node_DedupedList [self.nodes] must only contain Node objects! Node Processing/Error-Checking Error? | Invalid_nodes: [{invalid}]")
+        # Reject non-Node entries within the supplied collection.
+        if not all(isinstance(node, Node) for node in self.nodes):
+            raise NodeDefinitionError(
+                "Pipeline nodes must contain only Node objects"
+            )
+
+        # A Pipeline name is optional but must be textual when supplied.
+        if self.name is not None and not isinstance(self.name, str):
+            raise NodeDefinitionError(
+                "Pipeline name must be a string or None"
+            )
 
 
 _data_ref_default_store = ContextVar(
@@ -83,7 +70,7 @@ _data_ref_default_store = ContextVar(
 )
 
 
-class _DataRefMeta(type):
+class _DataRefContext(type):
     @property
     def default_store(cls):
         return _data_ref_default_store.get()
@@ -93,229 +80,144 @@ class _DataRefMeta(type):
         cls.set_default_store(store)
 
 
-class DataRef(metaclass=_DataRefMeta):
+@dataclass(frozen=True)
+class DataRef(metaclass=_DataRefContext):
+    key: Hashable
+    store: str | None = None
+    count: int | None = None
+    max: int | None = None
+    literal: bool = False
+    prefix: bool = field(default=True, compare=False, hash=False, repr=False)
+    source_str: str | None = field(default=None, compare=False, hash=False, repr=False)
+
+    def __post_init__(self):
+        # An omitted Store uses the current context-local default.
+        if self.store is None:
+            object.__setattr__(self, "store", type(self).default_store)
+        if self.key == "*" and not self.literal:
+            object.__setattr__(self, "key", "!")
+
+        # A DataRef identifies one hashable key in one Store.
+        if not isinstance(self.store, str) or not self.store.strip():
+            raise DataRefInitError("DataRef store must be a non-empty string")
+        if not isinstance(self.key, Hashable):
+            raise DataRefInitError("DataRef key must be hashable")
+        if not isinstance(self.prefix, bool):
+            raise DataRefInitError("DataRef prefix must be a bool")
+
+        # Count says how many matching States make the reference ready.
+        if self.count is not None and (not isinstance(self.count, int) or isinstance(self.count, bool) or self.count < 0):
+            raise DataRefInitError("DataRef count must be a non-negative integer or None")
+
+        # Max says how many matching States are selected.
+        if self.max is not None and (not isinstance(self.max, int) or isinstance(self.max, bool) or self.max < 0):
+            raise DataRefInitError("DataRef max must be a non-negative integer or None")
+
+        # Zero count is the ordinary default readiness contract.
+        if self.count == 0:
+            object.__setattr__(self, "count", None)
+            if self.max == 0:
+                object.__setattr__(self, "max", None)
+
+        required = 1 if self.count is None else self.count
+        if self.max is not None and self.max > required:
+            raise DataRefInitError("DataRef max cannot exceed count")
+
+    @property
+    def dynamic(self):
+        # Literal keys never represent patterns.
+        if self.literal:
+            return False
+        return self.count is not None or self.max is not None or (isinstance(self.key, str) and (self.key == "!" or any(token in self.key for token in "*?[")))
+
+    @property
+    def is_autogenerated(self):
+        return self.store == "__untracked__" or self.store.startswith("__untracked___")
+
     @classmethod
     def set_default_store(cls, store):
         if not isinstance(store, str) or not store.strip():
-            raise DataRefInitError(
-                "DataRef default store must be a non-empty string"
-            )
+            raise DataRefInitError("DataRef default store must be a non-empty string")
         return _data_ref_default_store.set(store)
 
     @classmethod
     def reset_default_store(cls, token):
         _data_ref_default_store.reset(token)
 
-    def __init__(self, key: str=None, store: str=None, count: int=None, max: int=None) -> None:
-
-        #if targets not hashable, 
-        if not isinstance(store, str):
-            if store is None:
-                store = DataRef.default_store
-            else:
-                raise DataRefInitError(f"data_ref.store reference was not a string! was {type(store)} e.g: mem, disk, redis")
-        if not isinstance(key, Hashable):
-            raise DataRefInitError(f"data_ref.key {type(key)}:{key} was not hashable! please provide a hashable value. To disable this check - please DedupedList HashableKeyCheck to False in the config")
-        
-        if count is not None and (not isinstance(count, int) or isinstance(count, bool) or count < 0):
-            raise DataRefInitError("data_ref.count must be a non-negative integer or None")
-        if max is not None and (not isinstance(max, int) or isinstance(max, bool) or max < 0):
-            raise DataRefInitError("data_ref.max must be a non-negative integer or None")
-
-        minimum = 1 if count is None else count
-        if max is not None and max > minimum:
-            raise DataRefInitError(
-                "data_ref.max cannot exceed data_ref.count (MIN): "
-                f"MAX {max} > MIN {minimum}"
-            )
-
-        self.key = key
-        self.store = store
-        self.dynamic = False
-        self.count = count # count ignored if not dynamic
-        self.max = max
-
-        if count is not None or max is not None or any(token in self.key for token in "*?["):
-            self.dynamic = True
-
     @classmethod
-    def literal(cls, key, store):
-        """Create a reference whose key is data, not dependency syntax."""
-        reference = cls(key=str(key), store=store)
-        reference.dynamic = False
-        reference.count = None
-        reference.max = None
-        return reference
+    def from_string(cls, value: str | DataRef, prefix: bool = True):
+        # An existing DataRef is already parsed.
+        if isinstance(value, DataRef):
+            return value
+        if not isinstance(value, str):
+            raise TypeError(f"DataRef must be created from str, not {type(value)}")
+        if not isinstance(prefix, bool):
+            raise TypeError("DataRef prefix must be a bool")
 
-        # if isinstance(key, str):
-        #     if "@" in key: # if converting from stre @ should be stripped bbbefore - temporary work around
-        #         self.key =  key.split("@", 1)[1] # remove @ from @dep.string
+        has_prefix = prefix and value.startswith("@")
+        text = value[1:] if has_prefix else value
+        source_str = text
 
-        #     if ":" in self.key and not store: # could lead to bug is store chosen and user presumes :is part of the sttr. for now startswith @ and : are special characters
-        #         self.store, self.key = self.key.split(":", 1)
-        #     if "*" in self.key:   
-        #         self.dynamic = True  
-        #         return
+        # Model identifiers are literal host identities.
+        if text.startswith("__model__:"):
+            return cls(key=text.removeprefix("__model__:"), store="__model__", literal=True, prefix=has_prefix, source_str=source_str)
+
+        if re.search(r":\*:\d+:(?:\d+|\*)$", text):
+            raise ValueError("Invalid DataRef string; expected STORE:KEY[:MIN[:MAX]]")
+
+        parts = text.split(":")
+        count = None
+        maximum = None
+
+        # Read the optional MIN and MAX fields from the end.
+        if len(parts) >= 3 and parts[-2:] == ["*", "*"]:
+            parts = parts[:-2]
+            count = 1
+        elif len(parts) >= 2 and parts[-2] == "*" and parts[-1].isdigit():
+            count = int(parts[-1])
+            maximum = count
+            parts = parts[:-2]
+        elif len(parts) >= 2 and parts[-2].isdigit() and parts[-1] == "*":
+            count = int(parts[-2])
+            parts = parts[:-2]
+        elif len(parts) >= 2 and parts[-2].isdigit() and parts[-1].isdigit():
+            count = int(parts[-2])
+            maximum = int(parts[-1])
+            parts = parts[:-2]
+        elif parts[-1].isdigit():
+            count = int(parts[-1])
+            maximum = count
+            parts = parts[:-1]
+        elif len(parts) >= 2 and parts[-1] == "*":
+            parts = parts[:-1]
+            count = 1
+
+        # The final colon separates the Store from the key.
+        remaining = ":".join(parts)
+        if ":" in remaining:
+            store, key = remaining.rsplit(":", 1)
+        else:
+            store = cls.default_store
+            key = remaining
+        if not store or not key:
+            raise ValueError(f"Invalid DataRef string: {value!r}")
+
+        return cls(key=key, store=store, count=count, max=maximum, prefix=has_prefix, source_str=source_str)
+
     @staticmethod
-    def _is_dep_string(_str, strict=True):
-        if isinstance(_str, str):
-            # Dep strings are deemed incomplete if like @dep.str. and will be ignored. Must be like @dep.str 
-            if _str.startswith("@") and not _str.endswith("."):
-                if _str == "@": # dep str must contain a path value
-                    warn("dep_extractor found a dep as '@'! Check that tuple or DedupedList is correcty defined for a single dep_string. e.g: (@dep_string, ) or {@dep_string, }")
-                    return False
-                return True 
-            elif not strict and ":" in _str and not _str.endswith("."):
-                return True
-            
-        return False
+    def to_string(data_ref: DataRef, prefix: bool | None = None):
+        # Format the resolved Store, key, and explicit dynamic bounds.
+        if prefix is None:
+            prefix = data_ref.prefix
+        elif not isinstance(prefix, bool):
+            raise TypeError("DataRef prefix must be a bool or None")
 
-    @staticmethod # 
-    def from_string(target_str: str, strip_leading=True, verbose=False) -> DataRef:
-        if isinstance(target_str, DataRef):
-            return target_str
-        if isinstance(target_str, str):
-            # print(f"[TARGET_STR_DEBUG_CONVERTER] - FOUND {target_str} as {type(target_str)}, repr={repr(target_str)}")
-            # if verbose:
-            #     print(f"converting dep_Ref {target_str} to DataRef")
-            if strip_leading: 
-                target_key = target_str.split("@", 1)[1] if target_str.startswith("@") else target_str  # remove first @ from @dep.string
-            else:
-                target_key = target_str
-            target_store = DataRef.default_store
-            count = None
-            max = None
-
-            # TIDE Model State identifiers are opaque host identifiers. A
-            # colon, numeric suffix or ``*`` inside one is literal identity,
-            # never TIDE dependency syntax.
-            model_prefix = "__model__:"
-            if target_key.startswith(model_prefix):
-                return DataRef.literal(
-                    target_key[len(model_prefix):],
-                    "__model__",
-                )
-
-            parts = target_key.split(":")
-
-            # Pull MIN/MAX options from the end. The public grammar is
-            # STORE:KEY[:MIN[:MAX]]. A bare ``*`` in the MIN position marks a
-            # dynamic reference with the default minimum; ``*`` in MAX means
-            # unbounded. Wildcards inside KEY independently make it dynamic.
-            if re.search(r":\*:\d+:(?:\d+|\*)$", target_key):
-                raise ValueError(
-                    "Invalid dependency reference format: "
-                    f"{target_str}; expected STORE:KEY[:MIN[:MAX]]"
-                )
-
-            if len(parts) >= 4 and parts[-2:] == ["*", "*"]:
-                # Explicit ``MIN=*, MAX=*`` means the default minimum and
-                # every match available when resolution freezes.
-                parts.pop()
-                parts.pop()
-                count = 1
-            elif (
-                len(parts) >= 2
-                and parts[-2] == "*"
-                and parts[-1].isdigit()
-            ):
-                selected = int(parts.pop())
-                parts.pop()
-                count = selected
-                max = selected
-            elif (
-                len(parts) >= 2
-                and parts[-2].isdigit()
-                and (parts[-1].isdigit() or parts[-1] == "*")
-            ):
-                max_token = parts.pop()
-                count = int(parts.pop())
-                max = count if max_token == "*" else int(max_token)
-            elif parts and parts[-1].isdigit():
-                count = int(parts.pop())
-                max = count
-            elif len(parts) >= 3 and parts[-1] == "*":
-                parts.pop()
-                count = 1
-
-            # Whatever remains is ``key`` or ``store:key``. Runtime-scoped
-            # stores may themselves contain colons (for example
-            # ``__tide___TIDE: .exec(0)``), so the final colon is the only
-            # safe store/key boundary.
-            remaining = ":".join(parts)
-            if not remaining:
-                raise ValueError(
-                    f"Invalid dependency reference format: {target_str}"
-                )
-
-            if ":" in remaining:
-                target_store, target_key = remaining.rsplit(":", 1)
-                if not target_store or not target_key:
-                    raise ValueError(
-                        f"Invalid dependency reference format: {target_str}"
-                    )
-            else:
-                target_key = remaining
-
-            converted_ref = DataRef(key=target_key, store=target_store, count=count, max=max)
-            if verbose:
-                print(f"converted:{converted_ref} dynamic = {converted_ref.dynamic}")
-            return converted_ref
-            
-        raise TypeError(f"{target_str} must be a str, was type({type(target_str)})") 
-    
-    @staticmethod
-    def to_string(data_ref: DataRef, strip_leading=False):
-        ref_string = f"@{data_ref.store}:{data_ref.key}"
-        if strip_leading: ref_string = ref_string.split("@", 1)[1]
-        if data_ref.dynamic:
-            key_is_dynamic = any(token in data_ref.key for token in "*?[")
-            if data_ref.count is None and data_ref.max is None:
-                return ref_string
-            if data_ref.count == 1 and data_ref.max is None:
-                return ref_string + ":*"
+        text = f"{data_ref.store}:{data_ref.key}"
+        if data_ref.count is not None or data_ref.max is not None:
             minimum = 1 if data_ref.count is None else data_ref.count
-            if data_ref.max is None:
-                return ref_string + f":{minimum}:*"
-            if data_ref.max == minimum:
-                return ref_string + f":{minimum}"
-            ref_string = ref_string + f":{minimum}:{data_ref.max}"
-
-        return ref_string
-    
-    @staticmethod    
-    def _normalise_data_refs(targets: str | DataRef | DedupedList[str | DataRef]):
-        normalised_targets = []
-
-        if isinstance(targets, list):    
-            for target in targets:
-                if not isinstance(target, (DataRef, str)): # TODO-NOTE: Support targets DedupedLists [X]
-                    raise NodeDefinitionError(f"DataRefDefError | Target - [{type(target)}, {target}] must be str, DataRef or a DedupedList of either!")
-                
-                normalised = DataRef.from_string(target, strip_leading=False) if isinstance(target, str) else target
-                    
-                if normalised not in normalised_targets:
-                    normalised_targets.append(normalised)
-            return normalised_targets
-
-        if isinstance(targets, str): # TODO-NOTE: Support targets DedupedLists [X]
-            normalised_targets = [DataRef.from_string(targets, strip_leading=False)]
-
-        if isinstance(targets, DataRef):
-            normalised_targets = [targets]
-
-        return normalised_targets
-    
-    def __hash__(self) -> int:
-        return hash((self.store, self.key)) 
-
-    def __eq__(self, other: Any) -> bool:
-        return (isinstance(other, DataRef) and self.store == other.store and self.key == other.key and self.max == other.max and self.count == other.count)
-
-    def __repr__(self) -> str:
-        minimum = 1 if self.dynamic and self.count is None else self.count
-        maximum = "*" if self.dynamic and self.max is None else self.max
-        return f"DataRef({self.key}, {self.store}{(f', need:{minimum},' if minimum is not None else '')} {(f'return:{maximum}' if maximum is not None else '')})"
+            maximum = "*" if data_ref.max is None else data_ref.max
+            text += f":{minimum}:{maximum}"
+        return f"@{text}" if prefix else text
 
 class ProcessStates(Enum):
     RAW = "raw"
@@ -324,165 +226,104 @@ class ProcessStates(Enum):
     RESOLVED = "resolved"
 
 @dataclass
-class NodeState:
-    indexed : bool = False
-    compiled: bool = False
-    resolved: bool = False
-    executing: bool = False
-    evaluated: bool = False
-    result_cached: bool = False
-
-
-@dataclass 
-class NodeDeferralFlags:   
-    # func defer flag
-    func    : bool = False
-    # primary args defer flag
-    args    : bool = False
-    # primary kwargs defer flag
-    kwargs  : bool = False
-    
-    # secondary args defer flags
-    p_args  : bool = False
-    p_kwargs: bool = False
-    # secondary kwargs defer flags
-    k_args  : bool = False
-    k_kwargs: bool = False
-    # is any input is deferred? else False
-    def any(self) -> bool:
-        return any((
-            self.func,
-            self.args,
-            self.kwargs,
-            self.p_args,
-            self.p_kwargs,
-            self.k_args,
-            self.k_kwargs,
-        ))
-    
-@dataclass
 class RunnerNode:
     node: Node
     id: int
-    content_id: int = None
+
+    # Runtime projection of the Node definition.
+    content_id: bytes = field(init=False)
+    node_name: str = field(init=False)
+    func: Callable = field(init=False)
+    effects: list[Effect] = field(init=False)
+    targets: list[DataRef] = field(init=False)
+
+    args: RunnerNodeInput = field(init=False)
+    kwargs: RunnerNodeInput = field(init=False)
+    p_args: RunnerNodeInput = field(init=False)
+    p_kwargs: RunnerNodeInput = field(init=False)
+    k_args: RunnerNodeInput = field(init=False)
+    k_kwargs: RunnerNodeInput = field(init=False)
+
+    force_update: bool = field(init=False)
+    one_shot: bool = field(init=False)
+    unpack: bool = field(init=False)
+    share_implicit_target: bool = field(init=False)
+
+    # Dependencies discovered while compiling this occurrence.
     deps: DedupedList[DataRef] = field(default_factory=DedupedList)
-    effects: DedupedList[Effect] = field(default_factory=DedupedList)
-    defer_flags: NodeDeferralFlags = field(default_factory=NodeDeferralFlags)
-    deferred: bool = False
+    dep_to_input_map: DefaultDict[
+        DataRef,
+        DedupedList[tuple[str, RunnerNodeInput]],
+    ] = field(default_factory=lambda: defaultdict(DedupedList))
+    dynamic_to_static_deps: DefaultDict[
+        DataRef,
+        DedupedList[DataRef],
+    ] = field(default_factory=lambda: defaultdict(DedupedList))
+    static_to_dynamic_deps: DefaultDict[
+        DataRef,
+        DedupedList[DataRef],
+    ] = field(default_factory=lambda: defaultdict(DedupedList))
+    _input_nodes: DedupedList[Node] = field(default_factory=DedupedList)
 
-    result: DataRef = None
-    result_cached: bool = False
+    # Preserve the execution which registered an emitted occurrence.
+    emitted_by_exec_id: str | None = None
 
-    # Time
-    status: str = None
-    start_time: float = None
-    end_time: float = None
-    duration: float = None
+    # Retain the current execution state.
+    executing: bool = False
+    evaluated: bool = False
+    result: Any = None
+    status: str | None = None
 
-    # Task name 
-    original_node_name: str | None = None # if route is a duplicate, node_name is appended with _id so maintain original for traceability
+    # Delay dependency changes until the current execution completes.
+    _pending_deleted_dependencies: DedupedList[DataRef] = field(default_factory=DedupedList)
+    _pending_updated_dependencies: DedupedList[DataRef] = field(default_factory=DedupedList)
 
-    state: NodeState = field(default_factory=NodeState)
-
-    dep_to_input_map: DefaultDict[DataRef, DedupedList[str, NodeInput]] = field(default_factory=lambda: defaultdict(DedupedList))
-
-    dynamic_to_static_deps: DefaultDict[DataRef, DedupedList[DataRef]] = field(default_factory=lambda: defaultdict(DedupedList))
-    static_to_dynamic_deps: DefaultDict[DataRef, DedupedList[DataRef]] = field(default_factory=lambda: defaultdict(DedupedList))
-    
-    touched_nodes: DedupedList[Node] = field(default_factory=DedupedList)
-    released_nodes: DedupedList[Node] = field(default_factory=DedupedList)
-    runtime_targets: DedupedList[DataRef] = field(default_factory=DedupedList)
-    runtime_effects: list[Effect] = field(default_factory=list)
-
-    resolve_output: bool = False
-    resolved_output: Any = None
-    recompute: bool = False
-    one_shot: bool = False
-
-    _input_nodes: DedupedList = field(default_factory=DedupedList)
-    _pending_unresolve_inputs: DefaultDict = field(default_factory=lambda: defaultdict(DedupedList))
-
-
-
-    def __post_init__(self): 
-        #apply and increment id
-
+    def __post_init__(self):
+        # Project the immutable definition used by this runtime occurrence.
         self.content_id = self.node.content_id
-        self.node_name: str = self.node.node_name 
+        self.node_name = self.node.node_name
+        self.func = self.node.func
+        self.effects = self.node.effects
+        self.targets = self.node.targets
 
-        # Node function / Task
-        self.func: Callable = self.node.func
-        self.effects: list[Effect] = self.node.effects
-        self.targets: DedupedList[DataRef] = self.node.targets # TODO-NOTE: Support targets DedupedLists [X]
+        # Give every definition input its own runtime carrier.
+        self.args = RunnerNodeInput(self.node.args.raw)
+        self.kwargs = RunnerNodeInput(self.node.kwargs.raw)
+        self.p_args = RunnerNodeInput(self.node.p_args.raw)
+        self.p_kwargs = RunnerNodeInput(self.node.p_kwargs.raw)
+        self.k_args = RunnerNodeInput(self.node.k_args.raw)
+        self.k_kwargs = RunnerNodeInput(self.node.k_kwargs.raw)
 
-        # Primary Inputs satisfied_nodes = DedupedList(dependent_node_id)
-        self.args:   NodeInput | Any | str | DedupedList | tuple = RunnerNodeInput(self.node.args.raw) 
-        self.kwargs: NodeInput | dict = RunnerNodeInput(self.node.kwargs.raw) 
+        # Project the definition's execution policy.
+        self.force_update = self.node.force_update
+        self.one_shot = self.node.one_shot
+        self.unpack = self.node.unpack
+        self.share_implicit_target = self.node.share_implicit_target
 
-        # Secondary Inputs
-        self.p_args   : NodeInput | tuple = RunnerNodeInput(self.node.p_args.raw) 
-        self.p_kwargs : NodeInput | dict = RunnerNodeInput(self.node.p_kwargs.raw) 
-        self.k_args   : NodeInput | tuple = RunnerNodeInput(self.node.k_args.raw)               
-        self.k_kwargs : NodeInput | dict = RunnerNodeInput(self.node.k_kwargs.raw)
-
-        self.inject_data_store: bool = self.node.inject_data_store
-        self.resolve_output: bool = self.node.resolve_output
-        self.recompute: bool = self.node.recompute
-        self.unpack: bool = self.node.unpack
-
- # For Runner
     def _invalidate(self):
-        self._reset_execution_state()
+        # Clear the completed result so this occurrence may execute again.
+        self.evaluated = False
+        self.result = None
 
-    def _unresolve(self):
-        self.state.resolved = False
-        self._reset_execution_state()
-
-        self.dynamic_to_static_deps: DefaultDict[DataRef: DedupedList[DataRef]] = defaultdict(DedupedList)
-        self.static_to_dynamic_deps: DefaultDict[DataRef: DedupedList[DataRef]] = defaultdict(DedupedList)
-
-        for input in self.get_all_inputs().values():
-            input: RunnerNodeInput
-            input.unresolve()
-        
-    def _unresolve_input(self, input: RunnerNodeInput):
-        self.state.resolved = False
-        self._reset_execution_state()
-        
-        input.unresolve()
-
-    def _reset_execution_state(self):
-        self.state.evaluated = False
-        self.result: DataRef = None
-        self.result_cached: bool = False
-
-        # Time
-        self.status: str = None
-        self.start_time: float = None
-        self.end_time: float = None
-        self.duration: float = None
-
-        self.touched_nodes.clear()
-        self.released_nodes.clear()
-    def _reset_runtime_state(self):
-
-        self._reset_execution_state()
-    
-        for input in self.get_all_inputs().values():
-            input: RunnerNodeInput
-            input.unresolve()
-
-                
-    def get_secondary_inputs(self):
-        return {"p_args": self.p_args, "p_kwargs": self.p_kwargs, "k_args": self.k_args, "k_kwargs": self.k_kwargs}
+    def _unresolve_input(self, node_input):
+        # Invalidate this occurrence and its affected input.
+        self._invalidate()
+        node_input.unresolve()
 
     def get_primary_inputs(self):
-        return {"args": self.args, "kwargs": self.kwargs}
+        return {
+            "args": self.args,
+            "kwargs": self.kwargs,
+        }
 
     def get_all_inputs(self):
         return {
-            "p_args": self.p_args, "p_kwargs": self.p_kwargs, "k_args": self.k_args, "k_kwargs": self.k_kwargs,
-            "args": self.args, "kwargs": self.kwargs
+            "p_args": self.p_args,
+            "p_kwargs": self.p_kwargs,
+            "k_args": self.k_args,
+            "k_kwargs": self.k_kwargs,
+            "args": self.args,
+            "kwargs": self.kwargs,
         }
 
 @dataclass
@@ -492,342 +333,294 @@ class RunnerNodeInput:
     normalised: Any = None
     resolved: Any = None
 
-    _VALID_PROCESS_ORDER = [
-        ProcessStates.RAW, 
-        ProcessStates.EVALUATED, 
-        ProcessStates.NORMALISED, 
-        ProcessStates.RESOLVED
-    ]
+    deps: list[DataRef] = field(default_factory=list)
+    state: ProcessStates = field(
+        default=ProcessStates.RAW,
+        init=False,
+    )
 
-    deps: list = field(default_factory=list)
-    states: Dict[ProcessStates, bool] = field(default_factory=lambda: {state: False for state in ProcessStates})
-    
-    @property
-    def state(self) -> ProcessStates:
-        if self.has_been(ProcessStates.RESOLVED): return ProcessStates.RESOLVED
-        if self.has_been(ProcessStates.NORMALISED): return ProcessStates.NORMALISED
-        if self.has_been(ProcessStates.EVALUATED): return ProcessStates.EVALUATED
-        return ProcessStates.RAW
+    _PROCESS_ORDER: ClassVar[tuple[ProcessStates, ...]] = (
+        ProcessStates.RAW,
+        ProcessStates.EVALUATED,
+        ProcessStates.NORMALISED,
+        ProcessStates.RESOLVED,
+    )
 
-    def has_been(self, processed_state: ProcessStates) -> bool:  
-        if not isinstance(processed_state, ProcessStates):
-            raise TypeError(f"{processed_state} is not a valid state type: use ProcessStates enum [RAW | EVALUATED | NORMALISED | RESOLVED]!")  
-        return self.states[processed_state]
+    def has_been(self, state):
+        # A later stage includes every earlier completed stage.
+        return (
+            self._PROCESS_ORDER.index(self.state)
+            >= self._PROCESS_ORDER.index(state)
+        )
 
-    def can_transition(self, current_state: ProcessStates, new_state: ProcessStates) -> bool:
-        return self._VALID_PROCESS_ORDER.index(new_state) == self._VALID_PROCESS_ORDER.index(current_state) + 1
+    def get_previous_value(self, state):
+        # Read the value produced immediately before the requested stage.
+        index = self._PROCESS_ORDER.index(state)
+        if index == 0:
+            raise ValueError(
+                "RAW has no previous input value"
+            )
 
-    def update_state(self, processed_state: ProcessStates, processed_input: Any) -> Self:
-        if not isinstance(processed_state, ProcessStates):
-            raise TypeError(f"{processed_state} is not a valid state type: use ProcessStates enum [RAW | EVALUATED | NORMALISED | RESOLVED]!") 
-        
-        current_state = self.state
+        previous = self._PROCESS_ORDER[index - 1]
+        return getattr(self, previous.value)
 
-        if processed_state == current_state and current_state == ProcessStates.RESOLVED:
-            pass
-        else: 
-            if not self.can_transition(current_state, processed_state):
-                raise RuntimeError(f"couldnt transition from {current_state.value} to {processed_state.value}! Make sure progression order is 'raw, evaluated, normalised, and resolved'!")
-        
-        self.set_state_value(processed_state, processed_input)
-        self.states[processed_state] = True
-    
-    def set_state_value(self, processed_state: ProcessStates, value: Any) -> None:
-        if self.state == processed_state:
-            return 
-        state = processed_state.value
-        setattr(self, f"{state}", value)
+    def update_state(self, state, value):
+        # Inputs progress through exactly one stage at a time.
+        current = self._PROCESS_ORDER.index(self.state)
+        requested = self._PROCESS_ORDER.index(state)
 
-    def get_value(self, state: ProcessStates):
-        if not isinstance(state, ProcessStates):
-            raise TypeError(f"{state} is not a valid state type: use ProcessStates enum [RAW | EVALUATED | NORMALISED | RESOLVED]!") 
-        return getattr(self, state.value)
-    
+        if requested != current + 1:
+            raise RuntimeError(
+                f"Cannot transition input from "
+                f"{self.state.value} to {state.value}"
+            )
+
+        setattr(self, state.value, value)
+        self.state = state
+
     def unresolve(self):
-        if self.states[ProcessStates.RESOLVED]:
-            self.states[ProcessStates.RESOLVED] = False
+        # Return a resolved input to its normalised dependency structure.
+        if self.state is ProcessStates.RESOLVED:
             self.resolved = None
-
-    def get_previous_state(self, state):
-        if not isinstance(state, ProcessStates) or state == ProcessStates.RAW:
-            raise TypeError(f"{state} is not a valid state type: use ProcessStates enum [EVALUATED | NORMALISED | RESOLVED]!")
-        return self._VALID_PROCESS_ORDER[self._VALID_PROCESS_ORDER.index(state) - 1]
-
-    def get_previous_value(self, state: ProcessStates):
-        previous_state = self.get_previous_state(state)
-        return getattr(self, previous_state.value)
+            self.state = ProcessStates.NORMALISED
 
 @dataclass
 class NodeInput:
     raw: Any = None
 
-# Node - A 
-@dataclass 
-class Node: 
- 
-    # Node ID
-    id: int = field(init=False)
-    content_id: int = field(init=False)
+def _normalise_node_input(value, default):
+    # Preserve an existing NodeInput or wrap one raw input.
+    if isinstance(value, NodeInput):
+        return value
+    return NodeInput(default if value is None else value)
 
 
-    # Node function / Targets
-    func: Callable = None 
+def _normalise_node_effects(effects):
+    # Normalise the supported Effect carriers into one ordered list.
+    if effects is None:
+        effects = []
+    elif isinstance(effects, Effect) or (isinstance(effects, type) and issubclass(effects, Effect)):
+        effects = [effects]
+    elif isinstance(effects, (list, tuple, DedupedList)):
+        effects = list(effects)
+    else:
+        raise NodeDefinitionError("Node effects must be an Effect or an ordered list/tuple of Effects")
 
-    # Primary Inputs 
-    args:   NodeInput | Any | str | DedupedList | tuple = field(default_factory=tuple) 
-    kwargs: NodeInput | dict = field(default_factory=dict) 
+    # Reject runtime Effect functions used as declared Effects.
+    runtime_effect_functions = (READ, WRITE_NOW, DELETE_NOW)
+    for effect in effects:
+        if any(effect is runtime_effect for runtime_effect in runtime_effect_functions):
+            raise NodeDefinitionError(
+                f"{effect.__name__} is a runtime Effect function and must be called inside a Node; "
+                "declared effects require Effect objects or Effect classes"
+            )
 
-    # Secondary Inputs
-    p_args   : NodeInput | tuple = field(default_factory=tuple)
-    p_kwargs : NodeInput | dict = field(default_factory=dict)
-    k_args   : NodeInput | tuple = field(default_factory=tuple)               
-    k_kwargs : NodeInput | dict = field(default_factory=dict)
-    
-    targets: str | DataRef | List[str | DataRef] | None = None # TODO-NOTE: Support targets DedupedLists [X]
-    effects: DedupedList = field(default_factory=DedupedList)
+    # Validate every declared Effect.
+    for effect in effects:
+        if effect is RAISE or isinstance(effect, RAISE):
+            raise NodeDefinitionError("RAISE is execution control and cannot be a declared Node Effect")
+        if not (isinstance(effect, Effect) or (isinstance(effect, type) and issubclass(effect, Effect))):
+            raise NodeDefinitionError("Node effects must contain only Effect objects or Effect classes")
 
+    # Instantiate the argument-free Effect classes.
+    return [effect() if effect is END or effect is DELETE else effect for effect in effects]
+
+
+def _node_content_id(node):
+    # Identify every definition field which affects execution.
+    definition = (
+        node.func,
+        node.args.raw,
+        node.kwargs.raw,
+        node.p_args.raw,
+        node.p_kwargs.raw,
+        node.k_args.raw,
+        node.k_kwargs.raw,
+        tuple(node.targets),
+        tuple(node.effects),
+        node.node_name,
+        node.force_update,
+        node.one_shot,
+        node.unpack,
+        node.share_implicit_target,
+    )
+    return repr(definition).encode("utf-8")
+
+
+@dataclass
+class Node:
+    func: Callable
+    args: Any = field(default_factory=tuple)
+    kwargs: Any = field(default_factory=dict)
+    p_args: Any = field(default_factory=tuple)
+    p_kwargs: Any = field(default_factory=dict)
+    k_args: Any = field(default_factory=tuple)
+    k_kwargs: Any = field(default_factory=dict)
+    targets: str | DataRef | list[str | DataRef] | None = None
+    effects: Effect | type[Effect] | list[Effect] | tuple[Effect, ...] | None = None
     node_name: str | None = None
-
-    inject_data_store: bool = False
-    resolve_output: bool = False
-    recompute:bool = False
-    one_shot:bool = False
+    force_update: bool = False
+    one_shot: bool = False
     unpack: bool = False
-
-
-    
-
-    # Keep counter of seen nodes to return a new id for that function, able to index against route_DedupedList
-    _node_counter: ClassVar[int] = 0  
-
-    def __post_init__(self): 
-        #apply and increment id
-        self.id = uuid4().hex
-        # Node._node_counter += 1
-
-        self.content_id = repr((str(self.func.__name__), self.args, self.kwargs, self.p_args, self.p_kwargs, self.k_args, self.k_kwargs, self.targets, self.unpack)).encode("utf-8") 
-        
-        # #prevalidation
-        # if not self.args and not callable(self.args): #self.args.raw
-        #     raise NodeDefinitionError(f"RouteDefinitonError[@NodeID:{self.id}][{self.node_name if self.node_name else self.targets}] | PosArgs: {self.args} must be a Any or DataRef!")
-        
-        self.args     = NodeInput(raw=self.args if self.args is not None else tuple()) 
-        self.p_args   = NodeInput(raw=self.p_args if self.p_args is not None else tuple())
-        self.p_kwargs = NodeInput(raw=self.p_kwargs if self.p_kwargs is not None else {})
-        
-        self.kwargs   = NodeInput(raw=self.kwargs if self.kwargs is not None else {}) 
-        self.k_args   = NodeInput(raw=self.k_args if self.k_args is not None else tuple())
-        self.k_kwargs = NodeInput(raw=self.k_kwargs if self.k_kwargs is not None else {})
-        
-        if self.effects is None:
-            self.effects = []
-        elif isinstance(self.effects, Effect) or (
-            isinstance(self.effects, type)
-            and issubclass(self.effects, Effect)
-        ):
-            self.effects = [self.effects]
-        elif isinstance(self.effects, (list, tuple, set, DedupedList)):
-            self.effects = list(self.effects)
-        else:
-            raise NodeDefinitionError(
-                "EffectDefError | effects must be an Effect or an iterable "
-                f"of Effects, was {type(self.effects).__name__}"
-            )
-
-        for effect in self.effects:
-            if not isinstance(effect, Effect):
-                if not (
-                    isinstance(effect, type)
-                    and issubclass(effect, Effect)
-                ):
-                    raise NodeDefinitionError(f"EffectDefError[@NodeID:{self.id}] | Effects : [{type(effect)}, {effect}] must be an valid Event class! [RETURN, WRITE, DELETE, RAISE, END, RUN or EFFECT - from tide_tooling import WRITE, RAISE, ... ]")
-
-        if not isinstance(self.targets, (list, str, DataRef)) and self.targets is not None: # TODO-NOTE: Support targets DedupedLists [X]
-            raise NodeDefinitionError(f"RouteDefinitonError[@NodeID:{self.id}] | Targets: {self.targets} must be a DedupedList!")
-        
-        if not callable(self.func):
-            raise NodeDefinitionError(f"RouteDefinitionError[@NodeID:{self.id}] | Function : {self.func} must be callable")
-
-        if not isinstance(self.unpack, bool):
-            raise NodeDefinitionError(
-                f"RouteDefinitionError[@NodeID:{self.id}] | unpack must be a bool"
-            )
-        
-        self.targets = DataRef._normalise_data_refs(self.targets)
-        self.node_name = self.node_name or f"{self.func.__name__}"  
-                
-        # post validation
-        if not (isinstance(self.args, (NodeInput))): #self.args.raw
-            raise NodeDefinitionError(f"RouteDefinitonError[@NodeID:{self.id}][{self.node_name}] | PosArgs: {self.args} must be a string, DedupedList, DedupedList, or tuple or callable!")
-        if not (isinstance(self.kwargs, (NodeInput))): #self.kwargs.raw
-            raise NodeDefinitionError(f"RouteDefinitonError[[@NodeID:{self.id}][{self.node_name}] | RouteKwargs: {self.kwargs} must be a dict or a callable!")
-
-
-
-@dataclass 
-class Dag:
-    forward_map: DefaultDict[int, DedupedList[DataRef]] = field(default_factory = lambda: defaultdict(DedupedList))
-    reverse_map: DefaultDict[DataRef, DedupedList[int]] = field(default_factory = lambda: defaultdict(DedupedList))
-
-    static_deps: DefaultDict[DataRef, DedupedList[int]] = field(default_factory = lambda: defaultdict(DedupedList))
-    dynamic_deps: DefaultDict[DataRef, DedupedList[int]] = field(default_factory = lambda: defaultdict(DedupedList))
-
-    ready_nodes: DedupedList = field(default_factory = DedupedList)
-
-    topo_order: DedupedList = field(default_factory=DedupedList)
-    has_cycle: bool = False
-    cycle_info: None = None
-
-    def _register_entry(self, node_id:int , deps: Iterable[DataRef]):
-        if isinstance(deps, DataRef):
-            deps = {deps, }
-        self.forward_map[node_id].extend(deps)
-        for dep in deps:
-            if dep.dynamic:
-                self.dynamic_deps[dep].append(node_id)
-            else:
-                self.static_deps[dep].append(node_id)
-            self.reverse_map[dep].append(node_id)
-            pass
-
-@dataclass
-class IntentDag(Dag):
-    def __post__init__():
-        super().__init__()
-
-@dataclass
-class ExpandedDag(Dag):
-    def __post__init__():
-        super().__init__()    
-    
-@dataclass
-class RuntimeDag:
-   
-    dag_to_run: Dag|None=None
+    share_implicit_target: bool = False
+    id: str = field(init=False)
+    content_id: bytes = field(init=False)
 
     def __post_init__(self):
-        if self.dag_to_run is None:
-            raise RuntimeDagConsumptionError("Error consuming DAG to run!! No dag object was given!")
-        if not isinstance(self.dag_to_run, (Dag)):
-            raise RuntimeDagConsumptionError("Error consuming DAG to run!! DAG was not a valid IntentDag or ExpandedDag object")
-        else:
-            try:
-                import copy 
-                self.forward_map = copy.deepcopy(self.dag_to_run.forward_map)
-                self.reverse_map = copy.deepcopy(self.dag_to_run.reverse_map)
-                self.ready_nodes_queue = deque(copy.deepcopy(self.dag_to_run.ready_nodes))
+        # Require the execution callable.
+        if not callable(self.func):
+            raise NodeDefinitionError("Node func must be callable")
 
-                self.waiting_static_deps = copy.deepcopy(self.dag_to_run.static_deps)
-                self.waiting_dynamic_deps = copy.deepcopy(self.dag_to_run.dynamic_deps)
+        # Give this definition occurrence its identity.
+        self.id = uuid4().hex
 
-   
-                print("Successfully consumed Dag")
-            except Exception as e:
-                raise NodeToDagRegistrationError(f"RuntimeDagError - Error consuming DAG! {e}") from e
-    
-    def register_node(self, node, deps) -> bool:
-        ''' Registers a node to the DAG. This includes updating ready_nodes_queue if registering_node has no deps '''
+        # Normalise every input boundary.
+        self.args = _normalise_node_input(self.args, ())
+        self.kwargs = _normalise_node_input(self.kwargs, {})
+        self.p_args = _normalise_node_input(self.p_args, ())
+        self.p_kwargs = _normalise_node_input(self.p_kwargs, {})
+        self.k_args = _normalise_node_input(self.k_args, ())
+        self.k_kwargs = _normalise_node_input(self.k_kwargs, {})
 
-        if not isinstance(deps, list):
-            warn(f"Register_node Error! Deps must be a LIST. Was {type(deps)}", UserWarning)
-            raise NodeToDagRegistrationError(f"Error registering node to DAG! [{node.id} | {node.node_name}] Deps must be a DedupedList. Was {type(deps)}!")
-        if node.id in self.forward_map:
-            return False
-        
-        #register node
-        try:
-            if node.id not in self.forward_map:
-                self.forward_map[node.id] = DedupedList(deps)
-                for target in node.targets:
-                    if target not in self.reverse_map: # TODO-NOTE: Support targets DedupedLists [X]
-                        self.reverse_map[target]
-                for dep in deps:
-                    self.reverse_map[dep].append(node.id)
-                    if dep.dynamic:
-                        self.waiting_dynamic_deps[dep].append(node.id)
-           
-            if not self.forward_map[node.id]:
-                self.release_node(node.id)
+        # Normalise explicitly declared output references.
+        if not isinstance(self.targets, (list, str, DataRef, type(None))):
+            raise NodeDefinitionError("Node targets must be a string, DataRef, list of either, or None")
+        targets = [] if self.targets is None else self.targets if isinstance(self.targets, list) else [self.targets]
+        self.targets = []
+        for target in targets:
+            if not isinstance(target, (str, DataRef)):
+                raise NodeDefinitionError("Node targets must contain only strings or DataRefs")
+            target = DataRef.from_string(target, prefix=False) if isinstance(target, str) else target
+            if target not in self.targets:
+                self.targets.append(target)
 
-            print(f"Registered Node [{node.id}]!")
-            return True
-            
-        except Exception as e:
-            raise NodeToDagRegistrationError(f"Error registering node to DAG! [{node.id} | {node.node_name}] : {e}") from e
+        # Normalise ordered declared Effects.
+        self.effects = _normalise_node_effects(self.effects)
 
-    def release_node(self, node_id):
-        self.ready_nodes_queue.appendleft(node_id) # add to 
+        # Retain the explicit label or derive it from the callable.
+        if self.node_name is not None and not isinstance(self.node_name, str):
+            raise NodeDefinitionError("Node name must be a string or None")
+        self.node_name = self.node_name if self.node_name is not None else self.func.__name__
 
-    # def satisfy_node_dependency(self, node_id: int, dependency: DataRef) -> None:
-    #     node_dependencies = self.forward_map[node_id]
-    #     node_dependencies.remove(dependency)
+        # Require every execution option to be Boolean.
+        options = {
+            "force_update": self.force_update,
+            "one_shot": self.one_shot,
+            "unpack": self.unpack,
+            "share_implicit_target": self.share_implicit_target,
+        }
+        invalid_options = [name for name, value in options.items() if not isinstance(value, bool)]
+        if invalid_options:
+            raise NodeDefinitionError("Node options must be bool: " + ", ".join(invalid_options))
 
-    #     print(f"[{node_id}] {dependency} satified")
-        
-    #     if not self.forward_map[node_id]:
-    #         print(f"[{node_id}] satified for RELEASE by {dependency}")
-    #         self.release_node(node_id)
+        # Identify the complete execution-affecting definition.
+        self.content_id = _node_content_id(self)
 
-    def satisfy_downstream_deps(self, node_or_target:Node| DataRef=None):
-        touched_nodes = DedupedList()
-        released_nodes = DedupedList()
 
-        if not node_or_target:
-            print("[satisfy_downstream_deps] Please provide at least a node to satisfy targets")
-            raise ValueError("Failed to satisfy downstream deps! Node and Targets were both none. Nothing to release")
-
-        if isinstance(node_or_target, DataRef):
-            id = node_or_target
-            targets = node_or_target
-        else:
-            id = node_or_target.id 
-            targets = node_or_target.targets
-
-        if targets is not None:
-            
-            if targets in self.reverse_map:
-                for dependent_node_id in DedupedList(self.reverse_map[targets]):
-                    # remove dep from dep_node forward maps
-                    if dependent_node_id in self.forward_map and targets in self.forward_map[dependent_node_id]:
-                        try:
- 
-                            self.forward_map[dependent_node_id].remove(targets)
-
-                        except ValueError:
-                            warn(f"[SATISFY] dep {targets} was not present in forward map, is this a duplicate event?")
-                            continue
-                        except KeyError:
-                            warn(f"[SATISFY] node_id {dependent_node_id} was not present in forward map, is this a duplicate event?")
-                        touched_nodes.append(dependent_node_id)
-
-                        # if dep_node no longer has any deps - release it
-                        if not list(self.forward_map[dependent_node_id]):
-                            del self.forward_map[dependent_node_id]
-                            released_nodes.append(dependent_node_id)
-                            print(f"[{id}] READIED {dependent_node_id} for RELEASE")
-                            self.release_node(dependent_node_id)
-                    
-                released_display = (
-                    "NO NODES" if not released_nodes else released_nodes
-                )
-                touched_display = (
-                    "NO NODES" if not touched_nodes else touched_nodes
-                )
-                print(
-                    f"[{id}] RELEASED [{released_display}] "
-                    f"| TOUCHED [{touched_display}]!"
-                )
-                return touched_nodes, released_nodes    
-
-        print(f"[{id}] NOTHING TO RELEASE | NO targets TARGETs | NO DEPENDENT NODES!")   
-        return None, None
 
 @dataclass
-class PostRuntimeDag(Dag):
-    def __post__init__() -> None:
-        super().__init__()
+class IntentDag:
+    # Node occurrence -> declared dependencies.
+    forward_map: DefaultDict[int, DedupedList[DataRef]] = field(default_factory=lambda: defaultdict(DedupedList))
+    # Dependency -> consuming node occurrences.
+    reverse_map: DefaultDict[DataRef, DedupedList[int]] = field(default_factory=lambda: defaultdict(DedupedList))
+    # Partition dependency predicates by kind.
+    static_deps: DefaultDict[DataRef, DedupedList[int]] = field(default_factory=lambda: defaultdict(DedupedList))
+    dynamic_deps: DefaultDict[DataRef, DedupedList[int]] = field(default_factory=lambda: defaultdict(DedupedList))
+    # Nodes with no declared dependencies begin ready.
+    ready_nodes: DedupedList[int] = field(default_factory=DedupedList)
+    
+class RuntimeDag:
+    def __init__(self, dag):
+        if not isinstance(dag, IntentDag):
+            raise RuntimeDagConsumptionError(
+                "RuntimeDag requires an IntentDag"
+            )
 
+        # Copy the static DAG into independently mutable runtime state.
+        self.forward_map = copy.deepcopy(dag.forward_map)
+        self.reverse_map = copy.deepcopy(dag.reverse_map)
+        self.waiting_static_deps = copy.deepcopy(dag.static_deps)
+        self.waiting_dynamic_deps = copy.deepcopy(dag.dynamic_deps)
+        self.ready_nodes_queue = deque(
+            copy.deepcopy(dag.ready_nodes)
+        )
 
+    def register_node(self, node):
+        # Register one runtime-discovered node only once.
+        if node.id in self.forward_map:
+            return False
+
+        dependencies = DedupedList(node.deps)
+        self.forward_map[node.id] = dependencies
+
+        for dependency in dependencies:
+            self.reverse_map[dependency].append(node.id)
+
+            waiting = (
+                self.waiting_dynamic_deps
+                if dependency.dynamic
+                else self.waiting_static_deps
+            )
+            waiting[dependency].append(node.id)
+
+        # Dependency-free runtime work joins the ready queue.
+        if not dependencies:
+            self.ready_nodes_queue.append(node.id)
+
+        return True
+
+    def satisfy_dependency(self, dependency):
+        # Satisfy this exact dependency predicate for every dependant.
+        released_nodes = DedupedList()
+
+        for node_id in tuple(
+            self.reverse_map.get(dependency, ())
+        ):
+            dependencies = self.forward_map.get(node_id)
+
+            if dependencies is None or dependency not in dependencies:
+                continue
+
+            dependencies.remove(dependency)
+
+            if not dependencies:
+                self.ready_nodes_queue.append(node_id)
+                released_nodes.append(node_id)
+
+        # No node remains waiting on the satisfied predicate.
+        waiting = (
+            self.waiting_dynamic_deps
+            if dependency.dynamic
+            else self.waiting_static_deps
+        )
+        waiting.pop(dependency, None)
+
+        return released_nodes
+
+    def unsatisfy_dependency(self, node_id, dependency):
+        # Make one previously satisfied predicate unsatisfied again.
+        dependencies = self.forward_map[node_id]
+
+        if dependency in dependencies:
+            return False
+
+        dependencies.append(dependency)
+
+        waiting = (
+            self.waiting_dynamic_deps
+            if dependency.dynamic
+            else self.waiting_static_deps
+        )
+        waiting[dependency].append(node_id)
+
+        # A blocked node can no longer remain ready.
+        try:
+            self.ready_nodes_queue.remove(node_id)
+        except ValueError:
+            pass
+
+        return True
 
 # class SQLite(StoreTemplate):
 
@@ -851,36 +644,19 @@ class FakeFuture:
         return self._result     
 
 
-class Effect:
-    def __init__(self):
-        self.preserve_output = __TEMPLATE_VAL__
+class Effect(SealableEvidence):
+    kind: ClassVar[Effects]
+    _tide_value_fields = frozenset({"output"})
 
-    @property
-    def kind(self):
-        return type(self).__name__
-
-    @staticmethod
-    def _plain_value(value):
-        if isinstance(value, __TIDE_TEMPLATE_VALUE__):
-            return repr(value)
-        if isinstance(value, DataRef):
-            return DataRef.to_string(value, strip_leading=True)
-        if isinstance(value, Node):
-            return value.node_name
-        if isinstance(value, dict):
-            return {
-                Effect._plain_value(key): Effect._plain_value(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple, set, DedupedList)):
-            return [Effect._plain_value(item) for item in value]
-        return value
+    def __init__(self, output: Any = __TEMPLATE_VAL__):
+        self.output = output
 
     def to_dict(self):
-        payload = {"effect": self.kind}
+        payload = {"effect": self.kind.value}
         payload.update({
-            name: self._plain_value(value)
-            for name, value in vars(self).items()
+            name: getattr(self, name)
+            for name in vars(self)
+            if not name.startswith("_tide_")
         })
         return payload
 
@@ -888,7 +664,7 @@ class Effect:
         details = [
             f"{name}={value!r}"
             for name, value in self.to_dict().items()
-            if name not in {"effect", "preserve_output"}
+            if name not in {"effect", "output"}
         ]
         return f"{self.kind}({', '.join(details)})"
 
@@ -896,57 +672,168 @@ class Effect:
         return str(self)
 
 class EMIT(Effect):
-    def __init__(self, nodes: DedupedList=None):
-        super().__init__()
-        if isinstance(nodes, Node):
-            nodes = [nodes]
+    kind = Effects.EMIT
+    _tide_value_fields = frozenset({"output", "nodes"})
+
+    def __init__(self, nodes: Node | Iterable[Node], output: Any = __TEMPLATE_VAL__):
+        super().__init__(output)
+
+        nodes = (nodes,) if isinstance(nodes, Node) else tuple(nodes)
+
+        if not nodes:
+            raise ValueError("EMIT requires at least one Node")
+
+        if any(not isinstance(node, Node) for node in nodes):
+            raise TypeError("EMIT accepts only Node definitions")
+
         self.nodes = nodes
         
 
 class END(Effect):
-    def __init__(self, runner_ids: int | DedupedList =__TEMPLATE_VAL__, preserve_output: Any=__TEMPLATE_VAL__):
-        super().__init__()
-        if isinstance(runner_ids, int):
-            runner_ids = [runner_ids]
-             
-        self.targets = runner_ids
-        self.preserve_output = preserve_output
+    kind = Effects.END
+
+    def __init__(self, runner_ids: int | str | Iterable[int | str] | None = None, output: Any = __TEMPLATE_VAL__):
+        super().__init__(output)
+
+        if runner_ids is None:
+            self.targets = None
+            return
+
+        targets = (runner_ids,) if isinstance(runner_ids, (int, str)) else tuple(runner_ids)
+
+        if not targets:
+            raise ValueError("END requires at least one Runner target")
+
+        if any(not isinstance(runner_id, (int, str)) for runner_id in targets):
+            raise TypeError("END targets must be Runner IDs")
+
+        self.targets = targets
 
 class RUN(Effect):
-    def __init__(self, runner_ids: int | DedupedList =__TEMPLATE_VAL__, mode="auto", stay_alive=False, templates=None, preserve_output: Any=__TEMPLATE_VAL__):
-        super().__init__()
-        if not templates: templates = {}
-        if isinstance(runner_ids, int):
-            runner_ids = [runner_ids]
-             
-        self.targets = runner_ids
+    kind = Effects.RUN
+    _tide_value_fields = frozenset({
+        "output",
+        "local_store_templates",
+        "dynamic_ref_plan",
+    })
+
+    def __init__(self, pipeline_ids: int | str | Iterable[int | str], mode: str = "auto", local_store_templates: dict[str, Any] | None = None, stay_alive: bool = False, runner_name: str | None = None, dynamic_ref_plan: Any = None, output: Any = __TEMPLATE_VAL__):
+        super().__init__(output)
+
+        targets = (pipeline_ids,) if isinstance(pipeline_ids, (int, str)) else tuple(pipeline_ids)
+
+        if not targets:
+            raise ValueError("RUN requires at least one Pipeline target")
+
+        if any(not isinstance(pipeline_id, (int, str)) for pipeline_id in targets):
+            raise TypeError("RUN targets must be Pipeline IDs")
+
+        if runner_name is not None and len(targets) != 1:
+            raise ValueError("runner_name requires exactly one Pipeline target")
+
+        self.targets = targets
         self.mode = mode
-        self.templates = templates
+        self.local_store_templates = dict(local_store_templates or {})
         self.stay_alive = stay_alive
-        self.preserve_output = preserve_output
+        self.runner_name = runner_name
+        self.dynamic_ref_plan = dynamic_ref_plan
 
 
 
 
 class DELETE(Effect):
-    def __init__(self, data_refs_or_dep_strs: str | DataRef | DedupedList[str | DataRef], preserve_output: Any=__TEMPLATE_VAL__):
-        super().__init__()
-        
-        data_refs = DataRef._normalise_data_refs(data_refs_or_dep_strs)
-    
-        self.preserve_output = preserve_output
-        self.targets = data_refs
+    kind = Effects.DELETE
+
+    def __init__(self, references: str | DataRef | Iterable[str | DataRef] | None = None, output: Any = __TEMPLATE_VAL__):
+        super().__init__(output)
+
+        if references is None:
+            self.targets = None
+            return
+
+        raw_targets = (references,) if isinstance(references, (str, DataRef)) else tuple(references)
+        targets = []
+        for target in raw_targets:
+            ref = DataRef.from_string(target, prefix=False) if isinstance(target, str) else target
+
+            if not isinstance(ref, DataRef):
+                raise TypeError("DELETE targets must be strings or DataRefs")
+
+            if ref.dynamic:
+                raise ValueError("DELETE requires static references")
+
+            if ref not in targets:
+                targets.append(ref)
+
+        if not targets:
+            raise ValueError("DELETE requires at least one target")
+
+        self.targets = tuple(targets)
 
 class WRITE(Effect):
-    def __init__(self, data_refs_or_dep_strs: str | DataRef | DedupedList[str | DataRef], preserve_output: Any=__TEMPLATE_VAL__):
-        super().__init__()
-        data_refs = DataRef._normalise_data_refs(data_refs_or_dep_strs)
-    
-        self.preserve_output = preserve_output
-        self.targets = data_refs
+    kind = Effects.WRITE
+    _tide_value_fields = frozenset({"output", "targets"})
 
-class RAISE(Exception):
-    def __init__(self, exception: Exception | str=None, effects:DedupedList=None, preserve_output:Any=__TEMPLATE_VAL__):
+    def __init__(self, references: dict[str | DataRef, Any] | str | DataRef | Iterable[str | DataRef], value: Any = __TEMPLATE_VAL__, *, output: Any = __TEMPLATE_VAL__):
+        super().__init__(output)
+
+        mapped = isinstance(references, dict)
+        if mapped:
+            if value is not __TEMPLATE_VAL__:
+                raise ValueError("WRITE cannot receive both mapped values and value")
+            raw_writes = tuple(references.items())
+        else:
+            if value is __TEMPLATE_VAL__:
+                raise ValueError("WRITE requires a value for its references")
+            raw_references = (references,) if isinstance(references, (str, DataRef)) else tuple(references)
+            raw_writes = tuple((reference, value) for reference in raw_references)
+
+        targets = []
+        for reference, write_value in raw_writes:
+            ref = DataRef.from_string(reference, prefix=False) if isinstance(reference, str) else reference
+
+            if not isinstance(ref, DataRef):
+                raise TypeError("WRITE targets must be strings or DataRefs")
+
+            if ref.dynamic:
+                raise ValueError("WRITE requires static references")
+
+            if any(existing_ref == ref for existing_ref, _ in targets):
+                if mapped:
+                    raise ValueError(f"WRITE contains duplicate normalized target: {ref}")
+                continue
+
+            targets.append((ref, write_value))
+
+        if not targets:
+            raise ValueError("WRITE requires at least one target")
+
+        self.targets = tuple(targets)
+
+class READ_EFFECT(Effect):
+    kind = Effects.READ
+    _tide_value_fields = frozenset({"output", "fallback"})
+
+    def __init__(self, reference: str | DataRef, fallback: Any = __TEMPLATE_VAL__):
+        super().__init__()
+
+        ref = DataRef.from_string(reference, prefix=False) if isinstance(reference, str) else reference
+
+        if not isinstance(ref, DataRef):
+            raise TypeError("READ requires a string or DataRef")
+
+        if ref.dynamic:
+            raise ValueError("READ requires one static reference")
+
+        self.targets = (ref,)
+        self.fallback = fallback
+
+
+class RAISE(Effect, Exception):
+    kind = Effects.RAISE
+    _tide_value_fields = frozenset({"output", "exception"})
+
+    def __init__(self, exception: Exception | type[Exception] | str | None = None, effects: Effect | type[Effect] | Iterable[Effect | type[Effect]] | None = None, output: Any = __TEMPLATE_VAL__):
         if exception is None:
             exception = Exception("TIDE controlled RAISE")
         elif isinstance(exception, str):
@@ -958,26 +845,82 @@ class RAISE(Exception):
             exception = exception()
 
         if not isinstance(exception, Exception):
-            raise TypeError(
-                "RAISE exception must be an Exception, Exception type, "
-                "string, or None"
-            )
+            raise TypeError("RAISE requires an Exception, Exception type, string, or None")
 
-        super().__init__(str(exception))
+        if effects is None:
+            effects = ()
+        elif isinstance(effects, Effect) or (isinstance(effects, type) and issubclass(effects, Effect)):
+            effects = (effects,)
+        else:
+            effects = tuple(effects)
+
+        for effect in effects:
+            if not (isinstance(effect, Effect) or (isinstance(effect, type) and issubclass(effect, Effect))):
+                raise TypeError("RAISE effects must be Effect objects or classes")
+
+        result = exception if output is __TEMPLATE_VAL__ else output
+        Effect.__init__(self, result)
+        Exception.__init__(self, str(exception))
+
         self.exception = exception
-        self.preserve_output = preserve_output
-        self.effects = list(effects or ())
+        self.effects = effects
 
     def to_dict(self):
         return {
-            "effect": type(self).__name__,
+            "effect": self.kind.value,
             "exception": repr(self.exception),
-            "preserve_output": Effect._plain_value(self.preserve_output),
-            "effects": Effect._plain_value(self.effects),
+            "output": self.output,
+            "effects": self.effects,
         }
 
     def __str__(self):
         return f"RAISE(exception={self.exception!r})"
+
+
+@dataclass
+class EffectRuntime:
+    # Immediate occurrence Events are published directly through Ocean.  This
+    # carrier retains only the runtime Effect summary returned with ExecMeta.
+    exec_id: str
+    effects: list[Effect] = field(default_factory=list)
+    node_ready_event_id: str | None = None
+    inside_process_pool: bool = False
+    default_store: str = "global"
+    read_handler: Callable | None = None
+    write_handler: Callable | None = None
+    delete_handler: Callable | None = None
+
+    def __deepcopy__(self, memo):
+        copied = type(self)(
+            exec_id=self.exec_id,
+            effects=[],
+            node_ready_event_id=self.node_ready_event_id,
+            inside_process_pool=self.inside_process_pool,
+            default_store=self.default_store,
+            read_handler=None,
+            write_handler=None,
+            delete_handler=None,
+        )
+
+        memo[id(self)] = copied
+        copied.effects = copy.deepcopy(self.effects, memo)
+
+        return copied
+
+    def read(self, effect):
+        if self.inside_process_pool:
+            raise ReadInsideProcessPoolError()
+        return self.read_handler(self, effect)
+
+    def write_now(self, effect):
+        if self.inside_process_pool:
+            raise WriteNowInsideProcessPoolError()
+        return self.write_handler(self, effect)
+
+    def delete_now(self, effect):
+        if self.inside_process_pool:
+            raise DeleteNowInsideProcessPoolError()
+        return self.delete_handler(self, effect)
 
 
 _current_effect_runtime = ContextVar(
@@ -986,72 +929,51 @@ _current_effect_runtime = ContextVar(
 )
 
 
-def READ(reference, fallback=__TEMPLATE_VAL__):
+def READ(reference: str | DataRef, fallback: Any = __TEMPLATE_VAL__):
     """Read a reference during TIDE execution and record the attempted read.
 
     Outside a TIDE node runtime there is no store context, so the fallback is
     returned without side effects. The default fallback is TIDE's template
     sentinel.
     """
-    refs = DataRef._normalise_data_refs(reference)
-    if len(refs) != 1:
-        raise ValueError("READ requires exactly one static TIDE reference")
-
-    ref = refs[0]
-    if ref.dynamic:
-        raise ValueError("READ dynamic references are not supported yet")
+    effect = READ_EFFECT(reference, fallback)
 
     runtime = _current_effect_runtime.get()
     if runtime is None:
-        return fallback
+        return effect.fallback
 
-    if runtime.get("inside_process_pool"):
-        raise ReadInsideProcessPoolError(
-            "READ cannot observe TIDE's live store from inside a process pool; "
-            "retry this execution in the thread pool"
-        )
-
-    ref_key = DataRef.to_string(ref, strip_leading=True)
-    read_values = runtime.get("read_values", {})
-    found = ref_key in read_values
-    value = read_values[ref_key] if found else fallback
-    runtime.setdefault("effects", []).append({
-        "effect": Effects.READ,
-        "reference": ref,
-        "found": found,
-        "value": value,
-    })
-    return value
+    return runtime.read(effect)
 
 
-def DELETE_NOW(reference):
+def WRITE_NOW(reference: str | DataRef, value: Any) -> bool:
+    if not isinstance(reference, (str, DataRef)):
+        raise TypeError("WRITE_NOW requires a string or DataRef")
+    effect = WRITE(reference, value)
+    runtime = _current_effect_runtime.get()
+
+    if runtime is None:
+        return __fallback__ 
+     
+    return runtime.write_now(effect)
+
+
+def DELETE_NOW(reference: str | DataRef) -> bool:
     """Delete one reference during TIDE execution and report success.
 
     Unlike :class:`DELETE`, this is an imperative runtime operation: the live
     store is changed before the function continues.  Outside a TIDE node there
     is no store to mutate, so ``False`` is returned without side effects.
     """
-    refs = DataRef._normalise_data_refs(reference)
-    if len(refs) != 1:
-        raise ValueError("DELETE_NOW requires exactly one static TIDE reference")
-
-    ref = refs[0]
+    ref = DataRef.from_string(reference, prefix=False) if isinstance(reference, str) else reference
+    if not isinstance(ref, DataRef):
+        raise TypeError("DELETE_NOW requires a string or DataRef")
     if ref.dynamic:
-        raise ValueError("DELETE_NOW dynamic references are not supported yet")
+        raise ValueError("DELETE_NOW requires one static reference")
+    effect = DELETE(ref)
 
     runtime = _current_effect_runtime.get()
     if runtime is None:
         return False
 
-    if runtime.get("inside_process_pool"):
-        raise DeleteNowInsideProcessPoolError(
-            "DELETE_NOW cannot mutate TIDE's live store from inside a "
-            "process pool; retry this execution in the thread pool"
-        )
-
-    delete_now = runtime.get("delete_now")
-    if not callable(delete_now):
-        raise RuntimeError("DELETE_NOW runtime is missing its live-store handler")
-
-    return bool(delete_now(ref))
+    return runtime.delete_now(effect)
         

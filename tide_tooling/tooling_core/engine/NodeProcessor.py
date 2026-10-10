@@ -1,326 +1,386 @@
-from typing import Callable, Tuple, Any, Union, Generator
-from .classes import Node, NodeInput, ProcessStates, DataRef, RunnerNode, RunnerNodeInput, Event
-from .DependencyTools import DependencyTools
 import inspect
-from .errors import CallableDependencyError, NodeFailed, MissingRefDuringResolutionError, DynamicRefCountLessThanAvailableKeysError
-from warnings import warn
 from collections import defaultdict
 
-class NodeProcessor: # __init__(DepTools)
+from .classes import DataRef, Node, ProcessStates
+from .errors import (
+    CallableDependencyError,
+    DynamicRefCountLessThanAvailableKeysError,
+    MissingRefDuringResolutionError,
+    NodeFailed,
+)
+from .utils import tide_snapshot_value
 
-    # contain everything needed to prepare node inputs and run node
-    def __init__(self, dep_tools: DependencyTools):
+
+class NodeProcessor:
+    def __init__(self, dep_tools):
         self.dep_tools = dep_tools
 
-    ###################
-    #  STAGE RUNNERS  #
-    ###################
-    def run_process_stage(self, state: ProcessStates, stage_fn: Callable, node_input: RunnerNodeInput, args: tuple = ()) -> RunnerNodeInput:
-        '''
-            Run a processing stage for NodeInput with a specific function and state
-            e.g:
-                - evaluated = evaluate_function(node.input_value.raw) 
-                - UpdateInputState | update state with state=ProcessStates.EVALUATED and node.evaluated = new_value
-        '''
-        try:
-            if node_input.has_been(state):
-                return node_input, None
+    def _run_stage(self, node_input, state, transform, *args):
+        # Apply one unfinished stage to the previous input boundary.
+        if node_input.has_been(state):
+            return None
 
-            previous_value = node_input.get_previous_value(state)
-            new_value, stage_output = stage_fn(*args, previous_value)
-
-            node_input.update_state(state, new_value)
-            return node_input, stage_output
-        except Exception:
-            raise
-    
-    def run_compile_stage(self, node: RunnerNode, input_name: str, node_input: RunnerNodeInput) -> None:
-        # eval, (normalise input, extract deps)
-        node_input, _           = self.run_process_stage(state=ProcessStates.EVALUATED, stage_fn=self.evaluate_node_input, node_input=node_input, args=(node, input_name))
-        node_input, found  = self.run_process_stage(state=ProcessStates.NORMALISED, stage_fn=self.normalise_input, node_input=node_input)
-        # update found deps in input and to node for indexing
-        found_deps, found_nodes = found 
-        if found_deps:
-            node_input.deps.extend(found_deps)
-            for dep in found_deps:                    
-                if dep not in node.deps:
-                    node.deps.append(dep)
-
-
-        node._input_nodes.extend(found_nodes)
-        pass
-    def run_resolve_stage(
-        self,
-        reference_unscoper: Callable,
-        node: Node,
-        node_input: NodeInput,
-        observe_unrepresented=False,
-    ) -> None:
-        node_input, observations = self.run_process_stage(
-            state=ProcessStates.RESOLVED,
-            stage_fn=self.resolve_input,
-            node_input=node_input,
-            args=(reference_unscoper, node, observe_unrepresented),
+        value, evidence = transform(
+            node_input.get_previous_value(state),
+            *args,
         )
-        return observations or ([], [])
- 
-        ###################
-    
-    ###################
-    # EVALUATE  STAGE #
-    ###################
-    def evaluate_node_input(self, node: Node, input_name: str, input_value: Any) -> Any:
+        node_input.update_state(state, value)
+        return evidence
+
+    def evaluate_input(self, value, node, input_name):
+        # Evaluate callable inputs; leave ordinary values unchanged.
+        if not callable(value):
+            return value, None
+
+        args, kwargs = self._injection_inputs(node, input_name)
+        return (
+            self._evaluate_callable(
+                value,
+                args,
+                kwargs,
+            ),
+            None,
+        )
+
+    def _injection_inputs(self, node, input_name):
+        # Select inputs supplied to an args/kwargs factory.
+        if input_name == "args":
+            return node.p_args.normalised, node.p_kwargs.normalised
+        if input_name == "kwargs":
+            return node.k_args.normalised, node.k_kwargs.normalised
+        return (), {}
+
+    def _evaluate_callable(self, function, args, kwargs):
+        # Normalise the supplied call shape.
+        if args is None:
+            args = ()
+        elif not isinstance(args, (list, tuple)):
+            args = (args,)
+
+        if kwargs is None:
+            kwargs = {}
+        if not isinstance(kwargs, dict):
+            raise TypeError("Callable input kwargs must be a dict")
+
+        # Bind before calling so signature failures are explicit.
         try:
-            if callable(input_value):
-                # get args
-                _args, _kwargs = self._get_injection_args(node, input_name)
+            bound = inspect.signature(function).bind(*args, **kwargs)
+        except TypeError as error:
+            raise CallableDependencyError(
+                f"Failed to bind callable input: {error}"
+            ) from error
+        return function(*bound.args, **bound.kwargs)
 
-                # evaluate the function (primary input callable) 
-                evaluated_input = self._callable_input_evaluator(input_value, _args, _kwargs, inject_data_store=node.inject_data_store)
-                
-                return evaluated_input, None
-            return input_value, None
-        except Exception as e:
-            raise RuntimeError(
-                f"[EvaluateInputError] Node[{node.id}] e: {e}"
-            ) from e
+    def normalise_input(self, value):
+        # Convert one dependency string into a DataRef.
+        if (
+            isinstance(value, str)
+            and value.startswith("@")
+            and value != "@"
+            and not value.endswith(".")
+        ):
+            value = DataRef.from_string(value)
 
-    ###################
-    # NORMALISE STAGE #
-    ###################
-    def normalise_input(self, input_value: Any) -> Union[Any, list]:
-        deps = list()
-        nodes = list()
-        ## normalise
-        # if dep.str convert to DataRef and log dep
-        if DataRef._is_dep_string(input_value):
-            input_value = DataRef.from_string(input_value) # self.dep_tools.normalise_dep_str
-            deps.append(input_value)
-            return input_value, (deps, nodes)
-        
-        # log found dep and return DataRef
-        if isinstance(input_value, DataRef):
-            deps.append(input_value)
-            return input_value, (deps, nodes)
-        
-        ## recurse ##
-        # for each item in container - normalise value and update deps
-        if isinstance(input_value, (tuple, set, list)):
-             # convert lists to tuple as lists cannot contain unhashable values
-            if isinstance(input_value, set):
-                input_value = tuple(input_value)
-                
-            normalised = list()
-            for v in input_value:
-                normalised_input, found = self.normalise_input(v)
-                normalised.append(normalised_input)
-                deps.extend(found[0])
-                nodes.extend(found[1])
-                
-            return type(input_value)(normalised), (deps, nodes)
-        
-        # for each item in dict - normalise value
-        if isinstance(input_value, dict):
+        # Retain one dependency.
+        if isinstance(value, DataRef):
+            return value, ([value], [])
+
+        # Represent one nested Node through its output targets.
+        if isinstance(value, Node):
+            if not value.targets:
+                target_id = (
+                    value.node_name
+                    if value.share_implicit_target
+                    else value.id
+                )
+                value.targets = [
+                    DataRef(
+                        f"@tmp_node_link.{target_id}",
+                        "__tide__",
+                    )
+                ]
+
+            normalised = (
+                value.targets[0]
+                if len(value.targets) == 1
+                else value.targets
+            )
+            return normalised, (list(value.targets), [value])
+
+        # Normalise every dictionary value.
+        if isinstance(value, dict):
             normalised = {}
-            for k, v in input_value.items():
-                normalised_input, found = self.normalise_input(v)
-                normalised[k] = normalised_input
+            deps = []
+            input_nodes = []
+
+            for key, child in value.items():
+                child, found = self.normalise_input(child)
+                normalised[key] = child
                 deps.extend(found[0])
-                nodes.extend(found[1])
-            return normalised, (deps, nodes)
-        #return unchanged 
+                input_nodes.extend(found[1])
 
-        if isinstance(input_value, Node):
-            node = input_value
-            nodes.append(node)
-            if not node.targets: # if a node takes a node as input, create a target for the input node and register target as a dep. 
-                node.targets = [DataRef(f'@tmp_node_link.{node.node_name}', "__tide__")]
-            deps.extend(node.targets)
-            # A nested node with one target represents one argument value.  Keeping
-            # the target wrapped in a list makes the dependency resolver return
-            # ``[value]`` and silently changes the producer's result shape before
-            # passing it to the consumer.  Multiple targets remain a collection.
-            normalised_output = node.targets[0] if len(node.targets) == 1 else node.targets
-            return normalised_output, (deps, nodes) # TODO-NOTE: Support target lists [X]
-        return input_value, (deps, nodes)
+            return normalised, (deps, input_nodes)
 
-    ###################
-    #  COMPILE STAGE  #
-    ###################
+        # Normalise every sequence value.
+        if isinstance(value, (list, tuple, set)):
+            source = (
+                sorted(value, key=repr)
+                if isinstance(value, set)
+                else value
+            )
+            normalised = []
+            deps = []
+            input_nodes = []
 
-    def compile_secondary_inputs(self, node: RunnerNode) -> None:
-        for input_name, node_input in node.get_secondary_inputs().items():
-            self.run_compile_stage(node, input_name, node_input)
-    def compile_primary_inputs(self, node: RunnerNode) -> None:
-        for input_name, node_input in node.get_primary_inputs().items():
-            self.run_compile_stage(node, input_name, node_input)           
-    def compile_all_inputs(self, node: RunnerNode) -> None:
-        try:
-            # evaluate and normalise injection args
-            for input_name, node_input in node.get_secondary_inputs().items():
-                self.run_compile_stage(node, input_name, node_input)
-                for dep in node_input.deps:
-                    node.dep_to_input_map[dep].append((input_name, node_input))
-            # evaluate and normalise primary args
-            for input_name, node_input in node.get_primary_inputs().items():
-                self.run_compile_stage(node, input_name, node_input)
-                for dep in node_input.deps:
-                    node.dep_to_input_map[dep].append((input_name, node_input))
- 
-        except Exception as e:  
-            warn(f"[InputResolutionError] Node[{node.id}], input={node_input} failed to compile due to {e}")
-            raise NodeFailed(node.id, input_name, e)
+            for child in source:
+                child, found = self.normalise_input(child)
+                normalised.append(child)
+                deps.extend(found[0])
+                input_nodes.extend(found[1])
 
-    ###################
-    #  RESOLVE STAGE  #
-    ###################
+            container = (
+                tuple(normalised)
+                if isinstance(value, set)
+                else type(value)(normalised)
+            )
+            return container, (deps, input_nodes)
 
-   
-    def resolve_input(
+        # Ordinary values require no normalisation.
+        return value, ([], [])
+
+    def _compile_input(self, node, input_name, node_input):
+        # Evaluate one input, then normalise its discovered contents.
+        self._run_stage(
+            node_input,
+            ProcessStates.EVALUATED,
+            self.evaluate_input,
+            node,
+            input_name,
+        )
+        deps, input_nodes = self._run_stage(
+            node_input,
+            ProcessStates.NORMALISED,
+            self.normalise_input,
+        )
+
+        # Attach exactly what normalisation discovered.
+        node_input.deps.extend(deps)
+        node.deps.extend(deps)
+        node._input_nodes.extend(input_nodes)
+        for dep in deps:
+            node.dep_to_input_map[dep].append((input_name, node_input))
+
+    def compile_all_inputs(self, node):
+        # Compile every input through the same two stages.
+        for input_name, node_input in node.get_all_inputs().items():
+            try:
+                self._compile_input(node, input_name, node_input)
+            except Exception as error:
+                raise NodeFailed(node.id, input_name, error) from error
+
+    def _resolve_dependencies(
         self,
-        reference_unscoper: Callable,
+        value,
+        reference_unscoper,
         node,
-        observe_unrepresented,
-        input_value: Any,
-    ) -> Any:
-        unrepresented = [] if observe_unrepresented else None
-        resolved_value, read_deps = (
-            self.dep_tools.in_place_dependency_resolver(
+        path=(),
+    ):
+        # Resolve one dependency occurrence.
+        if isinstance(value, DataRef):
+            if value.dynamic:
+                dynamic_ref = reference_unscoper(value)
+                available_refs = self.dep_tools.matching_refs(dynamic_ref)
+                required = value.count if value.count is not None else 1
+                if len(available_refs) < required:
+                    raise DynamicRefCountLessThanAvailableKeysError(
+                        f"{value}.count was more than available keys!",
+                        value,
+                        tuple(ref.key for ref in available_refs),
+                    )
+
+            selected_refs = (
+                node.dynamic_to_static_deps[value][:value.max]
+                if value.dynamic
+                else (value,)
+            )
+            dynamic_ref = (
+                reference_unscoper(value)
+                if value.dynamic
+                else None
+            )
+            resolved_values = []
+            reads = []
+
+            for occurrence, selected in enumerate(selected_refs):
+                ref = reference_unscoper(selected)
+                resolved = self.dep_tools.resolve_exact(ref)
+                resolved_values.append(resolved)
+                reads.append((
+                    ref,
+                    resolved,
+                    tide_snapshot_value(resolved, boundary="read"),
+                    dynamic_ref,
+                    path + (occurrence,) if value.dynamic else path,
+                ))
+
+            return (
+                resolved_values if value.dynamic else resolved_values[0],
+                reads,
+            )
+
+        # Resolve dependencies inside a dictionary.
+        if isinstance(value, dict):
+            resolved = {}
+            reads = []
+
+            for key, child in value.items():
+                child, child_reads = self._resolve_dependencies(
+                    child,
+                    reference_unscoper,
+                    node,
+                    path + (key,),
+                )
+                resolved[key] = child
+                reads.extend(child_reads)
+
+            return resolved, reads
+
+        # Resolve dependencies inside a list or tuple.
+        if isinstance(value, (list, tuple)):
+            resolved = []
+            reads = []
+
+            for index, child in enumerate(value):
+                child, child_reads = self._resolve_dependencies(
+                    child,
+                    reference_unscoper,
+                    node,
+                    path + (index,),
+                )
+                resolved.append(child)
+                reads.extend(child_reads)
+
+            return type(value)(resolved), reads
+
+        # Ordinary values remain unchanged.
+        return value, []
+
+    def _resolve_input(
+        self,
+        reference_unscoper,
+        node,
+        node_input,
+    ):
+        if node_input.has_been(ProcessStates.RESOLVED):
+            return [], []
+
+        value = node_input.get_previous_value(ProcessStates.RESOLVED)
+
+        # Resolve one scalar input as one complete input.
+        if not isinstance(value, (dict, list, tuple)):
+            resolved, reads = self._resolve_dependencies(
+                value,
                 reference_unscoper,
                 node,
-                input_value,
-                unrepresented=unrepresented,
-                collapse_root=False,
             )
-        )
-        return resolved_value, (read_deps, unrepresented or [])
-    # def resolve_secondary_inputs(self, node: Node) -> None:
-    #     for node_input in node.get_secondary_inputs().values():
-    #         self.run_resolve_stage(node_input)               
-    # def resolve_primary_inputs(self, node: Node) -> None:
-    #     for node_input in node.get_primary_inputs().values():
-    #         self.run_resolve_stage(node_input)           
+            node_input.update_state(ProcessStates.RESOLVED, resolved)
+            unrepresented = []
+            if not reads:
+                unrepresented.append((
+                    resolved,
+                    tide_snapshot_value(resolved, boundary="read"),
+                    (),
+                ))
+            return reads, unrepresented
+
+        # Resolve each actual positional or keyword input once.
+        is_mapping = isinstance(value, dict)
+        items = value.items() if is_mapping else enumerate(value)
+        resolved = {} if is_mapping else []
+        reads = []
+        unrepresented = []
+
+        for position, child in items:
+            whole_input_is_represented = isinstance(child, DataRef)
+            child, child_reads = self._resolve_dependencies(
+                child,
+                reference_unscoper,
+                node,
+                (position,),
+            )
+            if is_mapping:
+                resolved[position] = child
+            else:
+                resolved.append(child)
+            reads.extend(child_reads)
+
+            # Observe the whole input unless one dependency represents it exactly.
+            if not whole_input_is_represented:
+                unrepresented.append((
+                    child,
+                    tide_snapshot_value(child, boundary="read"),
+                    (position,),
+                ))
+
+        resolved = resolved if is_mapping else type(value)(resolved)
+        node_input.update_state(ProcessStates.RESOLVED, resolved)
+        return reads, unrepresented
+
     def resolve_all_inputs(
         self,
-        reference_unscoper: Callable,
-        node: Node,
-        track_unrepresented=True,
-    ) -> None:
-        if not isinstance(track_unrepresented, bool):
-            raise TypeError("track_unrepresented must be a bool")
-        try:
-            reads = defaultdict(list)
-            unrepresented = defaultdict(list)
-            # resolve injection arguments
-            for input_name, node_input in node.get_secondary_inputs().items():
-                input_reads, _ = self.run_resolve_stage(
-                    reference_unscoper,
-                    node,
-                    node_input,
-                )
-                reads[input_name].extend(input_reads)
-            # resolve primary arguments
-            for input_name, node_input in node.get_primary_inputs().items():
-                input_reads, input_unrepresented = self.run_resolve_stage(
-                    reference_unscoper,
-                    node,
-                    node_input,
-                    observe_unrepresented=track_unrepresented,
-                )
-                reads[input_name].extend(input_reads)
-                unrepresented[input_name].extend(input_unrepresented)
-            return reads, unrepresented
-        except (MissingRefDuringResolutionError, DynamicRefCountLessThanAvailableKeysError) as e:
-            raise e
-        except Exception as e:  
-            raise NodeFailed(node.id, input_name, f"[InputResolutionError] Node[{node.id}], input={input_name} failed to resolve due to {e}")
+        reference_unscoper,
+        node,
+    ):
+        reads = defaultdict(list)
+        unrepresented = defaultdict(list)
 
-    ###################
-    #     HELPERS     #
-    ###################
-
-    def _extract_nodes_from_result(self, result: Any) -> Generator[Node, None, None]:
-        if isinstance(result, Node):
-            yield result
-            return
-        if isinstance(result, (list, set, tuple)):
-            for v in result:
-                yield from self._extract_nodes_from_result(v)
-            return
-        if isinstance(result, dict):
-            for v in result.values():
-                yield from self._extract_nodes_from_result(v)
-            return
-        #add generator support
-        return
-
-    def _get_injection_args(self, node, callable_input_name):
-        if callable_input_name == "args":
-            _args = node.p_args.normalised
-            _kwargs = node.p_kwargs.normalised
-            return (_args, _kwargs)
-        if callable_input_name == "kwargs":
-            _args = node.k_args.normalised
-            _kwargs = node.k_kwargs.normalised
-            return (_args, _kwargs)  
-        return (), {}
-    
-    def _callable_input_evaluator(
-        self,
-        func: Callable,
-        inj_args: Any | tuple = (),
-        inj_kwargs: dict | None = None,
-        inject_data_store: bool = False,
-    ) -> Any:
-
-        func_sig = inspect.signature(func) 
-
-        if inj_args is None:
-            inj_args = tuple()
-
-        if not isinstance(inj_args, (tuple, list)):
-            inj_args = (inj_args,)
-        
-        if inj_kwargs is None:
-            inj_kwargs = {}
-
-        if not isinstance(inj_kwargs, dict):
-            raise TypeError(f"[CALLABLE_INPUT_EVALUATOR] func={func.__name__} failed! inj_kwargs={type(inj_kwargs)} was not a dict!")
-
-        try:
-            # bind inputs to function
+        # Resolve every input through the same final stage.
+        for input_name, node_input in node.get_all_inputs().items():
             try:
-                if inject_data_store:
-                    bound = func_sig.bind(
-                        self.dep_tools.dump_store("mem"),
-                        *inj_args,
-                        **inj_kwargs,
-                    )
-                else:
-                    bound = func_sig.bind(*inj_args, **inj_kwargs)    
-            except TypeError as e: 
-                raise CallableDependencyError(f"{self._callable_input_evaluator.__name__} Lambda function input error - failed to bind inputs [inject={inject_data_store}]{inj_args, inj_kwargs} to function!: {e} ") from e
-        
-            result = func(*bound.args, **bound.kwargs)
-            return result 
-        except Exception as e:
-            warn(f"func {func.__name__} failed! : {e}")
-            raise
+                input_reads, input_unrepresented = self._resolve_input(
+                    reference_unscoper,
+                    node,
+                    node_input,
+                )
+            except (
+                MissingRefDuringResolutionError,
+                DynamicRefCountLessThanAvailableKeysError,
+            ):
+                raise
+            except Exception as error:
+                raise NodeFailed(node.id, input_name, error) from error
 
-    def _cache_result(self, node: Node, result: Any, resolved_result: Any=None) -> None:
+            reads[input_name].extend(input_reads)
+            unrepresented[input_name].extend(input_unrepresented)
+
+        return reads, unrepresented
+
+    def _extract_nodes_from_result(self, value):
+        # Yield every nested Node from one returned value.
+        if isinstance(value, Node):
+            yield value
+            return
+        if isinstance(value, (list, tuple, set)):
+            for child in value:
+                yield from self._extract_nodes_from_result(child)
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                yield from self._extract_nodes_from_result(child)
+
+    def _fill_cache(self, node, result):
+        # Store one completed result.
         node.result = result
-        node.resolved_result = resolved_result
-        node.state.result_cached = True
-    
-    def _fill_cache(self, node: Node, result: Any, resolved_result) -> None:
-        self._cache_result(node, result, resolved_result)
 
-    def _satisfy(self, node: Node) -> None:
-        all_inputs = list(node.get_all_inputs().values())
-        
-        if not all((input.states[ProcessStates.RESOLVED] for input in all_inputs)):
-            raise NodeFailed(node_id=node.id, input_name='', error=f'Could not satisfy node[{node.id}]! Are all inputs resolved??')
-            
-        if node.state.result_cached:
-            node.state.evaluated = True
-            pass
+    def _satisfy(self, node):
+        # A completed node requires every input to be resolved.
+        if not all(
+            node_input.has_been(ProcessStates.RESOLVED)
+            for node_input in node.get_all_inputs().values()
+        ):
+            raise NodeFailed(
+                node.id,
+                "",
+                f"Node {node.id} has unresolved inputs",
+            )
+        node.evaluated = True

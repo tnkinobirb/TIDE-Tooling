@@ -6,17 +6,18 @@ indexing, queries, and display orchestration remain in ``tide_logging``.
 """
 
 from __future__ import annotations
+ 
+from typing import Any, NamedTuple
 
-from collections import defaultdict
-from typing import Any
-
-from tide_tooling.tooling_core.engine.classes import DataRef, __TIDE_TEMPLATE_VALUE__
+from tide_tooling.tooling_core.engine.classes import DataRef, __fallback__
+from tide_tooling.tooling_core.engine.events import Cause, Effects
 from tide_tooling.tooling_core.engine.tide_rendering import _show_fields
 from tide_tooling.tooling_core.engine.utils import safe_equal
 from tide_tooling.tooling_core.engine.utils import tide_value_hasher
+from tide_tooling.tooling_core.engine.tide_evidence import SealableEvidence
 
 
-__TEMPLATE__ = __TIDE_TEMPLATE_VALUE__()
+__TEMPLATE__ = __fallback__()
 
 
 def _diff(subject, other):
@@ -27,7 +28,7 @@ def _diff(subject, other):
     return _build_compared(subject, other)
 
 
-class Actor:
+class Actor(SealableEvidence):
     def __init__(self, source_ocean, source_runner, source_actor):
         self.id = (source_ocean, source_runner, source_actor)
         self.source_ocean = source_ocean
@@ -44,7 +45,7 @@ class Actor:
 
     @staticmethod
     def _is_template(value):
-        return isinstance(value, __TIDE_TEMPLATE_VALUE__)
+        return isinstance(value, __fallback__)
 
     def __hash__(self):
         return hash((
@@ -83,8 +84,132 @@ class Actor:
             colour=colour,
         )
 
+    def to_string(self) -> str:
+        return str(self.source_actor)
+        
 
-class EmittedNodeRecord:
+class ActorOccurrence(NamedTuple):
+    actor: Actor
+    occurrence_id: int                   
+
+    def to_string(self):
+        return self.actor.to_string() + f"[{self.occurrence_id}]"
+
+    def __repr__(self):
+        return self.to_string()
+
+
+class AmbiguousActorOccurrence(NamedTuple):
+    """Execution activity whose RESULT_READY is outside the Event scope."""
+
+    actor: Actor
+    occurrence_id: int
+    exec_id: str
+
+    def to_string(self):
+        return self.actor.to_string() + f"[!{self.occurrence_id}]"
+
+    def __repr__(self):
+        return self.to_string()
+
+
+class ImmediateExecutionReference(SealableEvidence):
+    """The one owner reference carried by an immediate Trace window."""
+
+    def __init__(
+        self,
+        *,
+        exec_id,
+        actor=None,
+        node_definition_id=None,
+        ambiguous_occurrence=None,
+        resolved_seq_id=None,
+        resolved_actor_occurrence=None,
+    ):
+        self.exec_id = exec_id
+        self.actor = actor
+        self.node_definition_id = node_definition_id
+        self.ambiguous_occurrence = ambiguous_occurrence
+        self.resolved_seq_id = resolved_seq_id
+        self.resolved_actor_occurrence = resolved_actor_occurrence
+
+    @property
+    def resolved(self):
+        return self.resolved_seq_id is not None
+
+
+class ImmediateEffectRecord(SealableEvidence):
+    """Chronological Trace window created by one immediate Effect Event."""
+
+    _tide_value_fields = frozenset()
+
+    def __init__(
+        self,
+        *,
+        seq_id,
+        event_id,
+        event_seq_id,
+        exec_id,
+        execution_reference,
+    ):
+        self.seq_id = seq_id
+        self.event_id = event_id
+        self.event_seq_id = event_seq_id
+        self.exec_id = exec_id
+        self.execution_reference = execution_reference
+        self.effects = []
+        self.deps = []
+        self.writes = []
+
+    @property
+    def producer_id(self):
+        return self.execution_reference.actor
+
+    @property
+    def producer_occurrence_id(self):
+        return (
+            self.execution_reference.resolved_actor_occurrence
+            or self.execution_reference.ambiguous_occurrence
+        )
+
+
+class UnresolvedExecutionRecord(SealableEvidence):
+    """Sealed execution-shaped projection for unresolved runtime activity."""
+
+    _tide_value_fields = frozenset()
+
+    def __init__(self, **facts):
+        for name, value in facts.items():
+            setattr(self, name, value)
+
+
+class ReadyAttemptRecord(SealableEvidence):
+    """Exact readiness evidence retained independently from execution."""
+
+    def __init__(
+        self,
+        *,
+        event_id,
+        event_seq_id,
+        exec_id,
+        actor,
+        node_definition_id,
+        runner_id,
+        pipeline_id,
+        node_snapshot=None,
+    ):
+        self.event_id = event_id
+        self.event_seq_id = event_seq_id
+        self.exec_id = exec_id
+        self.actor = actor
+        self.node_definition_id = node_definition_id
+        self.runner_id = runner_id
+        self.pipeline_id = pipeline_id
+        self.node_snapshot = node_snapshot
+        self.outcome = "ready"
+
+class EmittedNodeRecord(SealableEvidence):
+    _tide_value_fields = frozenset()
     def __init__(
         self,
         ocean_id,
@@ -94,13 +219,15 @@ class EmittedNodeRecord:
         func,
         func_name,
         inputs,
-        deps,
+        declared_deps,
         declared_targets,
         declared_effects,
         origin,
         content_id,
         base_node,
         base_node_content_id,
+        node_options,
+        emitted_by_exec_id=None,
     ):
         self.ocean_id = ocean_id
         self.runner_id = runner_id
@@ -110,19 +237,31 @@ class EmittedNodeRecord:
         self.func = func
         self.func_name = func_name
         self.inputs = inputs
-        self.deps = deps
+        # An emitted node is definition evidence, not an execution.  These
+        # selectors declare what a future execution would require; they are
+        # never resolved DependencyUseRecords.
+        self.declared_deps = list(declared_deps or ())
         self.declared_targets = declared_targets
         self.declared_effects = declared_effects
-        if origin not in {"declared", "runtime"}:
+        if origin not in {"declared", "runtime", "unknown"}:
             raise ValueError(
-                "EmittedNodeRecord origin must be 'declared' or 'runtime'"
+                "EmittedNodeRecord origin must be 'declared', 'runtime', "
+                "or 'unknown'"
             )
         self.origin = origin
         self.content_id = content_id
         self.base_node = base_node
         self.base_node_content_id = base_node_content_id
+        self.node_options = dict(node_options or {})
+        self.emitted_by_exec_id = emitted_by_exec_id
 
-class ExecRecord:
+class ExecRecord(SealableEvidence):
+    _tide_value_fields = frozenset({
+        "output_value",
+        "error",
+        "node_options",
+        "now_meta",
+    })
     def __init__(
         self,
         seq_id,
@@ -149,29 +288,32 @@ class ExecRecord:
         error,
         node_options,
         output_value=__TEMPLATE__,
-        resolve_output=None,
         writes=None,
         emitted_nodes=None,
         base_node_id=None,
         base_node_content_id=None,
         content_id=None,
         handled_raise=False,
+        mutated_during=None,
+        now_meta=None,
+        emitted_by_exec_id=None,
     ):
         self.seq_id = seq_id
         options = node_options or {}
         identity_options = options if isinstance(options, dict) else {}
         if identity_options.get("preserve_exec_id") is True:
             self.exec_id = exec_id
-        elif isinstance(exec_id, __TIDE_TEMPLATE_VALUE__):
+        elif isinstance(exec_id, __fallback__):
             self.exec_id = exec_id
         else:
             self.exec_id = (
                 f"TIDE_EXEC:{exec_id}"
-                if "TIDE_EXEC:" not in exec_id
+                if not exec_id.startswith("TIDE_EXEC:")
                 else exec_id
             )
         self.source_ocean_id = ocean_id
         self.producer_id = Actor(ocean_id, runner_id, func_name)
+        self.producer_occurrence_id = None
         self.runner_id = runner_id
         self.pipeline_id = pipeline_id
         self.node_id = node_id
@@ -195,23 +337,27 @@ class ExecRecord:
         self.duration_ms = duration_ms
         self.error = error
         self.handled_raise = handled_raise
+        self.mutated_during = {
+            reference: list(input_names)
+            for reference, input_names in (mutated_during or {}).items()
+        }
+        self.now_meta = now_meta
 
         self.output_value = output_value
-        self.resolve_output = (
-            resolve_output
-            if resolve_output is not None
-            else []
-        )
         self.writes = writes or []
 
         self.emitted_nodes = emitted_nodes or []
+        self.emitted_by_exec_id = emitted_by_exec_id
         self.base_node_id = base_node_id
         self.base_node_content_id = base_node_content_id
         self.content_id = content_id
         self.node_options = options
 
+    def now(self):
+        return self.now_meta
 
-class AffectedRecord:
+
+class AffectedRecord(SealableEvidence):
     def __init__(
         self,
         effect,
@@ -227,33 +373,42 @@ class AffectedRecord:
         self.affected_exec_id = affected_exec_id
 
 
-class EffectRecord:
+class EffectRecord(SealableEvidence):
+    _tide_value_fields = frozenset({"targets", "output"})
     def __init__(
         self,
         effect,
         targets,
         *,
-        origin,
+        event_id: str,
+        origin: str,
+        immediate: bool,
         output=__TEMPLATE__,
         affected=None,
         target_existed=None,
     ):
+        if not isinstance(event_id, str):
+            raise TypeError("EffectRecord event_id must be a string")
         if origin not in {"declared", "runtime"}:
             raise ValueError(
                 "EffectRecord origin must be 'declared' or 'runtime'"
             )
+        if not isinstance(immediate, bool):
+            raise TypeError("EffectRecord immediate must be a bool")
+        if effect in {Effects.READ, Effects.DELETE}:
+            if not isinstance(target_existed, bool):
+                raise TypeError("READ and DELETE EffectRecords require target_existed")
+        elif target_existed is not None:
+            raise ValueError("target_existed is valid only for READ and DELETE")
+
+        self.event_id = event_id
         self.effect = effect
         self.targets = targets
         self.output = output
         self.origin = origin
-        effect_value = getattr(effect, "value", effect)
-        if effect_value in {"read", "DELETE"}:
-            self.target_existed = target_existed
-        elif target_existed is not None:
-            raise ValueError(
-                "target_existed is valid only for READ and DELETE effects"
-            )
-        self.affected = affected if affected is not None else defaultdict()
+        self.immediate = immediate
+        self.target_existed = target_existed
+        self.affected = affected if affected is not None else {}
 
 
 def _associated_input_key(associated_input):
@@ -276,7 +431,8 @@ def _associated_input_key(associated_input):
     return repr(associated_input)
 
 
-class InputUseRecord:
+class InputUseRecord(SealableEvidence):
+    _tide_value_fields = frozenset({"raw", "evaluated", "normalised", "resolved"})
     def __init__(
         self,
         name,
@@ -297,57 +453,45 @@ class InputUseRecord:
         if not isinstance(other, InputUseRecord):
             return False
 
-        own_dependencies = [
-            getattr(dependency, "dep", dependency)
-            for dependency in self.dependencies
-        ]
-        other_dependencies = [
-            getattr(dependency, "dep", dependency)
-            for dependency in other.dependencies
-        ]
-
         return all([
             self.name == other.name,
             safe_equal(self.raw, other.raw),
             safe_equal(self.evaluated, other.evaluated),
             safe_equal(self.normalised, other.normalised),
             safe_equal(self.resolved, other.resolved),
-            len(own_dependencies) == len(other_dependencies),
+            len(self.dependencies) == len(other.dependencies),
             all(
                 safe_equal(own, expected)
                 for own, expected in zip(
-                    own_dependencies,
-                    other_dependencies,
+                    self.dependencies,
+                    other.dependencies,
                     strict=True,
                 )
             ),
         ])
 
 
-class WriteRecord:
+class WriteRecord(SealableEvidence):
+    _tide_value_fields = frozenset({"stored_result"})
     def __init__(
         self,
-        cause,
+        cause: Cause,
         stored_result,
         stored_version,
         stored_target,
         snapshot_lineage=None,
         observed_mutable=False,
+        updated=False,
     ):
-        if (
-            not isinstance(cause, str)
-            or "TIDE: .event(<function B" in cause
-        ):
-            raise ValueError(
-                f"Cause {cause} for write "
-                f"{(stored_target, stored_version)} was invalid!"
-            )
+        if not isinstance(cause, Cause):
+            raise TypeError("WriteRecord cause must be a Cause")
         self.cause = cause
         self.stored_result = stored_result
         self.stored_version = stored_version
         self.stored_target = stored_target
         self.snapshot_lineage = list(snapshot_lineage or ())
         self.observed_mutable = observed_mutable
+        self.updated = updated
 
     def __eq__(self, other):
         if not isinstance(other, WriteRecord):
@@ -360,10 +504,12 @@ class WriteRecord:
             self.stored_target == other.stored_target,
             self.snapshot_lineage == other.snapshot_lineage,
             self.observed_mutable == other.observed_mutable,
+            self.updated == other.updated,
         ])
 
 
-class DependencyUseRecord:
+class DependencyUseRecord(SealableEvidence):
+    _tide_value_fields = frozenset({"resolved_value", "input_path"})
     def __init__(
         self,
         associated_input: tuple,
@@ -380,6 +526,7 @@ class DependencyUseRecord:
         input_path=None,
         snapshot_lineage=None,
         observed_mutable=False,
+        observation_id=None,
     ):
         self.dep = dep
         self.type = type
@@ -392,6 +539,7 @@ class DependencyUseRecord:
             self.input_path = input_path
             self.snapshot_lineage = list(snapshot_lineage or ())
             self.observed_mutable = observed_mutable
+            self.observation_id = observation_id
             return
 
         self.associated_input = associated_input
@@ -404,6 +552,7 @@ class DependencyUseRecord:
         self.input_path = input_path
         self.snapshot_lineage = list(snapshot_lineage or ())
         self.observed_mutable = observed_mutable
+        self.observation_id = observation_id
 
     def __repr__(self):
         return f"DepUseRecord({self.unscoped_reference})"
@@ -425,6 +574,9 @@ class DependencyUseRecord:
                 == list(other.expanded_to or []),
                 self.input_index == other.input_index,
                 self.input_path == other.input_path,
+                self.snapshot_lineage == other.snapshot_lineage,
+                self.observed_mutable == other.observed_mutable,
+                self.observation_id == other.observation_id,
             ])
 
         return all([
@@ -442,13 +594,15 @@ class DependencyUseRecord:
             self.input_path == other.input_path,
             self.snapshot_lineage == other.snapshot_lineage,
             self.observed_mutable == other.observed_mutable,
+            self.observation_id == other.observation_id,
         ])
 
     def _associated_input_key(self):
         return _associated_input_key(self.associated_input)
 
 
-class ExpandedDepRecord:
+class ExpandedDepRecord(SealableEvidence):
+    _tide_value_fields = frozenset({"resolved_value", "input_path"})
     def __init__(
         self,
         associated_input,
@@ -465,6 +619,7 @@ class ExpandedDepRecord:
         input_path=None,
         snapshot_lineage=None,
         observed_mutable=False,
+        observation_id=None,
     ):
         self.associated_input = associated_input
         self.dep = dep
@@ -480,6 +635,7 @@ class ExpandedDepRecord:
         self.input_path = input_path
         self.snapshot_lineage = list(snapshot_lineage or ())
         self.observed_mutable = observed_mutable
+        self.observation_id = observation_id
 
     def __eq__(self, other):
         if not isinstance(other, ExpandedDepRecord):
@@ -503,13 +659,14 @@ class ExpandedDepRecord:
             self.input_path == other.input_path,
             self.snapshot_lineage == other.snapshot_lineage,
             self.observed_mutable == other.observed_mutable,
+            self.observation_id == other.observation_id,
         ])
 
     def _associated_input_key(self):
         return _associated_input_key(self.associated_input)
 
 
-class Inputs:
+class Inputs(SealableEvidence):
     def __init__(self, input_log_dict):
         nothing_args = [(), (), (), (), []]
         nothing_kwargs = [{}, {}, {}, {}, []]
@@ -538,9 +695,20 @@ class Inputs:
             InputUseRecord("k_kwargs", *nothing_kwargs),
         )
 
+        # Preserve factual inputs added outside the six canonical argument
+        # buckets (for example runtime READ evidence). Reconstruction already
+        # supplies these InputUseRecords; Inputs owns the complete input set.
+        for name, input_record in input_log_dict.items():
+            if not hasattr(self, name):
+                setattr(self, name, input_record)
+
     def items(self):
         # Runtime effects can add factual inputs after argument resolution.
-        return vars(self).items()
+        return (
+            (name, value)
+            for name, value in vars(self).items()
+            if not name.startswith("_tide_")
+        )
 
     def __repr__(self):
         used = []
@@ -557,8 +725,8 @@ class Inputs:
         if not isinstance(other, Inputs):
             return False
 
-        own_inputs = vars(self)
-        other_inputs = vars(other)
+        own_inputs = dict(self.items())
+        other_inputs = dict(other.items())
         return (
             own_inputs.keys() == other_inputs.keys()
             and all(

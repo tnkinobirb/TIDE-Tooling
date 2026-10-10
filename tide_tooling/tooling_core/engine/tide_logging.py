@@ -4,38 +4,49 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tide_tooling.tooling_core.engine.PipelineRunner import PipelineRunner
 
-from tide_tooling.tooling_core.engine.events         import Effects
-from tide_tooling.tooling_core.engine.classes        import DataRef, __TIDE_TEMPLATE_VALUE__
+from tide_tooling.tooling_core.engine.events         import Cause, Effects
+from tide_tooling.tooling_core.engine.classes        import DataRef, __fallback__
 from tide_tooling.tooling_core.engine.utils          import (
     DedupedList,
+    detached_tide_value,
     deduped_dict,
-    _is_tide_exec_uuid,
-    snapshot_json_dict,
+    safe_equal,
 )
 from tide_tooling.tooling_core.engine.errors         import InvalidObjectKindError
 from tide_tooling.tooling_core.engine.tide_records   import (
     Actor,
+    ActorOccurrence,
     AffectedRecord,
     DependencyUseRecord,
     EffectRecord,
     EmittedNodeRecord,
     ExecRecord,
+    ImmediateEffectRecord,
+    UnresolvedExecutionRecord,
+    ReadyAttemptRecord,
     ExpandedDepRecord,
     InputUseRecord,
     Inputs,
     WriteRecord,
 )
 from tide_tooling.tooling_core.engine.tide_links     import (
-    AffectedStackLink,
-    EmittedStackLink,
-    ReadWriteLink,
-    StackLink,
+    EffectEdge,
+    EmissionEdge,
+    ReadEdge,
 )
 from tide_tooling.tooling_core.engine.tide_index     import TraceIndex
+from tide_tooling.tooling_core.engine.tide_evidence  import (
+    TraceEvidenceStore,
+    seal_exec_records,
+    validate_exec_record_relationships,
+)
 from tide_tooling.tooling_core.engine.tide_query_results import (
     Compared,
     ConsumedBy,
+    Definition,
     Downstream,
+    ExecutionAncestry,
+    ExecValues,
     Inspected,
     InspectedGroup,
     Investigate,
@@ -45,28 +56,14 @@ from tide_tooling.tooling_core.engine.tide_query_results import (
     ProducedBy,
     Searched,
     Stream,
-    TIDEModelCompared,
     Upstream,
+    UsedAs,
+    Waiting,
     _build_compared,
     _build_object_compared,
+    _state_occurrence_text,
 )
-from tide_tooling.tooling_core.engine.tide_model import (
-    _build_tide_model_compared,
-    _canonical_tide_structure,
-    _is_tide_model_operand,
-    _sorted_tide_items,
-    _tide_incidence_entry,
-    _tide_incidence_set,
-    _tide_incidence_sort_key,
-    _tide_model_document,
-)
-from tide_tooling.tooling_core.engine.tide_runtime_logging import (
-    EventLogger,
-    ExecutionLog,
-    LogTools,
-)
-
-import copy, warnings
+import copy
 from .utils import tide_value_hasher
 
 from collections                import defaultdict    
@@ -87,6 +84,143 @@ from .tide_rendering import (
     strip_ansi,
 )
 
+
+def _detached_error(error, memo):
+    if error is None:
+        return None
+    if not isinstance(error, BaseException):
+        return copy.deepcopy(error, memo)
+
+    try:
+        detached = type(error)(*copy.deepcopy(error.args, memo))
+    except Exception:
+        detached = Exception(*copy.deepcopy(error.args, memo))
+    memo[id(error)] = detached
+
+    for name, value in getattr(error, "__dict__", {}).items():
+        # A failed Trace may be attached to its exception.  Copying it here
+        # recursively reaches live runners/thread locks; it is contextual
+        # navigation, not part of the exception value itself.
+        if name == "tide_trace":
+            continue
+        setattr(detached, name, copy.deepcopy(value, memo))
+    return detached
+
+
+def _detached_exec_records(records):
+    """Clone public execution evidence without traversing live failure state."""
+    memo = {}
+    detached_records = []
+    for record in records:
+        detached = copy.copy(record)
+        memo[id(record)] = detached
+        detached_records.append(detached)
+
+    for record, detached in zip(records, detached_records, strict=True):
+        for name, value in vars(record).items():
+            if name == "error":
+                cloned = _detached_error(value, memo)
+            else:
+                cloned = copy.deepcopy(value, memo)
+            setattr(detached, name, cloned)
+    return tuple(detached_records)
+
+
+def _project_executions(records, completed, ready_attempts, evidence_store):
+    """Build the single execution-shaped projection of Trace evidence."""
+    attempts = {attempt.exec_id: attempt for attempt in ready_attempts}
+    grouped = {}
+    for record in records:
+        if not isinstance(record, ImmediateEffectRecord):
+            continue
+        if record.execution_reference.resolved:
+            continue
+        grouped.setdefault(record.exec_id, []).append(record)
+
+    projected = list(completed)
+    projection_memo = {}
+    for exec_id, windows in grouped.items():
+        first = windows[0]
+        attempt = attempts.get(exec_id)
+        actor = first.producer_id
+        attempt_snapshot = (
+            attempt.node_snapshot
+            if attempt is not None
+            and isinstance(attempt.node_snapshot, dict)
+            else {}
+        )
+
+        def attempt_value(name, default):
+            value = attempt_snapshot.get(name, default)
+            from tide_tooling.tooling_core.engine.utils import TIDEValueSnapshot
+            return value.restore() if isinstance(value, TIDEValueSnapshot) else value
+
+        unresolved = UnresolvedExecutionRecord(
+            ambiguous=True,
+            immediate_windows=tuple(windows),
+            seq_id=first.seq_id,
+            event_seq_id=first.event_seq_id,
+            exec_id=exec_id,
+            producer_id=actor,
+            producer_occurrence_id=first.producer_occurrence_id,
+            source_ocean_id=actor.source_ocean,
+            runner_id=attempt.runner_id if attempt is not None else actor.source_runner,
+            pipeline_id=attempt.pipeline_id if attempt is not None else None,
+            node_id=(
+                attempt.node_definition_id
+                if attempt is not None
+                else first.execution_reference.node_definition_id
+            ),
+            base_node_id=(
+                attempt.node_definition_id
+                if attempt is not None
+                else first.execution_reference.node_definition_id
+            ),
+            func_name=actor.source_actor,
+            func=attempt_snapshot.get("func"),
+            content_id=(
+                attempt.node_definition_id
+                if attempt is not None
+                else first.execution_reference.node_definition_id
+            ),
+            deps=tuple(dependency for window in windows for dependency in window.deps),
+            writes=tuple(write for window in windows for write in window.writes),
+            effects=tuple(effect for window in windows for effect in window.effects),
+            inputs={},
+            emitted_nodes=(),
+            emitted_by_exec_id=None,
+            declared_deps=tuple(attempt_value("declared_deps", ())),
+            declared_targets=tuple(attempt_value("declared_targets", ())),
+            declared_effects=tuple(attempt_snapshot.get("declared_effects", ())),
+            runtime_effects=(),
+            runtime_targets=(),
+            unscoped_store_refs=tuple(attempt_snapshot.get("unscoped_store_refs", ())),
+            node_options=dict(attempt_snapshot.get("node_options", {})),
+            base_node_content_id=attempt_snapshot.get("base_node_content_id"),
+            status="ambiguous",
+            started_at=None,
+            finished_at=None,
+            duration_ms=None,
+            error=None,
+        )
+        unresolved._tide_seal_evidence(evidence_store, projection_memo)
+        projected.append(unresolved)
+
+    return tuple(sorted(projected, key=lambda record: record.seq_id))
+
+
+def _same_effect_record(left, right):
+    """Match one Effect fact across owned/detached Trace projections."""
+    return (
+        left.event_id == right.event_id
+        and left.effect == right.effect
+        and safe_equal(left.targets, right.targets)
+        and left.origin == right.origin
+        and left.immediate == right.immediate
+        and left.target_existed == right.target_existed
+        and safe_equal(left.output, right.output)
+    )
+
 __all__ = [
     "Trace",
     "TraceIndex",
@@ -100,13 +234,13 @@ __all__ = [
     "InputUseRecord",
     "Inputs",
     "WriteRecord",
-    "AffectedStackLink",
-    "EmittedStackLink",
-    "ReadWriteLink",
-    "StackLink",
+    "EffectEdge",
+    "EmissionEdge",
+    "ReadEdge",
     "Compared",
     "ConsumedBy",
     "Downstream",
+    "ExecValues",
     "Inspected",
     "InspectedGroup",
     "Investigate",
@@ -116,302 +250,811 @@ __all__ = [
     "ProducedBy",
     "Searched",
     "Stream",
-    "TIDEModelCompared",
     "Upstream",
     "_build_compared",
     "_build_object_compared",
-    "_build_tide_model_compared",
-    "_canonical_tide_structure",
-    "_is_tide_model_operand",
-    "_sorted_tide_items",
-    "_tide_incidence_entry",
-    "_tide_incidence_set",
-    "_tide_incidence_sort_key",
-    "_tide_model_document",
-    "EventLogger",
-    "ExecutionLog",
-    "LogTools",
     "strip_ansi",
 ]
 
-__TEMPLATE__ =  __TIDE_TEMPLATE_VALUE__()
+__TEMPLATE__ =  __fallback__()
 DEFAULT_TIDE_STORES = [
     "mem",
     "__tide__",
-    "__unnamed__",
+    "__untracked__",
     "__model__",
     "global",
 ]
 DEFAULT_STREAM_MAX_PATHS = 1000
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
-    
-
-
-    
-
-
-
-
-            
-
-# class OfBase:
-#     def to_dict(self):
-#         return {
-#             "id": self.source.id,
-#             "execs": self.execs,
-#             "paths": {exec_id: [path.to_dict() for path in paths] for exec_id, paths in self.paths_by_exec.items()}
-#         }
-    
-#     def show(self):
-#         if isinstance(self, ProducersOf):
-#             relation = f"Producers of"
-#         else:
-#             relation = f"Consumers of"
-
-#         lines = []
-#         for source, paths in self.paths_by_exec.items():
-#             print("")    
-#             print(f"{relation} {self.inspect(source).object}:")
-#             for path in paths:
-#                 path: Pathed
-#                 for exec_id, paths in path.paths.items():
-#                     exec_repr = self.inspect(exec_id, "exec_record").object
-#                     print(f"  via: {exec_repr}")
-#                     for path in paths:
-#                         for edge in path:
-#                             if isinstance(edge, str): 
-#                                 print(f"    {edge}")
-#                             else:
-#                                 edge: StackLink | AffectedStackLink
-#                                 ref = edge.produced_ref
-#                                 ver = edge.produced_ver
-#                                 print(f"      {ref}[v{ver}]")
-        
-#         pass
-
-
-
-# class ConsumersOf(OfBase):
-#     def __init__(self, inspect, source, execs, paths_by_exec):
-#         self.inspect = inspect
-#         self.source = source
-#         self.execs = execs
-#         self.paths_by_exec = paths_by_exec
-
-#     def to_dict(self):
-#         return super().to_dict()
-
-#     def show(self):
-#         return super().show()
-
-# class ProducersOf(OfBase):
-#     def __init__(self, inspect, source, execs, paths_by_exec):
-#         self.inspect = inspect
-#         self.source = source
-#         self.execs = execs
-#         self.paths_by_exec = paths_by_exec
-
-#     def to_dict(self):
-#         return super().to_dict()
-
-#     def show(self):
-#         return super().show()
-    
 class Trace:
-    def __init__(self, event_log=None, exec_log=None, runner=None, ocean_id=None, name:str="TIDE: .trace()", all_known_runners: dict=None, all_known_pipelines: dict=None, from_cas=False, bundle_context=None, source_context=None, model_context=None, host=None, host_record=None):
-        self.name = name
-        self.events = event_log or []
-            # raise ValueError("No events!")
-        
+    def __setattr__(self, name, value):
+        if getattr(self, "_tide_trace_sealed", False):
+            raise AttributeError("Trace evidence is sealed")
+        object.__setattr__(self, name, value)
+
+    @staticmethod
+    def _validate_record_identities(records):
+        seen_exec_ids = set()
+        seen_seq_ids = set()
+        seen_occurrences = set()
+
+        for record in records:
+            if record.seq_id in seen_seq_ids:
+                raise ValueError(
+                    f"Duplicate Trace sequence: {record.seq_id}"
+                )
+            seen_seq_ids.add(record.seq_id)
+
+            if not isinstance(record, ExecRecord):
+                continue
+
+            producer = record.producer_id
+            if producer.source_ocean != record.source_ocean_id:
+                raise ValueError(
+                    "Execution producer ocean does not match source_ocean_id"
+                )
+            if producer.source_runner != record.runner_id:
+                raise ValueError(
+                    "Execution producer runner does not match runner_id"
+                )
+            if producer.source_actor != record.func_name:
+                raise ValueError(
+                    "Execution producer actor does not match func_name"
+                )
+            if record.exec_id in seen_exec_ids:
+                raise ValueError(
+                    f"Duplicate execution identity: {record.exec_id}"
+                )
+            seen_exec_ids.add(record.exec_id)
+
+            occurrence = record.producer_occurrence_id
+            if occurrence is None:
+                continue
+            if occurrence.actor != producer:
+                raise ValueError(
+                    "ActorOccurrence actor does not match execution producer"
+                )
+            if (
+                not isinstance(occurrence.occurrence_id, int)
+                or isinstance(occurrence.occurrence_id, bool)
+                or occurrence.occurrence_id < 0
+            ):
+                raise ValueError(
+                    "ActorOccurrence occurrence_id must be a non-negative int"
+                )
+            if occurrence in seen_occurrences:
+                raise ValueError(
+                    f"Duplicate ActorOccurrence identity: {occurrence}"
+                )
+            seen_occurrences.add(occurrence)
+
+    def __init__(
+        self,
+        log,
+        *,
+        event_log=None,
+        events_verified=None,
+        _execution_records=None,
+        _index=None,
+        pipelines=None,
+        runner=None,
+        ocean_id=None,
+        name="TIDE: .trace()",
+        from_cas=False,
+        bundle_context=None,
+        model_context=None,
+        host=None,
+        host_record=None,
+        trace_starting_event=None,
+        pipeline_starting_event=None,
+        tide_plan=None,
+        missing_referenced_events=None,
+        causal_order_violations=None,
+        ready_exec_ids=None,
+        blocked_exec_ids=None,
+        deadlock=None,
+        ready_attempts=None,
+        started_runner_ids=None,
+        causal_runner_ids=None,
+        ended_runner_ids=None,
+        evidence_violations=None,
+        _state_authorities=None,
+        _value_backing=None,
+        _source_bundle=None,
+        _evidence_store=None,
+        _require_closed_evidence=False,
+    ):
+        """Construct a Trace from normalized execution evidence.
+
+        ``event_log`` is retained source evidence only. Trace construction does
+        not inspect Event types or payloads and does not reconstruct facts from
+        the Event stream.
+        """
         if ocean_id is None:
             raise ValueError("Trace requires a source ocean_id")
-        
-        self.ocean_id = ocean_id
-        self.from_cas = bool(from_cas)
-        self.bundle_context = (
-            dict(bundle_context)
+
+        if events_verified not in {True, False, None}:
+            raise TypeError("events_verified must be True, False, or None")
+
+        if event_log is None and events_verified is not None:
+            raise ValueError(
+                "events_verified requires retained Event evidence"
+            )
+
+        if (
+            runner is not None
+            and not isinstance(runner, (int, str))
+            and not all(
+                hasattr(runner, field)
+                for field in ("id", "pipeline", "index")
+            )
+        ):
+            raise ValueError(f"Trace received an invalid runner: {runner}")
+
+        selected_runner_id = (
+            runner
+            if isinstance(runner, (int, str))
+            else getattr(runner, "id", None)
+        )
+        supplied_trace_start_id = (
+            trace_starting_event
+            if isinstance(trace_starting_event, (int, str))
+            else getattr(trace_starting_event, "event_id", None)
+        )
+        supplied_pipeline_start_id = (
+            pipeline_starting_event
+            if isinstance(pipeline_starting_event, (int, str))
+            else getattr(pipeline_starting_event, "event_id", None)
+        )
+
+        # Own the normalized evidence.
+        self._name = name
+        self._ocean_id = ocean_id
+        self._event_log = event_log
+        self._events_verified = events_verified
+        self._evidence = _evidence_store or TraceEvidenceStore()
+
+        incoming_records = tuple(log or ())
+        owned_records = (
+            incoming_records
+            if all(
+                getattr(record, "_tide_sealed", False)
+                for record in incoming_records
+            )
+            else _detached_exec_records(incoming_records)
+        )
+        records = tuple(sorted(
+            owned_records,
+            key=lambda record: record.seq_id,
+        ))
+        self._validate_record_identities(records)
+        self._records = seal_exec_records(records, self._evidence)
+        self._log = tuple(
+            record
+            for record in self._records
+            if isinstance(record, ExecRecord)
+        )
+
+        # Retain supplied source metadata. No metadata source is an authority
+        # over the normalized Trace evidence.
+        self._pipeline_names = {
+            pipeline_id: getattr(pipeline, "name", pipeline)
+            for pipeline_id, pipeline in (pipelines or {}).items()
+        }
+        self._trace_starting_event_id = supplied_trace_start_id
+        self._pipeline_starting_event_id = supplied_pipeline_start_id
+        self._tide_plan = copy.deepcopy(tide_plan)
+        self._missing_referenced_events = {
+            event_id: tuple(referencing_event_ids)
+            for event_id, referencing_event_ids in (
+                missing_referenced_events or {}
+            ).items()
+        }
+        self._causal_order_violations = {
+            event_id: tuple(referencing_event_ids)
+            for event_id, referencing_event_ids in (
+                causal_order_violations or {}
+            ).items()
+        }
+        self._ready_exec_ids = frozenset(ready_exec_ids or ())
+        self._blocked_exec_ids = frozenset(blocked_exec_ids or ())
+        self._deadlock = copy.deepcopy(deadlock or {})
+
+        incoming_attempts = tuple(ready_attempts or ())
+        owned_attempts = (
+            incoming_attempts
+            if all(
+                getattr(attempt, "_tide_sealed", False)
+                for attempt in incoming_attempts
+            )
+            else _detached_exec_records(incoming_attempts)
+        )
+        self._ready_attempts = seal_exec_records(
+            owned_attempts,
+            self._evidence,
+        )
+        self._started_runner_ids = frozenset(started_runner_ids or ())
+        self._causal_runner_ids = frozenset(causal_runner_ids or ())
+        self._ended_runner_ids = frozenset(ended_runner_ids or ())
+        self._evidence_violations = {
+            key: tuple(values)
+            for key, values in (evidence_violations or {}).items()
+        }
+        self._selected_runner_id = selected_runner_id
+
+        # Build the execution-shaped query surface and its indexes.
+        self._execution_records = (
+            tuple(_execution_records)
+            if _execution_records is not None
+            else _project_executions(
+                self._records,
+                self._log,
+                self._ready_attempts,
+                self._evidence,
+            )
+        )
+        if _index is not None:
+            self._index = _index
+        else:
+            if _state_authorities is None:
+                state_authorities = validate_exec_record_relationships(
+                    self._execution_records,
+                    record_log=self._records,
+                    ready_attempts=self._ready_attempts,
+                )
+            else:
+                # The imported TideRun already recorded State value identity.
+                # Validate relationships without re-deriving identity from
+                # hydrated Python values.
+                validate_exec_record_relationships(
+                    self._execution_records,
+                    require_closed=_require_closed_evidence,
+                    validate_state_values=False,
+                    record_log=self._records,
+                    ready_attempts=self._ready_attempts,
+                )
+                state_authorities = dict(_state_authorities)
+
+            self._index = TraceIndex().build(
+                self._execution_records,
+                state_authorities=state_authorities,
+                value_backing=_value_backing,
+                ready_exec_ids=self._ready_exec_ids,
+                blocked_exec_ids=self._blocked_exec_ids,
+            ).seal()
+
+        # Retain import/re-export context without letting it reinterpret Trace.
+        self._from_cas = bool(from_cas)
+        self._source_bundle = _source_bundle
+        if self._source_bundle is not None and not self._from_cas:
+            raise ValueError(
+                "Only a Trace restored from a Bundle may retain a source Bundle"
+            )
+        self._bundle_context = (
+            copy.deepcopy(bundle_context)
             if isinstance(bundle_context, dict)
             else {}
         )
-        self.model_context = (
+        self._model_context = (
             copy.deepcopy(model_context)
             if isinstance(model_context, dict)
             else {}
         )
-        self.host = copy.deepcopy(
-            host
-            if host is not None
-            else self.model_context.get("host")
+        self._host = copy.deepcopy(
+            host if host is not None else self._model_context.get("host")
         )
-        self.host_record = (
-            snapshot_json_dict(host_record, location="host_record")
-            if host_record is not None
-            else None
+        self._host_record = copy.deepcopy(host_record)
+        self._divergence = copy.deepcopy(
+            self._bundle_context.get("divergence") or {}
         )
 
-        # if event_log:
-        #     if isinstance(event_log[0], ExecEvent | ExecRecord):
-        #         # for event in event_log:
-        #         #     for log in event_log:
-        #         #         for ref, read in log.reads.items():
-        #         #             self.reads.append(f"@{ref}:{read}")
-        #         # for log in event_log: 
-        #         #     for ref, write in log.writes.items():
-        #         #         self.writes.append()
-        #         # self.events = tuple(event_log)
-        #         # self.reads = tuple(f"@{ref}:{read}" for log in event_log for ref, read in log.reads.items()) 
-        #         # self.writes = tuple(f"@{ref}:{write}" for log in event_log for ref, write in log.writes.items()) # reF:val for write in writes
-        #         # self.values = tuple(value for log in event_log for value in list(log.reads.values()) + list(log.writes.values())) # val for val in [writes] + [values.items()]  
+        # Plan is a derived Trace view over captured source intent and
+        # normalized execution evidence. It is never an independent authority.
+        self._plan = self._materialise_plan()
 
-        #         self.events = tuple()
-        #         self.reads = tuple()      
-        #         self.writes = tuple()
-        #         self.values = tuple()
-        #     else:
-        #         node_ready_events = tuple(entry for entry in event_log if entry["event_type"] in [ExecutorEvents.NODE_READY])
-        #         node_write_events = tuple(entry for entry in event_log if entry["event_type"] in [RouterEvents.STORE_WRITE, RouterEvents.FORCE_WRITE])
+        # Corruption is derived only from normalized reader facts already
+        # supplied to Trace, never from replay or bundle/model authority.
+        self._corruption = copy.deepcopy(self._current_corruption())
+        self._tide_trace_sealed = True
 
-        #         self.events = tuple(event_log)
-        #         self.releases = tuple(event["payload"][0] for event in node_ready_events) 
-        #         self.writes = tuple(f"@{event['payload'][0]}:{event['payload'][1]}" for event in node_write_events) # reF:val for write in writes
-        #         self.values = tuple(event["payload"][2] for event in node_write_events) # val for val in [writes] + [values.items()]        
-        self.all_known_pipelines = all_known_pipelines if all_known_pipelines is not None else {}
-        self.all_known_runners = all_known_runners if all_known_runners is not None else {}
-        self.runner = runner
-        self.run = None
-        self.pipeline = "TIDE: UNKNOWN"
-        if hasattr(runner, "pipeline") and hasattr(runner, "id") and hasattr(runner, "index"):
-            self.run = runner.id
-            self.runner = runner
-            self.pipeline = runner.pipeline.name
-        elif isinstance(runner, (int, str)):
-            self.run = runner 
-            self.runner = runner
-            self.pipeline = "TIDE: UNKNOWN"
-        elif runner is not None:
-            raise ValueError(f"TraceInit: Runner was an invalid type {runner}")
-        
-        
+    @property
+    def name(self):
+        return self._name
 
-        self.exec_log = tuple(sorted(exec_log, key=lambda val: val.seq_id))
+    @property
+    def ocean_id(self):
+        return self._ocean_id
 
-        self._source_pipeline_names = {
-            (source.get("run"), source.get("pipeline_id")): source.get("pipeline")
-            for source in source_context or ()
-            if isinstance(source, dict) and source.get("pipeline") is not None
+    @property
+    def from_cas(self):
+        return self._from_cas
+
+    @property
+    def host(self):
+        return copy.deepcopy(self._host)
+
+    @property
+    def missing_referenced_events(self):
+        return dict(self._missing_referenced_events)
+
+    @property
+    def causal_order_violations(self):
+        return dict(self._causal_order_violations)
+
+    @property
+    def ready_exec_ids(self):
+        return self._ready_exec_ids
+
+    @property
+    def blocked_exec_ids(self):
+        return self._blocked_exec_ids
+
+    @property
+    def deadlocked(self):
+        return any(bool(waiting) for waiting in self._deadlock.values())
+
+    @property
+    def deadlock(self):
+        return copy.deepcopy(self._deadlock)
+
+    @property
+    def waiting(self):
+        return Waiting(self._deadlock)
+
+    @property
+    def scope(self):
+        return (
+            "complete"
+            if self.pipeline_ended
+            and not self.unresolved_ready_attempts
+            else "ambiguous"
+        )
+
+    @property
+    def pipeline_ended(self):
+        return (
+            self._selected_runner_id is not None
+            and self._selected_runner_id in self._ended_runner_ids
+        )
+
+    @property
+    def ready_attempts(self):
+        return self._ready_attempts
+
+    @property
+    def unresolved_ready_attempts(self):
+        return tuple(
+            attempt
+            for attempt in self._ready_attempts
+            if attempt.outcome == "ready"
+            and (
+                self._selected_runner_id is None
+                or attempt.runner_id in self._scope_runner_ids
+            )
+        )
+
+    @property
+    def _scope_runner_ids(self):
+        if self._causal_runner_ids:
+            return self._causal_runner_ids
+        if self._selected_runner_id is not None:
+            return frozenset((self._selected_runner_id,))
+        return frozenset()
+
+
+    @property
+    def events(self):
+        return self._event_log.events if self._event_log is not None else ()
+
+    @property
+    def event_log(self):
+        return self._event_log
+
+    @property
+    def events_verified(self):
+        return self._events_verified
+
+    def _boundary_event(self, event_id):
+        if event_id is None:
+            return None
+        return next(
+            (
+                event
+                for event in self.events
+                if event.event_id == event_id
+            ),
+            None,
+        )
+
+    @property
+    def trace_starting_event(self):
+        return self._boundary_event(self._trace_starting_event_id)
+
+    @property
+    def pipeline_starting_event(self):
+        return self._boundary_event(self._pipeline_starting_event_id)
+
+    @property
+    def log(self):
+        return self._records
+
+    @property
+    def pipelines(self):
+        return copy.deepcopy(self._pipeline_names)
+
+    @property
+    def bundle_context(self):
+        return copy.deepcopy(self._bundle_context)
+
+    @property
+    def divergence(self):
+        return copy.deepcopy(self._divergence)
+
+    @property
+    def divergent(self):
+        return bool(self.divergence.get("warnings"))
+
+    @property
+    def model_context(self):
+        return copy.deepcopy(self._model_context)
+
+    @property
+    def host_record(self):
+        return copy.deepcopy(self._host_record)
+
+    @property
+    def _execs(self):
+        return self._index.exec_by_exec_id
+
+    @property
+    def index(self):
+        return self._index
+
+    @property
+    def execs(self):
+        return self._index.exec_by_exec_id
+
+    @property
+    def plan(self):
+        return copy.deepcopy(self._plan)
+
+    def _derived_view(self, *, log, ocean_id=None, name=None):
+        """Construct a sealed presentation view without mutating this Trace."""
+        return Trace(
+            tuple(log),
+            pipelines=self._pipeline_names,
+            ocean_id=self.ocean_id if ocean_id is None else ocean_id,
+            name=self.name if name is None else name,
+            from_cas=self.from_cas,
+            bundle_context=self._bundle_context,
+            model_context=self._model_context,
+            host=self._host,
+            host_record=self._host_record,
+            tide_plan=self._tide_plan,
+            trace_starting_event=self.trace_starting_event,
+            pipeline_starting_event=self.pipeline_starting_event,
+            missing_referenced_events=self._missing_referenced_events,
+            causal_order_violations=self._causal_order_violations,
+            ready_exec_ids=self._ready_exec_ids,
+            blocked_exec_ids=self._blocked_exec_ids,
+            deadlock=self._deadlock,
+            ready_attempts=self._ready_attempts,
+            started_runner_ids=self._started_runner_ids,
+            causal_runner_ids=self._causal_runner_ids,
+            ended_runner_ids=self._ended_runner_ids,
+            evidence_violations=self._evidence_violations,
+            runner=self._selected_runner_id,
+            _evidence_store=self._evidence,
+        )
+
+    @staticmethod
+    def _plan_reference(reference):
+        if isinstance(reference, DataRef):
+            return DataRef.to_string(reference, prefix=False)
+        return str(reference)
+
+    @staticmethod
+    def _dynamic_plan_reads(record, declared):
+        if record is None:
+            return ()
+
+        reads = []
+        for dependency in record.deps or ():
+            if dependency.type != "dynamic" or dependency.dep != declared:
+                continue
+            for expanded in dependency.expanded_to or ():
+                if not any(
+                    read.unscoped_reference == expanded.unscoped_reference
+                    for read in reads
+                ):
+                    reads.append(expanded)
+        return tuple(reads)
+
+    @staticmethod
+    def _static_plan_read(record, declared):
+        if record is None:
+            return None
+        return next((
+            dependency
+            for dependency in record.deps or ()
+            if dependency.type != "dynamic"
+            and dependency.dep == declared
+        ), None)
+
+    def _materialise_plan(self):
+        if self._tide_plan is None:
+            return None
+
+        node_specs = list(self._tide_plan.get("nodes", ()))
+        specs_by_id = {
+            spec["definition_id"]: spec
+            for spec in node_specs
         }
+        selected_counts = defaultdict(int)
+        occurrences = []
 
-        self.pipeline_index = {}
-        for exec_record in self.exec_log:
-            pipeline_id = getattr(exec_record, "pipeline_id", None)
-            if pipeline_id is None:
+        for record in self._log:
+            spec = specs_by_id.get(record.base_node_id)
+            if spec is None:
+                continue
+            if spec["one_shot"] and selected_counts[record.base_node_id]:
+                continue
+            selected_counts[record.base_node_id] += 1
+            occurrences.append((spec, record))
+
+        used_occurrences = defaultdict(set)
+        for _, projected in occurrences:
+            occurrence = projected.producer_occurrence_id
+            if isinstance(occurrence, ActorOccurrence):
+                used_occurrences[occurrence.actor.source_actor].add(
+                    occurrence.occurrence_id
+                )
+
+        next_occurrence = {
+            actor_name: max(occurrences) + 1
+            for actor_name, occurrences in used_occurrences.items()
+            if occurrences
+        }
+        for spec in node_specs:
+            definition_id = spec["definition_id"]
+            if selected_counts[definition_id]:
                 continue
 
-            pipeline_id, pipeline_name = (
-                self._get_pipeline_named_tuple_from_id(
-                    pipeline_id,
-                    getattr(exec_record, "runner_id", None),
-                )
+            actor = Actor(
+                self.ocean_id,
+                spec["runner_id"],
+                spec["actor_name"],
             )
-            self.pipeline_index[pipeline_id] = pipeline_name
+            occurrence_id = next_occurrence.get(actor.source_actor, 0)
+            next_occurrence[actor.source_actor] = occurrence_id + 1
+            occurrences.append((
+                spec,
+                ActorOccurrence(actor, occurrence_id),
+            ))
 
-        self.execution_sources = self._build_execution_sources(source_context)
-        self.source_runs = tuple(dict.fromkeys(
-            source["run"] for source in self.execution_sources
-        ))
-        self.source_pipelines = tuple(dict.fromkeys(
-            source["pipeline"] for source in self.execution_sources
-        ))
+        external_actor = Actor(
+            self.ocean_id,
+            "TIDE: External",
+            "TIDE: External",
+        )
 
-        if len(self.source_runs) == 1:
-            self.run = self.source_runs[0]
-        elif len(self.source_runs) > 1:
-            self.run = f"MULTIPLE ({len(self.source_runs)})"
+        executions = []
+        states = []
+        inputs = []
+        outputs = []
+        seen_states = set()
+        seen_inputs = set()
+        seen_outputs = set()
+        latest_version_by_ref = {}
+        seen_executions = set()
 
-        if len(self.source_pipelines) == 1:
-            self.pipeline = self.source_pipelines[0]
-        elif len(self.source_pipelines) > 1:
-            self.pipeline = f"MULTIPLE ({len(self.source_pipelines)})"
-        
+        def add_execution(exec_id):
+            if exec_id not in seen_executions:
+                seen_executions.add(exec_id)
+                executions.append(exec_id)
 
-        self.reads = []
-        self.writes = []
-        self.values = DedupedList()
+        def external_execution(read):
+            if read is not None and read.producer_exec_id is not None:
+                producer = self._index.exec_by_exec_id.get(
+                    read.producer_exec_id
+                )
+                if (
+                    producer is not None
+                    and producer.producer_id == external_actor
+                    and isinstance(
+                        producer.producer_occurrence_id,
+                        ActorOccurrence,
+                    )
+                ):
+                    return repr(producer.producer_occurrence_id)
 
-        for exec in self.exec_log:
+            occurrence_id = next_occurrence.get(
+                external_actor.source_actor,
+                0,
+            )
+            next_occurrence[external_actor.source_actor] = occurrence_id + 1
+            return repr(ActorOccurrence(external_actor, occurrence_id))
 
-            for read in exec.deps or []:
-                if read.type == "dynamic":
-                    for expanded_read in read.expanded_to or []:
-                        self.reads.append(expanded_read)
-                        self.values.append(expanded_read.resolved_value)
+        def state_id(reference, version):
+            return f"{reference}[v{version}]"
+
+        def ensure_state(reference, version):
+            identity = state_id(reference, version)
+            created = identity not in seen_states
+            if identity not in seen_states:
+                seen_states.add(identity)
+                states.append(identity)
+            return identity, created
+
+        for spec, occurrence in occurrences:
+            if isinstance(occurrence, ActorOccurrence):
+                exec_id = repr(occurrence)
+                record = None
+            else:
+                exec_id = repr(occurrence.producer_occurrence_id)
+                record = occurrence
+            add_execution(exec_id)
+
+            for dependency in spec["dependencies"]:
+                if dependency["dynamic"]:
+                    reads = self._dynamic_plan_reads(
+                        record,
+                        dependency["declared"],
+                    )
                 else:
-                    self.reads.append(read)
-                    self.values.append(read.resolved_value)
+                    read = self._static_plan_read(
+                        record,
+                        dependency["declared"],
+                    )
+                    reads = ((
+                        read.unscoped_reference
+                        if read is not None
+                        else dependency["reference"],
+                        read,
+                    ),)
 
-            for write in exec.writes or []:
-                self.writes.append(write)
-                self.values.append(write.stored_result)
+                if dependency["dynamic"]:
+                    reads = tuple(
+                        (read.unscoped_reference, read)
+                        for read in reads
+                    )
 
+                for reference, read in reads:
+                    reference = self._plan_reference(reference)
+                    version = latest_version_by_ref.setdefault(reference, 0)
+                    identity, created = ensure_state(reference, version)
+                    if created:
+                        producer_id = external_execution(read)
+                        add_execution(producer_id)
+                        output_edge = (producer_id, identity)
+                        if output_edge not in seen_outputs:
+                            seen_outputs.add(output_edge)
+                            outputs.append({
+                                "exec_id": producer_id,
+                                "state_id": identity,
+                            })
+                    edge = (exec_id, identity)
+                    if edge not in seen_inputs:
+                        seen_inputs.add(edge)
+                        inputs.append({
+                            "exec_id": exec_id,
+                            "state_id": identity,
+                        })
 
-        self.reads = tuple(self.reads)
-        self.writes = tuple(self.writes)
-        self.values = tuple(self.values)
-        
-        index = TraceIndex(ocean_id)
-        self.index = index.build(self.exec_log)
+            for target in spec["targets"]:
+                reference = self._plan_reference(target)
+                version = latest_version_by_ref.get(reference, -1) + 1
+                latest_version_by_ref[reference] = version
+                identity, _ = ensure_state(reference, version)
+                edge = (exec_id, identity)
+                if edge not in seen_outputs:
+                    seen_outputs.add(edge)
+                    outputs.append({
+                        "exec_id": exec_id,
+                        "state_id": identity,
+                    })
 
-        # Intent is compiled only at the completed Trace boundary.
-        from tide_tooling.intent import build_trace_intent
+        plan = {
+            "E": executions,
+            "S": states,
+            "I": inputs,
+            "O": outputs,
+        }
 
-        self.intent = build_trace_intent(self, runner)
+        return plan
 
-    def to_dict(self):
-        from tide_tooling.tooling_core.bundling.TIDERunSerialiser import TIDERunSerialiser
+    def _current_corruption(self):
+        corruption = {
+            "missing_causal_events": dict(self.missing_referenced_events),
+            "causal_order_violations": dict(self.causal_order_violations),
+            "evidence_violations": dict(self._evidence_violations),
+        }
+        if self.pipeline_ended and self.unresolved_ready_attempts:
+            corruption["incomplete_executions"] = {
+                attempt.exec_id: attempt.event_id
+                for attempt in self.unresolved_ready_attempts
+            }
+        return corruption
+
+    @property
+    def corruption(self):
+        return copy.deepcopy(self._corruption)
+
+    @property
+    def corrupted(self):
+        return any(bool(details) for details in self.corruption.values())
+
+    @property
+    def reads(self):
+        return tuple(
+            read
+            for execution in self._execution_records
+            for dependency in execution.deps
+            for read in (
+                dependency.expanded_to
+                if dependency.type == "dynamic"
+                else (dependency,)
+            )
+        )
+
+    @property
+    def writes(self):
+        return tuple(
+            write
+            for execution in self._execution_records
+            for write in execution.writes
+        )
+
+    @property
+    def values(self):
+        return tuple(
+            detached_tide_value(value)
+            for value in self._index.value_by_hash.values()
+        )
+
+    @property
+    def runs(self):
+        return tuple(dict.fromkeys(
+            execution.runner_id for execution in self._execution_records
+        ))
+
+    def _sources(self):
+        return tuple(dict.fromkeys(
+            (execution.runner_id, execution.pipeline_id)
+            for execution in self._execution_records
+        ))
+
+    def to_dict(self, *, serialise_events=False):
+        """Return the Trace summary, optionally serialising retained Events."""
+        if not isinstance(serialise_events, bool):
+            raise TypeError("serialise_events must be a bool")
+
+        events = self.events
+        if serialise_events and self._event_log is not None:
+            events = self._event_log.to_event_bundle().to_dict()
 
         return {
             "type": "trace",
             "name": self.name,
             "ocean_id": self.ocean_id,
-            "run": getattr(self, "run", None),
-            "pipeline": getattr(self, "pipeline", None),
-            "sources": [dict(source) for source in self.execution_sources],
+            "sources": [
+                {
+                    "run": runner_id,
+                    "pipeline_id": pipeline_id,
+                    "pipeline": self._get_pipeline_named_tuple_from_id(
+                        pipeline_id
+                    )[1],
+                }
+                for runner_id, pipeline_id in self._sources()
+            ],
             "from_cas": self.from_cas,
-            "bundle_context": copy.deepcopy(self.bundle_context),
-            "model_context": copy.deepcopy(self.model_context),
+            "bundle_context": copy.deepcopy(self._bundle_context),
+            "model_context": copy.deepcopy(self._model_context),
             "host": copy.deepcopy(self.host),
-            "host_record": copy.deepcopy(self.host_record),
-            "value_hashes": sorted(self.index.value_by_hash),
-            "references": sorted(self.index.seen_refs),
+            "host_record": copy.deepcopy(self._host_record),
+            "events": events,
+            "value_hashes": sorted(self._index.value_by_hash),
+            "references": sorted(self._index.seen_refs),
             "ref_versions": [
                 {
                     "ref": ref,
@@ -419,69 +1062,19 @@ class Trace:
                     "value_hash": value_hash,
                 }
                 for (ref, version), value_hash in sorted(
-                    self.index.value_hash_by_ref_version.items(),
+                    self._index.value_hash_by_ref_version.items(),
                     key=repr,
                 )
             ],
-            "run_evidence": TIDERunSerialiser().serialise(self),
         }
 
-    def _build_execution_sources(self, source_context=None):
-        supplied_names = {}
-        for source in source_context or ():
-            if not isinstance(source, dict):
-                continue
-            supplied_names[(
-                source.get("run"),
-                source.get("pipeline_id"),
-            )] = source.get("pipeline")
+    def _tide_diff_evidence(self):
+        """Project only recorded, identity-scoped Trace evidence."""
+        from tide_tooling.tooling_core.bundling.TIDERunSerialiser import (
+            TIDERunSerialiser,
+        )
 
-        sources = []
-        seen = set()
-
-        for record in self.exec_log:
-            run_id = getattr(record, "runner_id", None)
-            pipeline_id = getattr(record, "pipeline_id", None)
-            source_key = (run_id, pipeline_id)
-
-            if source_key in seen:
-                continue
-
-            pipeline_name = supplied_names.get(source_key)
-            if pipeline_name is None:
-                _, pipeline_name = self._get_pipeline_named_tuple_from_id(
-                    pipeline_id
-                )
-
-            # Individual .event() records carry actor-specific pipeline IDs,
-            # but together they belong to the one public event source.
-            if (
-                run_id == "TIDE: .event()"
-                and isinstance(pipeline_name, str)
-                and pipeline_name.startswith("TIDE: .event(")
-            ):
-                pipeline_name = "TIDE: .event()"
-
-            source = {
-                "run": run_id,
-                "pipeline_id": pipeline_id,
-                "pipeline": pipeline_name,
-            }
-            sources.append(source)
-            seen.add(source_key)
-
-        # Event records may have distinct internal IDs but represent one
-        # public run/pipeline source. Collapse identical display identities.
-        collapsed = []
-        display_seen = set()
-        for source in sources:
-            display_key = (source["run"], source["pipeline"])
-            if display_key in display_seen:
-                continue
-            collapsed.append(source)
-            display_seen.add(display_key)
-
-        return tuple(collapsed)
+        return TIDERunSerialiser().evidence_claims(self)
 
     def _resolve_diff_operand(self, operand, kind=None, version=None):
         """Resolve a typed trace identifier to the object that should be diffed."""
@@ -499,13 +1092,6 @@ class Trace:
             if version is not None:
                 raise ValueError("A diff version requires a typed reference operand")
             return operand
-
-        if not self._is_valid_obj_kind(resolved_kind):
-            raise InvalidObjectKindError(
-                f"{operand} | type={resolved_kind} is not known or does not "
-                "exist in TIDE!",
-                resolved_kind,
-            )
 
         if resolved_kind in {"reference", "ref", "dep"}:
             if not isinstance(operand, str):
@@ -548,67 +1134,22 @@ class Trace:
             return [item.object for item in inspected.object]
         return inspected.object.object
 
-    def _tide_model_comparison_options(self):
-        """Return conversion options required by this Trace's model origin.
-
-        Public ``to_model()`` remains strict by default.  A Trace imported
-        through ``assign_unknown=True`` records that representational choice
-        in ``model_context`` so internal model comparisons can reconstruct the
-        same semantically valid comparison document without asking the caller to
-        repeat an already-made import decision.
-        """
-        model_context = (
-            self.model_context
-            if isinstance(self.model_context, dict)
-            else {}
-        )
-        return {
-            "assign_unknown": bool(
-                model_context.get("assigned_unknown_states")
-            ),
-        }
-
     def diff(
         self,
         source,
-        target=__TIDE_TEMPLATE_VALUE__,
+        target=__fallback__,
         source_type=None,
         target_type=None,
         source_ver=None,
         target_ver=None,
-        TIDE=True,
-        identity_mode="host",
     ):
-        """Compare traces, direct values, or typed identifiers from this trace.
-
-        ``trace.diff(other_trace)`` compares literal host-ID TIDE Models and
-        reports exact kernel and judgment-set changes. Set
-        ``identity_mode="structural"`` for deterministic occurrence aliases
-        when comparing equivalent projections with different host IDs. Pass
-        ``TIDE=False`` to retain the full trace-object/evidence diff. Two
-        operands keep the existing direct-value behaviour, while optional
-        path-style type and version arguments resolve trace references, hashes,
-        actors, executions, or effects before comparison.
-        """
-        if not isinstance(TIDE, bool):
-            raise TypeError("Trace.diff TIDE must be a bool")
-        if identity_mode == "canonical":
-            identity_mode = "structural"
-        if not isinstance(identity_mode, str):
-            raise TypeError("Trace.diff identity_mode must be a string")
-        if identity_mode not in {"host", "structural"}:
-            raise ValueError(
-                "Trace.diff identity_mode must be 'host' or 'structural'"
-            )
-        if not TIDE and identity_mode != "host":
-            raise ValueError(
-                "Trace.diff structural identity requires TIDE=True"
-            )
+        """Compare Trace evidence or two values through the ordinary diff."""
 
         target_omitted = (
             isinstance(target, type)
-            and issubclass(target, __TIDE_TEMPLATE_VALUE__)
-        ) or isinstance(target, __TIDE_TEMPLATE_VALUE__)
+            and issubclass(target, __fallback__)
+        ) or isinstance(target, __fallback__)
+
         if target_omitted:
             if any(
                 option is not None
@@ -621,12 +1162,6 @@ class Trace:
             ):
                 raise TypeError(
                     "Typed Trace.diff needs both a source and a target"
-                )
-            if TIDE and _is_tide_model_operand(source):
-                return _build_tide_model_compared(
-                    self,
-                    source,
-                    identity_mode=identity_mode,
                 )
             return _build_compared(self, source)
 
@@ -642,492 +1177,126 @@ class Trace:
         )
         return _build_compared(resolved_source, resolved_target)
 
-    def comparator(self, target, *, execution_map, state_map):
-        """Compare this Trace under explicit Execution and State maps."""
-        from tide_tooling.comparator import comparator
+    def compare(
+        self,
+        other,
+        *,
+        mapping="structural",
+        execution_map=None,
+        state_map=None,
+        represent_unknown_producers=False,
+    ):
+        if not isinstance(represent_unknown_producers, bool):
+            raise TypeError("represent_unknown_producers must be a bool")
 
-        return comparator(
-            self,
+        source = self.to_model(enrich=False)
+        target = (
+            other.to_model(enrich=False)
+            if isinstance(other, Trace)
+            else copy.deepcopy(other)
+        )
+
+        if represent_unknown_producers:
+            from tide_tooling.tooling_core.engine.tide_model import TIDEModel
+
+            source, _ = TIDEModel._assign_external_producer(
+                TIDEModel.normalise(source)
+            )
+            target, _ = TIDEModel._assign_external_producer(
+                TIDEModel.normalise(target)
+            )
+
+        from tide_tooling.comparator import (
+            _compare_tide_models,
+            _prepare_tide_comparison,
+        )
+
+        source, target, execution_map, state_map = (
+            _prepare_tide_comparison(
+                source,
+                target,
+                mapping=mapping,
+                execution_map=execution_map,
+                state_map=state_map,
+            )
+        )
+
+        return _compare_tide_models(
+            source,
             target,
+            mapping=mapping,
             execution_map=execution_map,
             state_map=state_map,
         )
 
+    def _trace_for_exec(self, exec_id):
+        record = self._index.exec_by_exec_id[exec_id]
+        # A focused execution retains its exact recorded emission subtree.
+        # Dropping those descendants would leave the emitter claiming that
+        # nodes which did execute had zero executions in the derived Trace.
+        exec_ids = {exec_id}
+        pending = [exec_id]
+        while pending:
+            parent_exec_id = pending.pop()
+            for child_exec_id in self._index.child_exec_ids_by_exec_id.get(
+                parent_exec_id,
+                (),
+            ):
+                if child_exec_id in exec_ids:
+                    continue
+                exec_ids.add(child_exec_id)
+                pending.append(child_exec_id)
+        records = [
+            candidate
+            for candidate in self._execution_records
+            if candidate.exec_id in exec_ids
+        ]
+        # A focused execution view is derived evidence, not a second
+        # Event-authoritative run scope. Imported evidence stays imported, but
+        # the focused view has no exact source Bundle to re-export.
+        return Trace(
+            records,
+            pipelines=self._pipeline_names,
+            runner=record.runner_id,
+            ocean_id=self.ocean_id,
+            from_cas=self.from_cas,
+            name=f"{self.name}: {record.func_name}",
+            host=self.host,
+            host_record=self._host_record,
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def to_model(
         self,
         *,
-        host=None,
-        include_metadata=False,
-        include_values=False,
-        include_hashes=True,
+        override_host_as=None,
+        enrich=True,
         incidence_format="explicit",
-        identity_mode="host",
-        assign_unknown=False,
+        identity_mode="literal",
     ):
-        """Export the interoperable ``K = (E, S, I, O)`` projection.
+        """Project this Trace as a TIDE Model."""
+        from tide_tooling.tooling_core.engine.tide_model import TIDEModel
 
-        TIDE references and versions remain an internal Trace detail. Each
-        exact internal State is assigned one opaque ``state_id``; state IDs
-        imported by :meth:`TIDE.from_model` are preserved. Incidence can be
-        emitted as explicit dictionaries, compact ``{e, s}`` dictionaries,
-        or JSON-compatible ordered pairs. ``identity_mode="structural"`` is
-        an explicit comparison view that canonically relabels the typed
-        incidence structure and excludes values and enrichment; the default
-        ``"host"`` export stays literal. Export is strict about represented
-        producers by default. ``assign_unknown=True`` warns and maps TIDE's
-        internal unknown observations to one tool-side ``unknown`` Execution.
-        """
-        for option_name, option in {
-            "include_metadata": include_metadata,
-            "include_values": include_values,
-            "include_hashes": include_hashes,
-            "assign_unknown": assign_unknown,
-        }.items():
-            if not isinstance(option, bool):
-                raise TypeError(f"{option_name} must be a bool")
-
-        if host is not None and (
-            not isinstance(host, str) or not host.strip()
-        ):
-            raise ValueError("host must be a non-empty string")
-
-        if not isinstance(incidence_format, str):
-            raise TypeError("incidence_format must be a string")
-        if incidence_format not in {"explicit", "compact", "pairs"}:
-            raise ValueError(
-                "incidence_format must be 'explicit', 'compact', or 'pairs'"
-            )
-
-        if identity_mode == "canonical":
-            identity_mode = "structural"
-        if not isinstance(identity_mode, str):
-            raise TypeError("identity_mode must be a string")
-        if identity_mode not in {"host", "structural"}:
-            raise ValueError(
-                "identity_mode must be 'host' or 'structural'"
-            )
-
-        model_context = (
-            self.model_context
-            if isinstance(self.model_context, dict)
-            else {}
+        return TIDEModel.from_trace(
+            self,
+            override_host_as=override_host_as,
+            enrich=enrich,
+            incidence_format=incidence_format,
+            identity_mode=identity_mode,
         )
-        is_model_projection = (
-            model_context.get("schema") == "TIDE-Model"
-        )
-        selected_host = host
-        if selected_host is None:
-            selected_host = model_context.get("host") or "TIDE"
 
-        def reference_string(reference):
-            if isinstance(reference, DataRef):
-                return DataRef.to_string(reference, strip_leading=True)
-            if isinstance(reference, str):
-                return reference
-            raise TypeError(
-                f"Trace contains an unsupported State reference: {reference!r}"
-            )
-
-        records = list(self.exec_log)
-
-        def is_unknown_producer_record(record):
-            node_options = (
-                record.node_options
-                if isinstance(record.node_options, dict)
-                else {}
-            )
-            if node_options.get("source") == "tide_model_boundary":
-                return True
-            if node_options.get("assigned_unknown") is True:
-                return True
-
-            actor = getattr(record, "producer_id", None)
-            actor_name = getattr(actor, "source_actor", None)
-            actor_source = getattr(actor, "source_runner", None)
-            causes = {
-                getattr(write, "cause", None)
-                for write in record.writes or ()
-            }
-            if actor_name == "unknown" and actor_source == "unknown":
-                return True
-            return (
-                actor_name in {"TIDE", "TIDE: Polling"}
-                and bool(causes)
-                and causes <= {
-                    "TIDE: observed value",
-                    "TIDE: user declared value",
-                    "TIDE: Pre-runtime Polling",
-                    "TIDE: Emitted Node Polling",
-                }
-            )
-
-        unknown_records = {
-            id(record)
-            for record in records
-            if is_unknown_producer_record(record)
-        }
-        model_records = [
-            record
-            for record in records
-            if assign_unknown or id(record) not in unknown_records
-        ]
-        model_exec_id_by_trace_id = {}
-        execution_enrichments = {}
-        context_exec_enrichments = {
-            entry["exec_id"]: copy.deepcopy(entry.get("metadata", {}))
-            for entry in model_context.get("execution_enrichment", ())
-            if isinstance(entry, dict) and "exec_id" in entry
-        }
-        for record in model_records:
-            node_options = (
-                record.node_options
-                if isinstance(record.node_options, dict)
-                else {}
-            )
-            unknown_producer = id(record) in unknown_records
-            host_exec_id = (
-                "unknown"
-                if unknown_producer
-                else node_options.get(
-                    "model_exec_id",
-                    record.exec_id,
-                )
-            )
-            exec_id = host_exec_id
-            model_exec_id_by_trace_id[record.exec_id] = exec_id
-
-            if include_metadata and not unknown_producer:
-                if host_exec_id in context_exec_enrichments:
-                    enrichment = context_exec_enrichments[host_exec_id]
-                elif is_model_projection:
-                    # Generated Trace actors and internal IDs make an
-                    # imported model inspectable, but they are not evidence
-                    # supplied by that model and must not leak back out as
-                    # enrichment.
-                    enrichment = {}
-                else:
-                    enrichment = {}
-                    actor = getattr(record, "producer_id", None)
-                    if actor is not None:
-                        enrichment["actor"] = {
-                            "name": actor.source_actor,
-                            "source": actor.source_runner,
-                            "ocean": actor.source_ocean,
-                        }
-                    for output_name, attribute_name in (
-                        ("start", "started_at"),
-                        ("end", "finished_at"),
-                        ("time", "duration_ms"),
-                        ("status", "status"),
-                        ("error", "error"),
-                        ("pipeline_id", "pipeline_id"),
-                        ("node_id", "node_id"),
-                    ):
-                        value = getattr(record, attribute_name, None)
-                        if value is not None:
-                            enrichment[output_name] = (
-                                repr(value)
-                                if output_name == "error"
-                                else value
-                            )
-                if enrichment:
-                    execution_enrichments[exec_id] = enrichment
-
-        state_id_by_internal = {}
-        state_order = list(
-            model_context.get(
-                "state_ids",
-                model_context.get("S", ()),
-            )
-        )
-        context_state_by_id = {
-            entry["state_id"]: {
-                key: value
-                for key, value in entry.items()
-                if key != "state_id"
-            }
-            for entry in model_context.get("state_enrichment", ())
-            if isinstance(entry, dict) and "state_id" in entry
-        }
-
-        context_state_by_projected_id = {}
-        for projection in model_context.get("state_projection", ()):
-            if not isinstance(projection, dict):
-                continue
-            if not {
-                "state_id",
-                "reference",
-                "version",
-            }.issubset(projection):
-                continue
-            internal_id = (
-                projection["reference"],
-                projection["version"],
-            )
-            host_state_id = projection["state_id"]
-            state_id = host_state_id
-            state_id_by_internal[internal_id] = state_id
-            context_state_by_projected_id[state_id] = (
-                context_state_by_id.get(host_state_id, {})
-            )
-
-        value_by_internal = {}
-
-        def state_id_for(reference, version, value):
-            reference = reference_string(reference)
-            internal_id = (reference, version)
-            if internal_id not in state_id_by_internal:
-                state_id = f"state_{len(state_order)}"
-                state_id_by_internal[internal_id] = state_id
-                state_order.append(state_id)
-            if value is not None and not isinstance(
-                value,
-                __TIDE_TEMPLATE_VALUE__,
-            ):
-                value_by_internal.setdefault(internal_id, value)
-            return state_id_by_internal[internal_id], internal_id
-
-        seen_inputs = set()
-        seen_outputs = set()
-        tool_unknown_states = []
-
-        for record in records:
-            if id(record) in unknown_records and not assign_unknown:
-                for write in record.writes or ():
-                    state_id, _ = state_id_for(
-                        write.stored_target,
-                        write.stored_version,
-                        write.stored_result,
-                    )
-                    tool_unknown_states.append(state_id)
-                continue
-
-            exec_id = model_exec_id_by_trace_id[record.exec_id]
-            for dependency in record.deps or ():
-                if getattr(dependency, "type", None) == "dynamic":
-                    resolved_dependencies = dependency.expanded_to or ()
-                else:
-                    resolved_dependencies = (dependency,)
-                for resolved in resolved_dependencies:
-                    state_id, _ = state_id_for(
-                        resolved.unscoped_reference,
-                        resolved.resolved_version,
-                        resolved.resolved_value,
-                    )
-                    edge = (exec_id, state_id)
-                    seen_inputs.add(edge)
-
-            for write in record.writes or ():
-                state_id, _ = state_id_for(
-                    write.stored_target,
-                    write.stored_version,
-                    write.stored_result,
-                )
-                if id(record) in unknown_records:
-                    tool_unknown_states.append(state_id)
-                edge = (exec_id, state_id)
-                seen_outputs.add(edge)
-
-        inputs = [
-            _tide_incidence_entry(exec_id, state_id, incidence_format)
-            for exec_id, state_id in sorted(
-                seen_inputs,
-                key=_tide_incidence_sort_key,
-            )
-        ]
-        outputs = [
-            _tide_incidence_entry(exec_id, state_id, incidence_format)
-            for exec_id, state_id in sorted(
-                seen_outputs,
-                key=_tide_incidence_sort_key,
-            )
-        ]
-
-        state_enrichments = {}
-        internal_by_state_id = {
-            state_id: internal_id
-            for internal_id, state_id in state_id_by_internal.items()
-        }
-        for state_id in state_order:
-            enrichment = {}
-            context_state = context_state_by_projected_id.get(
-                state_id,
-                context_state_by_id.get(state_id, {}),
-            )
-            internal_id = internal_by_state_id.get(state_id)
-            if (
-                include_metadata
-                and internal_id is not None
-                and not is_model_projection
-            ):
-                enrichment["reference"] = internal_id[0]
-                enrichment["version"] = internal_id[1]
-            value = (
-                value_by_internal.get(internal_id)
-                if internal_id is not None
-                else None
-            )
-
-            if include_hashes:
-                value_hash = context_state.get("value_hash")
-                if (
-                    value is not None
-                    and not is_model_projection
-                    and not context_state
-                ):
-                    value_hash = tide_value_hasher(value)
-                if value_hash is not None:
-                    enrichment["value_hash"] = value_hash
-
-            if include_values and value is not None:
-                from tide_tooling.tooling_core.bundling.TIDEOpaqueValue import TIDEOpaqueValue
-
-                if not isinstance(value, TIDEOpaqueValue):
-                    enrichment["value"] = copy.deepcopy(value)
-            if enrichment:
-                state_enrichments[state_id] = enrichment
-
-        execution_ids = sorted(
-            {
-                model_exec_id_by_trace_id[record.exec_id]
-                for record in model_records
-            },
-            key=lambda value: (type(value).__name__, repr(value)),
-        )
-        state_ids = list(dict.fromkeys(state_order))
-        represented_exec_ids = {
-            (type(exec_id), exec_id)
-            for exec_id in execution_ids
-        }
-        represented_state_ids = {
-            (type(state_id), state_id)
-            for state_id in state_ids
-        }
-        execution_enrichments = {
-            exec_id: enrichment
-            for exec_id, enrichment in execution_enrichments.items()
-            if (type(exec_id), exec_id) in represented_exec_ids
-        }
-        state_enrichments = {
-            state_id: enrichment
-            for state_id, enrichment in state_enrichments.items()
-            if (type(state_id), state_id) in represented_state_ids
-        }
-
-        model = {
-            "schema": "TIDE-Model",
-            "schema_version": 1,
-            "host": selected_host,
-            "E": execution_ids,
-            "S": state_ids,
-            "I": inputs,
-            "O": outputs,
-        }
-        if execution_enrichments:
-            model["executions"] = execution_enrichments
-        if state_enrichments:
-            model["states"] = state_enrichments
-        host_record = getattr(self, "host_record", None)
-        if host_record is not None:
-            model["host_record"] = copy.deepcopy(host_record)
-
-        from tide_tooling.core import TIDE
-
-        report = TIDE.validate_model(model)
-        if assign_unknown:
-            output_state_keys = set()
-            for edge in outputs:
-                if isinstance(edge, dict):
-                    state_id = edge.get("state_id", edge.get("s"))
-                else:
-                    state_id = edge[1]
-                output_state_keys.add((type(state_id), state_id))
-            missing_states = [
-                state_id
-                for state_id in {
-                    edge[1]
-                    for edge in _tide_incidence_set(inputs)
-                    | _tide_incidence_set(outputs)
-                }
-                if (type(state_id), state_id) not in output_state_keys
-            ]
-            if missing_states:
-                if "unknown" not in model["E"]:
-                    model["E"].append("unknown")
-                    model["E"].sort(
-                        key=lambda value: (type(value).__name__, repr(value))
-                    )
-                for state_id in sorted(
-                    missing_states,
-                    key=lambda value: (type(value).__name__, repr(value)),
-                ):
-                    outputs.append(
-                        _tide_incidence_entry(
-                            "unknown",
-                            state_id,
-                            incidence_format,
-                        )
-                    )
-                tool_unknown_states.extend(missing_states)
-                outputs = [
-                    _tide_incidence_entry(
-                        exec_id,
-                        state_id,
-                        incidence_format,
-                    )
-                    for exec_id, state_id in sorted(
-                        _tide_incidence_set(outputs),
-                        key=_tide_incidence_sort_key,
-                    )
-                ]
-                model["O"] = outputs
-                report = TIDE.validate_model(model)
-
-            if tool_unknown_states:
-                seen_warning_states = []
-                seen_warning_keys = set()
-                for state_id in tool_unknown_states:
-                    key = (type(state_id), state_id)
-                    if key not in seen_warning_keys:
-                        seen_warning_keys.add(key)
-                        seen_warning_states.append(state_id)
-                warnings.warn(
-                    "Trace States have no host-identified producer: "
-                    + ", ".join(repr(state) for state in seen_warning_states)
-                    + ". assign_unknown=True emitted the tool-side "
-                    "Execution 'unknown'; this does not establish host "
-                    "provenance.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        if not report["semantically_valid"]:
-            suggestion = (
-                "; pass assign_unknown=True only if a tool-side unknown "
-                "producer is acceptable"
-                if any(
-                    "has no represented producer" in error
-                    for error in report["errors"]
-                )
-                else ""
-            )
-            raise ValueError(
-                "Trace cannot be exported as a semantically valid TIDE Model: "
-                + "; ".join(report["errors"])
-                + suggestion
-            )
-
-        if identity_mode == "structural":
-            model = _canonical_tide_structure(
-                model,
-                incidence_format=incidence_format,
-            )
-            report = TIDE.validate_model(model)
-            if not report["semantically_valid"]:
-                raise ValueError(
-                    "Trace structural export is not a semantically valid TIDE Model: "
-                    + "; ".join(report["errors"])
-                )
-        return model
 
     def to_bundle(
         self,
@@ -1136,22 +1305,76 @@ class Trace:
         type=None,
         kind=None,
         path=None,
+        serialise_events=False,
+        verify_events=True,
+        sign=None,
     ):
-        """Create, and optionally export, a portable trace bundle.
+        """Create or re-export a portable Trace Bundle.
 
-        With no export options this returns a ``TIDEBundle`` as before.
-        Supplying ``type``, ``kind`` or ``path`` forwards the completed bundle
-        through ``TIDEBundle.export`` and returns that export result.
+        A live Trace is serialised once into TideRun + CAS.
+
+        A restored Trace never passes reconstructed values back through the
+        serializer. It re-exports the exact source TIDEBundle retained during
+        import. Export options (``type``, ``kind`` and ``path``) remain valid,
+        but serialization options cannot rewrite imported evidence.
         """
         from tide_tooling.tooling_core.bundling.TIDEBundle import TIDEBundle
         from tide_tooling.tooling_core.bundling.TIDEBundler import TIDEBundler
 
-        bundler = TIDEBundler(unsupported=unsupported)
-        bundle = TIDEBundle.from_trace(
-            self,
-            handle=handle,
-            bundler=bundler,
-        )
+        if not isinstance(serialise_events, bool):
+            raise TypeError("serialise_events must be a bool")
+        if not isinstance(verify_events, bool):
+            raise TypeError("verify_events must be a bool")
+
+        if self.from_cas:
+            bundle = self._source_bundle
+
+            if bundle is None:
+                raise RuntimeError(
+                    "This Trace contains imported Bundle evidence but no exact "
+                    "source Bundle is retained. TIDE will not reserialise "
+                    "imported evidence."
+                )
+
+            if not isinstance(bundle, TIDEBundle):
+                raise TypeError(
+                    "Restored Trace source Bundle must be a TIDEBundle"
+                )
+
+            if handle is not None:
+                raise ValueError(
+                    "A restored Trace cannot change Bundle metadata during "
+                    "to_bundle(); it may only re-export its source Bundle."
+                )
+
+            if unsupported != "opaque":
+                raise ValueError(
+                    "unsupported= is a live-serialization option and cannot "
+                    "be applied to a restored Trace."
+                )
+
+            if serialise_events and bundle.manifest.get("events") is None:
+                raise ValueError(
+                    "The source Bundle did not retain Event evidence; a "
+                    "restored Trace cannot create a new Event sidecar."
+                )
+
+            # False does not strip an Event sidecar already in the source.
+            # Re-export means preserving the imported envelope exactly.
+        else:
+            bundler = TIDEBundler(
+                unsupported=unsupported,
+                verify_events=verify_events,
+            )
+            bundle = TIDEBundle.from_trace(
+                self,
+                handle=handle,
+                bundler=bundler,
+                serialise_events=serialise_events,
+            )
+
+        if sign is not None:
+            bundle = bundle.sign(sign)
 
         if type is None and kind is None and path is None:
             return bundle
@@ -1169,297 +1392,586 @@ class Trace:
     @staticmethod
     def _is_val_hash(hash):
         return isinstance(hash, str) and hash.startswith("sha3_512_tide:")
+
     @staticmethod
-    def _is_valid_exec_uuid(uuid):
-        return _is_tide_exec_uuid(uuid)
+    def _split_state_identity(value, version):
+        if not isinstance(value, str) or not value.endswith("]"):
+            return value, version
 
-    def _pattern_match_references(self, reference_candidate):
-        refs = DedupedList()
-        
-        
+        reference, marker, suffix = value.rpartition("[v")
+        if not marker or not suffix[:-1].isdigit():
+            return value, version
 
-        if ":" not in reference_candidate:
-            seen_refs = DedupedList()
-            seen_stores = DedupedList()
-            for ref in self.index.seen_refs:
-                store, key = ref.split(":", 1)
-                seen_refs.append(key)
-                seen_stores.append(store)
-            
-            seen_refs = [ref.split(":", 1)[1] for ref in self.index.seen_refs]
+        identity_version = int(suffix[:-1])
+        if version is not None and version != identity_version:
+            raise ValueError("Supplied version conflicts with the State identity")
+        return reference, identity_version
 
-            for idx, ref in enumerate(seen_refs):
-                if self._pattern_match(ref, reference_candidate):
-                    found_ref = self.index.seen_refs[idx]
-                    refs.add(found_ref)
-        else:
-            seen_refs = self.index.seen_refs
-        
-            for ref in seen_refs:
-                if self._pattern_match(ref, reference_candidate):
-                    refs.add(ref)
-        return refs
+    @staticmethod
+    def _split_actor_occurrence(value, version):
+        if not isinstance(value, str) or not value.endswith("]"):
+            return value, version
 
-    def _pattern_match_func_names(self, func_name_candidate):
-        names = DedupedList()
-        for name in self.index.func_name_to_actors.keys():
-            if self._pattern_match(name, func_name_candidate):
-                names.add(name)
-        return names
-    
+        actor, marker, suffix = value.rpartition("[")
+        if not marker or not suffix[:-1].isdigit():
+            return value, version
+
+        occurrence = int(suffix[:-1])
+        if version is not None and version != occurrence:
+            raise ValueError("Supplied version conflicts with the Actor occurrence")
+        return actor, occurrence
+
     def _pattern_match(self, ref, pattern):
         import fnmatch
         return fnmatch.fnmatch(ref, f"*{pattern}*")
 
-    def find(self, value: Any, version=None) -> Searched:
-        # take an object
-        # find what it is. 
-        # find candidates
-        # inspect candidates,
-        # fill Searched object for each matching candidate
-        # fill SearchResult with SearchResult.found = [Searched, ]
-        
-        
-        handled_refs = set()
-        handled_actors = set()
-        ref_matches  = list()
-        actor_matches= list()
-        exec_matches = list()
-        value_matches= list()
-        effect_matches=list()
+    def find(self, value, version=None):
+        value, version = self._split_state_identity(value, version)
+        actor_value, actor_version = self._split_actor_occurrence(value, version)
+        if actor_value not in self._index.func_name_to_actors:
+            actor_value, actor_version = value, version
+        execs = DedupedList()
+        actors, refs, effects, values = [], [], [], []
+        nearby_actors, nearby_refs, nearby_execs = [], [], []
 
-        close_ref_matches= list()
-        close_actor_matches =list()
+        # An exact execution identity is always a find match.
+        try:
+            if value in self._execs:
+                execs.add(self.inspect(value, "exec_record"))
+        except TypeError:
+            pass
 
-        # VALUE MATCH
-        # inspected = self.inspect_value(value, "value")
-        # if inspected.history and inspected.object.id not in value_matches:
-        #     value_matches.append(inspected)
-
-        # EXEC UUID MATCH | VALUE HASH MATCH | REFERENCE MATCH | ACTOR MATCH
         if isinstance(value, str):
-            # EXEC UUID MATCH
-            if self._is_valid_exec_uuid(value):
-                if self.index.exec_by_exec_id.get(value, []):
-                    exec_matches.append(self.inspect(value, "exec_record"))
+            if value in self._index.value_by_hash:
+                values.append(self.inspect(value, "hash"))
+
+            if value in self._index.seen_refs:
+                inspected = self.inspect(value, "reference", version)
+                if version is None or version in inspected.history:
+                    refs.append(inspected)
+
+            for reference in self._index.seen_refs:
+                candidate = (
+                    reference
+                    if ":" in value
+                    else reference.split(":", 1)[-1]
+                )
+                if reference != value and self._pattern_match(candidate, value):
+                    inspected = self.inspect(reference, "reference", version)
+                    if version is None or version in inspected.history:
+                        nearby_refs.append(inspected)
+
             
-            # VALUE HASH MATCH
-            if self._is_val_hash(value) and value not in value_matches:
-                value_matches.append(self.inspect(value, "hash"))
+            for name, matched_actors in self._index.func_name_to_actors.items():
+                if isinstance(name, str) and self._pattern_match(name, actor_value):
+                    for actor in matched_actors:
+                        inspected = self.inspect(actor, "actor", version=actor_version)
+                        if inspected.exists:
+                            nearby_actors.append(inspected)
 
-            # REFERENCE MATCH
-            if value in self.index.seen_refs and value not in ref_matches:
-                if value not in handled_refs:    
-                    inspected_ref = self.inspect(value, "reference")
-                    if version is None:
-                        handled_refs.add(value)
-                        ref_matches.append(inspected_ref)
-                    else: 
-                        if version in inspected_ref.history:
-                            inspected_ref = self.inspect(value, "reference", version)
-                            handled_refs.add(value)
-                            ref_matches.append(inspected_ref)
+            # Function-name matches retain their exact execution occurrences.
+            nearby_execs.extend(
+                self.inspect(execution.exec_id, "exec_record")
+                for execution in self._execution_records
+                if isinstance(execution.func_name, str)
+                and self._pattern_match(execution.func_name, value)
+            )
 
-                    
-            
-            
-            # PATTERN MATCH REFERENCE RELATIVES
-            if not isinstance(self.runner, (int, str)):
-                stores = self.runner.store_router.registry.__seen_stores__
-            else:
-                stores = ["global", "__tide__", "__unnamed__"]
-            for store in stores:
-                candidate = f"{store}:{value}"
-                if candidate in self.index.seen_refs:
-                    if candidate not in handled_refs:
-                        
-                        inspected_ref = self.inspect(candidate, "reference")
-                        
-                        if version is not None: 
-                            if version not in inspected_ref.history:
-                                pass
-                            else:
-                                inspected_ref = self.inspect(candidate, "reference", version)
-                                                
-                        handled_refs.add(candidate)
-                        close_ref_matches.append(inspected_ref)
+        if isinstance(value, Actor) or (
+            isinstance(value, tuple) and len(value) == 3
+        ):
+            actor = value if isinstance(value, Actor) else Actor(*value)
+            if actor in self._index.actor_to_exec_ids:
+                actors.append(self.inspect(actor, "actor", version=version))
 
-            for ref in self._pattern_match_references(value):
-                if ref not in handled_refs:
-                    inspected_ref = self.inspect(ref, "reference")
-                    if version is not None: 
-                        if version not in inspected_ref.history:
-                            pass
-                        else:
-                            inspected_ref = self.inspect(ref, "reference", version)
-
-                    handled_refs.add(ref)
-                    close_ref_matches.append(inspected_ref)
-
-            # ACTOR NAME MATCHES ARE NEARBY, NOT EXACT
-            if value in self.index.func_name_to_actors:
-                for actor in self.index.func_name_to_actors.get(value, []):
-                    if actor in handled_actors:
-                        continue
-
-                    handled_actors.add(actor)   
-                    close_actor_matches.append(
-                        self.inspect(actor, "actor")
-                    )
-
-            # PATTERN MATCH ACTOR RELATIVES
-            for name in self._pattern_match_func_names(value):
-                for actor in self.index.func_name_to_actors.get(name, []):
-                    if actor in handled_actors:
-                        continue
-
-                    handled_actors.add(actor)
-                    close_actor_matches.append(
-                        self.inspect(actor, "actor")
-                    )
                 
 
-        # ACTOR MATCH
-        if isinstance(value, tuple) and len(value) == 3 or isinstance(value, Actor): 
-            if not isinstance(value, Actor):
-                actor = Actor(*value)
-            else:
-                actor = value
-            if actor in self.index.actor_to_exec_ids and actor not in actor_matches:
-                actor_matches.append(self.inspect(actor, "actor"))
-
-        # EXEC SEQ_ID MATCH                
         if isinstance(value, int):
+            execution = next(
+                (record for record in self._execution_records if record.seq_id == value),
+                None,
+            )
+            if execution is not None:
+                execs.add(self.inspect(execution.exec_id, "exec_record"))
 
-            if value < len(self.exec_log):
-                match = self.exec_log[value]
-                if match.exec_id not in exec_matches:
-                    exec_matches.append(self.inspect(match.exec_id, "exec_record"))
-        
-        # EFFECT MATCHES
         if isinstance(value, Effects):
-            inspected_effect = self.inspect(value, "effect")
-            if inspected_effect.exists:
-                effect_matches.append(inspected_effect)
+            inspected = self.inspect(value, "effect")
+            if inspected.exists:
+                effects.append(inspected)
         elif isinstance(value, tuple) and len(value) == 2:
-            inspected_effect = self.inspect(value, "effect", version)
-            if inspected_effect.exists:
-                effect_matches.append(inspected_effect)
+            inspected = self.inspect(value, "effect", version)
+            if inspected.exists:
+                effects.append(inspected)
 
-        nearby = Nearby(value, close_actor_matches, close_ref_matches)
-        searched =Searched(self.inspect, value, exec_matches, actor_matches, ref_matches, effect_matches, value_matches, nearby) 
-        return searched
+        nearby = Nearby(
+            value,
+            DedupedList(nearby_actors),
+            DedupedList(nearby_refs),
+            DedupedList(nearby_execs),
+        )
+        return Searched(value, execs, actors, refs, effects, values, nearby)
 
-    def value_of(self, reference_or_hash, version=None, show=False):
-        if isinstance(reference_or_hash, Inspected):
-            if reference_or_hash.type != "reference":
-                raise TypeError(
-                    "TIDE value lookup needs an inspected reference, "
-                    "reference string or value hash"
-                )
+    def _execution_for(self, identifier):
+        try:
+            execution = self._execs.get(identifier)
+        except TypeError:
+            execution = None
 
-            inspected_version = reference_or_hash.version
+        if execution is not None:
+            return execution
+
+        if isinstance(identifier, int) and not isinstance(identifier, bool):
+            execution = next((record for record in self._execution_records if record.seq_id == identifier), None)
+        elif isinstance(identifier, str):
+            execution = None
+        else:
+            raise TypeError("Execution identity must be a seq_id or exec_id")
+
+        if execution is None:
+            raise KeyError(f"Execution {identifier!r} was not found")
+
+        return execution
+
+    def inputs_outputs_of(self, identifier):
+        return ExecValues(self._execution_for(identifier))
+
+    def inputs_of(self, identifier):
+        values = self.inputs_outputs_of(identifier)
+        values.view = "inputs"
+        return values
+
+    def output_of(self, identifier):
+        values = self.inputs_outputs_of(identifier)
+        values.view = "output"
+        return values
+
+    @staticmethod
+    def _definition_inputs(record):
+        records = (
+            dict(record.inputs.items())
+            if hasattr(record.inputs, "items")
+            else {}
+        )
+        required = Definition.INPUT_NAMES
+        if not set(required).issubset(records):
+            raise RuntimeError(
+                "Recorded Node definition is missing declared input slots"
+            )
+        return {
+            name: records[name].raw
+            for name in required
+        }
+
+    @staticmethod
+    def _definition_options(record):
+        retained = getattr(record, "node_options", {}) or {}
+        return {
+            name: retained[name]
+            for name in (
+                "force_update",
+                "one_shot",
+                "unpack",
+                "share_implicit_target",
+            )
+            if name in retained
+        }
+
+    @staticmethod
+    def _definition_field(record, name):
+        if name == "definition_id":
+            return getattr(
+                record,
+                "base_node_id",
+                getattr(record, "base_node", None),
+            )
+        if name == "inputs":
+            return Trace._definition_inputs(record)
+        if name == "options":
+            return Trace._definition_options(record)
+        return getattr(record, name)
+
+    def definition_of(self, identifier):
+        """Return the exact retained definition for an execution or ID."""
+        execution = None
+        try:
+            execution = self._execution_for(identifier)
+        except KeyError:
+            if not isinstance(identifier, str):
+                raise
+
+        definition_id = (
+            execution.base_node_id
+            if execution is not None
+            else identifier
+        )
+        if definition_id is None:
+            raise KeyError(
+                f"Execution {identifier!r} has no recorded Node definition"
+            )
+
+        executions = tuple(
+            record
+            for record in self._execution_records
+            if record.base_node_id == definition_id
+        )
+        emitted = tuple(
+            node
+            for record in self._execution_records
+            for node in record.emitted_nodes
+            if node.base_node == definition_id
+        )
+        emitted_by_exec_ids = {
+            node.emitted_by_exec_id
+            for node in emitted
+        }
+        origins = {node.origin for node in emitted}
+        if len(emitted_by_exec_ids) > 1 or len(origins) > 1:
+            raise RuntimeError(
+                "Conflicting registration evidence for Node definition: "
+                f"{definition_id!r}"
+            )
+        authorities = (*emitted, *executions)
+        if not authorities:
+            raise KeyError(
+                f"Node definition {definition_id!r} was not found"
+            )
+
+        authority = authorities[0]
+        field_names = (
+            "base_node_content_id",
+            "func_name",
+            "inputs",
+            "declared_deps",
+            "declared_targets",
+            "declared_effects",
+            "options",
+        )
+        for other in authorities[1:]:
+            for field_name in field_names:
+                expected = self._definition_field(authority, field_name)
+                actual = self._definition_field(other, field_name)
+                if not safe_equal(expected, actual):
+                    raise RuntimeError(
+                        "Conflicting retained evidence for Node definition "
+                        f"{definition_id!r}: {field_name} disagrees"
+                    )
+
+        sources = []
+        for record in authorities:
+            source = {
+                "ocean_id": getattr(
+                    record,
+                    "source_ocean_id",
+                    getattr(record, "ocean_id", None),
+                ),
+                "runner_id": record.runner_id,
+                "pipeline_id": record.pipeline_id,
+            }
+            if source not in sources:
+                sources.append(source)
+
+        return Definition(
+            definition_id=definition_id,
+            content_id=authority.base_node_content_id,
+            name=authority.func_name,
+            sources=sources,
+            inputs=self._definition_inputs(authority),
+            declared_deps=authority.declared_deps,
+            declared_targets=authority.declared_targets,
+            declared_effects=authority.declared_effects,
+            node_options=self._definition_options(authority),
+            emitted=bool(emitted),
+            emitted_by_exec_id=(
+                next(iter(emitted_by_exec_ids)) if emitted else None
+            ),
+            origin=(next(iter(origins)) if emitted else None),
+            executions=executions,
+        )
+
+    def used_as(self, reference, version=None, seq_id=None):
+        """Return every recorded use of one exact State occurrence."""
+        if isinstance(reference, Inspected):
+            if reference.type != "reference":
+                raise TypeError("used_as requires an exact State reference")
             if (
                 version is not None
-                and inspected_version is not None
-                and version != inspected_version
+                and reference.version is not None
+                and version != reference.version
             ):
                 raise ValueError(
-                    "TIDE value lookup version conflicts with the inspected "
-                    "reference version"
+                    "Supplied version conflicts with the inspected reference"
                 )
+            version = reference.version if version is None else version
+            reference = reference.id
 
+        reference, version = self._split_state_identity(reference, version)
+        if not isinstance(reference, str):
+            raise TypeError("used_as requires an exact State reference")
+        if version is None:
+            raise ValueError("used_as requires an exact State version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise ValueError("used_as version must be a non-negative integer")
+        if seq_id is not None and (
+            not isinstance(seq_id, int)
+            or isinstance(seq_id, bool)
+            or seq_id < 0
+        ):
+            raise ValueError("used_as seq_id must be a non-negative integer or None")
+
+        state = (reference, version)
+        stored_hash = self._index.value_hash_by_ref_version.get(state)
+        if stored_hash is None:
+            raise KeyError(f"Unknown TIDE State: {reference}[v{version}]")
+        stored_snapshot = self._index._value_snapshots_by_hash.get(stored_hash)
+        if stored_snapshot is None:
+            raise RuntimeError("TIDE State has no retained value snapshot")
+
+        selected = tuple(
+            execution
+            for execution in self._execution_records
+            if seq_id is None or execution.seq_id == seq_id
+        )
+        if seq_id is not None and not selected:
+            raise KeyError(f"Execution seq_id {seq_id!r} was not found")
+
+        observations = []
+        for execution in selected:
+            for dependency in execution.deps:
+                dynamic = dependency.type == "dynamic"
+                for read in self._index._concretised_from(dependency):
+                    if (
+                        read.unscoped_reference,
+                        read.resolved_version,
+                    ) != state:
+                        continue
+                    snapshot = read._tide_snapshot("resolved_value")
+                    if snapshot is None:
+                        raise RuntimeError(
+                            "TIDE State use has no retained value snapshot"
+                        )
+                    associated = read.associated_input
+                    input_name = (
+                        associated[0]
+                        if isinstance(associated, (tuple, list)) and associated
+                        else associated
+                        if isinstance(associated, str)
+                        else associated.get("name")
+                        if isinstance(associated, dict)
+                        else getattr(associated, "name", None)
+                    )
+                    read_type = (
+                        "dynamic"
+                        if dynamic
+                        else "runtime_read"
+                        if input_name == "runtime_read"
+                        else read.type
+                    )
+                    observations.append((
+                        execution,
+                        read,
+                        snapshot,
+                        read_type,
+                    ))
+
+        return UsedAs(
+            reference,
+            version,
+            stored_snapshot,
+            observations,
+        )
+
+    def _value_hash_divergence(self, value_hash):
+        return next(
+            (
+                warning
+                for warning in self.divergence.get("warnings", ())
+                if isinstance(warning, dict)
+                and warning.get("type") == "value_hash_mismatch"
+                and warning.get("expected") == value_hash
+            ),
+            None,
+        )
+
+    def _recorded_state_value_descriptor(self, reference, version):
+        # EventReaders put immutable snapshot descriptors in snapshot_lineage.
+        # Presentation may read those facts but must never replace them with
+        # facts inferred from a reconstructed bundle value.
+        state = (reference, version)
+        value_hash = self._index.value_hash_by_ref_version.get(state)
+        if value_hash is None:
+            return None
+
+        records = (
+            tuple(
+                self._index.write_records_by_ref_version.get(
+                    state,
+                    (),
+                )
+            )
+            + tuple(
+                self._index.read_records_by_ref_version.get(
+                    state,
+                    (),
+                )
+            )
+        )
+
+        for record in records:
+            lineage = getattr(record, "snapshot_lineage", ()) or ()
+            for descriptor in reversed(lineage):
+                if (
+                    isinstance(descriptor, dict)
+                    and descriptor.get("value_hash") == value_hash
+                ):
+                    return descriptor
+
+        return {"value_hash": value_hash}
+
+    def _recorded_type_for_hash(self, value_hash):
+        types = {
+            descriptor.get("type")
+            for state in self._index.ref_versions_by_value_hash.get(
+                value_hash,
+                (),
+            )
+            for descriptor in (
+                self._recorded_state_value_descriptor(*state),
+            )
+            if isinstance(descriptor, dict)
+            and isinstance(descriptor.get("type"), str)
+        }
+        if len(types) == 1:
+            return next(iter(types))
+        if len(types) > 1:
+            return "multiple"
+        return None
+
+    def _warn_divergent_value_access(
+        self,
+        value_hash,
+        *,
+        reference=None,
+        version=None,
+        stacklevel=3
+    ):
+        mismatch = self._value_hash_divergence(value_hash)
+        if mismatch is None:
+            return
+
+        from warnings import warn
+
+        target = (
+            f"{reference}[v{version}]"
+            if reference is not None and version is not None
+            else value_hash
+        )
+        recorded_type = (
+            self._recorded_state_value_descriptor(reference, version).get("type")
+            if reference is not None
+            and version is not None
+            and isinstance(
+                self._recorded_state_value_descriptor(reference, version),
+                dict,
+            )
+            else self._recorded_type_for_hash(value_hash)
+        )
+        reconstructed = self._index.value_by_hash.get(value_hash)
+        reconstructed_type = (
+            type(reconstructed).__name__
+            if reconstructed is not None
+            else "unknown"
+        )
+
+        warn(
+            f"Divergent value for {target}:\n"
+            f"  recorded as:      {recorded_type or 'unknown'}\n"
+            f"  reconstructed as: {reconstructed_type}",
+            RuntimeWarning,
+            stacklevel=stacklevel,
+        )
+
+    def value_of(self, reference_or_hash, version=None, show=False):
+        from tide_tooling.tooling_core.engine.utils import detached_tide_value
+
+        if isinstance(reference_or_hash, Inspected):
+            if reference_or_hash.type != "reference":
+                raise TypeError("value_of requires a reference or value hash")
+            if version is not None and reference_or_hash.version is not None and version != reference_or_hash.version:
+                raise ValueError("Supplied version conflicts with the inspected reference")
+            version = reference_or_hash.version if version is None else version
             reference_or_hash = reference_or_hash.id
-            if version is None:
-                version = inspected_version
+
+        reference_or_hash, version = self._split_state_identity(
+            reference_or_hash,
+            version,
+        )
 
         if not isinstance(reference_or_hash, str):
-            raise TypeError(
-                "TIDE value lookup needs an inspected reference, "
-                "reference string or value hash"
-            )
+            raise TypeError("value_of requires a reference or value hash")
         if not isinstance(show, bool):
-            raise TypeError("TIDE value lookup show must be a bool")
+            raise TypeError("show must be a bool")
 
+        # Resolve an exact value hash.
         if self._is_val_hash(reference_or_hash):
             if version is not None:
-                raise ValueError("A TIDE value hash does not use a version")
+                raise ValueError("A value hash does not use a version")
+            if reference_or_hash not in self._index.value_by_hash:
+                raise KeyError(f"Unknown TIDE value hash: {reference_or_hash}")
 
-            try:
-                value = self.index.value_by_hash[reference_or_hash]
-            except KeyError as error:
-                raise KeyError(
-                    f"Unknown TIDE value hash: {reference_or_hash}"
-                ) from error
-
+            value = self._index.value_by_hash[reference_or_hash]
             if show:
                 self._show_value_of(
                     value,
                     value_hash=reference_or_hash,
                 )
-            return value
+            else:
+                self._warn_divergent_value_access(
+                    reference_or_hash,
+                    stacklevel=3,
+                )
+            return detached_tide_value(value)
 
-        if reference_or_hash in self.index.versions_by_ref:
-            return self._value_of_reference(
-                reference_or_hash,
-                version=version,
-                show=show,
-            )
+        # Resolve an exact reference.
+        if reference_or_hash in self._index.versions_by_ref:
+            return self._value_of_reference(reference_or_hash, version=version, show=show)
 
-        searched = self.find(reference_or_hash)
-        references = {
+        # Resolve an unqualified or partial reference.
+        searched = self.find(reference_or_hash, version)
+        references = sorted({
             inspected.id
-            for inspected in (
-                searched.get_exact("reference")
-                + searched.get_nearby("reference")
-            )
-        }
+            for inspected in searched.get_exact("reference") + searched.get_nearby("reference")
+        })
 
         if not references:
             raise KeyError(f"Unknown TIDE reference: {reference_or_hash}")
 
-        if version is not None:
-            references = {
-                reference
-                for reference in references
-                if version in self.index.versions_by_ref.get(reference, ())
-            }
-            if not references:
-                raise KeyError(
-                    f"Unknown TIDE reference version: "
-                    f"{reference_or_hash}[v{version}]"
-                )
-
-        references = sorted(references, key=str)
         if len(references) == 1:
-            return self._value_of_reference(
-                references[0],
-                version=version,
-                show=show,
-            )
+            return self._value_of_reference(references[0], version=version, show=show)
 
         values = []
         for reference in references:
-            found = self._value_of_reference(
-                reference,
-                version=version,
-                show=show,
-            )
+            found = self._value_of_reference(reference, version=version, show=show)
             values.extend(found if version is None else [found])
         return values
 
     def _value_of_reference(self, reference, *, version=None, show=False):
-        if version is not None:
-            try:
-                value_hash = self.index.value_hash_by_ref_version[
-                    (reference, version)
-                ]
-                value = self.index.value_by_hash[value_hash]
-            except KeyError as error:
-                raise KeyError(
-                    f"Unknown TIDE reference version: {reference}[v{version}]"
-                ) from error
+        versions = list(self._index.versions_by_ref.get(reference, ()))
+        if not versions:
+            raise KeyError(f"Unknown TIDE reference: {reference}")
 
+        selected_versions = sorted(versions) if version is None else [version]
+        versioned_values = []
+
+        for selected_version in selected_versions:
+            ref_version = (reference, selected_version)
+            value_hash = self._index.value_hash_by_ref_version.get(ref_version)
+            if value_hash is None or value_hash not in self._index.value_by_hash:
+                raise KeyError(f"Unknown TIDE reference version: {reference}[v{selected_version}]")
+            versioned_values.append((selected_version, value_hash, self._index.value_by_hash[value_hash]))
+
+        if version is not None:
+            value_hash = versioned_values[0][1]
+            value = versioned_values[0][2]
             if show:
                 self._show_value_of(
                     value,
@@ -1467,34 +1979,38 @@ class Trace:
                     version=version,
                     value_hash=value_hash,
                 )
-            return value
+            else:
+                self._warn_divergent_value_access(
+                    value_hash,
+                    reference=reference,
+                    version=version,
+                    stacklevel=4,
+                )
+            from tide_tooling.tooling_core.engine.utils import detached_tide_value
+            return detached_tide_value(value)
 
-        versions = self.index.versions_by_ref.get(reference, [])
-        if not versions:
-            raise KeyError(f"Unknown TIDE reference: {reference}")
-
-        versioned_values = [
-            (
-                value_version,
-                self.index.value_hash_by_ref_version[
-                    (reference, value_version)
-                ],
-                self.index.value_by_hash[
-                    self.index.value_hash_by_ref_version[
-                        (reference, value_version)
-                    ]
-                ],
-            )
-            for value_version in sorted(versions)
+        from tide_tooling.tooling_core.engine.utils import detached_tide_value
+        values = [
+            detached_tide_value(value)
+            for _, _, value in versioned_values
         ]
-        values = [value for _, _, value in versioned_values]
-
         if show:
             self._show_value_of(
                 values,
                 reference=reference,
                 versions=versioned_values,
             )
+        else:
+            warned_hashes = set()
+            for value_version, value_hash, _ in versioned_values:
+                if value_hash in warned_hashes:
+                    continue
+                warned_hashes.add(value_hash)
+                self._warn_divergent_value_access(
+                    value_hash,
+                    reference=reference,
+                    version=value_version,
+                )
         return values
 
     def show_value_of(self, reference_or_hash, version=None):
@@ -1509,58 +2025,176 @@ class Trace:
         versions=None,
     ):
         if versions is not None:
+            divergent_versions = {
+                value_version: mismatch
+                for value_version, version_hash, _ in versions
+                for mismatch in (
+                    self._value_hash_divergence(version_hash),
+                )
+                if mismatch is not None
+            }
             summary = (
                 f"{len(versions)} "
                 f"{'value' if len(versions) == 1 else 'values'} found"
             )
+            if divergent_versions:
+                summary += f" | {SHOW_RED}DIVERGENT{SHOW_RESET}"
             identifier = f"Reference: {reference}"
-        elif reference is not None:
-            summary = "1 value found"
-            identifier = f"Reference: {reference}[v{version}]"
         else:
+            mismatch = self._value_hash_divergence(value_hash)
             summary = "1 value found"
-            identifier = f"Value hash: {value_hash}"
+            if mismatch is not None:
+                summary += f" | {SHOW_RED}DIVERGENT{SHOW_RESET}"
+            identifier = (
+                f"Reference: {reference}[v{version}]"
+                if reference is not None
+                else f"Value hash: {value_hash}"
+            )
 
         lines = show_header("VALUE", summary, identifier)
 
         if versions is not None:
             lines.extend(show_section("VERSIONS"))
             for value_version, version_hash, version_value in versions:
+                mismatch = self._value_hash_divergence(version_hash)
+                descriptor = self._recorded_state_value_descriptor(
+                    reference,
+                    value_version,
+                )
+                recorded_type = (
+                    descriptor.get("type")
+                    if isinstance(descriptor, dict)
+                    else None
+                )
+
+                marker = (
+                    f"{SHOW_RED}!{SHOW_RESET}"
+                    if mismatch is not None
+                    else ""
+                )
                 lines.append(
-                    f"  {SHOW_CYAN}[v{value_version}]{SHOW_RESET} "
+                    f"  {marker}{SHOW_CYAN}[v{value_version}]{SHOW_RESET} "
                     f"{SHOW_DIM}{version_hash}{SHOW_RESET}"
                 )
-                lines.append(
-                    f"      {SHOW_DIM}type:{SHOW_RESET} "
-                    f"{SHOW_WHITE}{type(version_value).__name__}{SHOW_RESET}"
-                )
-                lines.append(
-                    f"      {SHOW_DIM}value:{SHOW_RESET} "
-                    f"{SHOW_WHITE}{repr(version_value)}{SHOW_RESET}"
-                )
+
+                if mismatch is not None:
+                    lines.append(
+                        f"      {SHOW_DIM}recorded as:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{recorded_type or 'unknown'}{SHOW_RESET}"
+                    )
+                    lines.append(
+                        f"      {SHOW_DIM}reconstructed as:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{self._show_value_name(version_value)}{SHOW_RESET}"
+                    )
+                    lines.append(
+                        f"      {SHOW_DIM}reconstructed hash:{SHOW_RESET} "
+                        f"{SHOW_RED}{mismatch.get('observed')}{SHOW_RESET}"
+                    )
+                    lines.append(
+                        f"      {SHOW_DIM}reconstructed value:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{repr(version_value)}{SHOW_RESET}"
+                    )
+                else:
+                    lines.append(
+                        f"      {SHOW_DIM}type:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{recorded_type or self._show_value_name(version_value)}{SHOW_RESET}"
+                    )
+                    lines.append(
+                        f"      {SHOW_DIM}value:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{repr(version_value)}{SHOW_RESET}"
+                    )
         else:
-            lines.extend(show_section("VALUE"))
-            lines.append(
-                f"  {SHOW_DIM}hash:{SHOW_RESET} "
-                f"{SHOW_CYAN}{value_hash}{SHOW_RESET}"
-            )
-            lines.append(
-                f"  {SHOW_DIM}type:{SHOW_RESET} "
-                f"{SHOW_WHITE}{type(value).__name__}{SHOW_RESET}"
-            )
-            lines.append(
-                f"  {SHOW_DIM}value:{SHOW_RESET} "
-                f"{SHOW_WHITE}{repr(value)}{SHOW_RESET}"
-            )
+            mismatch = self._value_hash_divergence(value_hash)
+
+            if mismatch is not None:
+                descriptor = (
+                    self._recorded_state_value_descriptor(
+                        reference,
+                        version,
+                    )
+                    if reference is not None
+                    else None
+                )
+                recorded_type = (
+                    descriptor.get("type")
+                    if isinstance(descriptor, dict)
+                    else self._recorded_type_for_hash(value_hash)
+                )
+
+                lines.extend(
+                    show_section("RECORDED AS")
+                )
+                lines.append(
+                    f"  {SHOW_DIM}type:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{recorded_type or 'unknown'}{SHOW_RESET}"
+                )
+                lines.append(
+                    f"  {SHOW_DIM}hash:{SHOW_RESET} "
+                    f"{SHOW_CYAN}{value_hash}{SHOW_RESET}"
+                )
+                if (
+                    isinstance(descriptor, dict)
+                    and isinstance(descriptor.get("repr"), str)
+                ):
+                    lines.append(
+                        f"  {SHOW_DIM}value:{SHOW_RESET} "
+                        f"{SHOW_WHITE}{descriptor['repr']}{SHOW_RESET}"
+                    )
+
+                lines.extend(show_section("RECONSTRUCTED AS"))
+                lines.append(
+                    f"  {SHOW_DIM}type:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{self._show_value_name(value)}{SHOW_RESET}"
+                )
+                lines.append(
+                    f"  {SHOW_DIM}hash:{SHOW_RESET} "
+                    f"{SHOW_RED}{mismatch.get('observed')}{SHOW_RESET}"
+                )
+                lines.append(
+                    f"  {SHOW_DIM}value:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{repr(value)}{SHOW_RESET}"
+                )
+            else:
+                descriptor = (
+                    self._recorded_state_value_descriptor(
+                        reference,
+                        version,
+                    )
+                    if reference is not None
+                    else None
+                )
+                recorded_type = (
+                    descriptor.get("type")
+                    if isinstance(descriptor, dict)
+                    else None
+                )
+
+                lines.extend(show_section("VALUE"))
+                lines.append(
+                    f"  {SHOW_DIM}hash:{SHOW_RESET} "
+                    f"{SHOW_CYAN}{value_hash}{SHOW_RESET}"
+                )
+                lines.append(
+                    f"  {SHOW_DIM}type:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{recorded_type or self._show_value_name(value)}{SHOW_RESET}"
+                )
+                lines.append(
+                    f"  {SHOW_DIM}value:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{repr(value)}{SHOW_RESET}"
+                )
 
         return show_output(lines)
-    
+
     def show(
         self,
         color=True,
         simple=False,
         colour=None,
         structural=False,
+        full_trace=False,
+        show_sources=False,
+        show_undeclared=False,
+        values=False,
     ):
         """Render this Trace, optionally through its canonical TIDE structure.
 
@@ -1569,40 +2203,87 @@ class Trace:
         and colour rules. The default view retains the Trace's supplied
         identities and enrichment.
         """
+        # Select the requested presentation boundary.
+        if not isinstance(full_trace, bool):
+            raise TypeError("show full_trace must be a bool")
+        if not isinstance(show_sources, bool):
+            raise TypeError("show show_sources must be a bool")
+        if not isinstance(show_undeclared, bool):
+            raise TypeError("show show_undeclared must be a bool")
+        if not isinstance(values, bool):
+            raise TypeError("show values must be a bool")
+
+        def is_autogenerated(reference):
+            return DataRef.from_string(
+                reference,
+                prefix=False,
+            ).is_autogenerated
+
+        def is_autogenerated_execution(execution):
+            writes = tuple(execution.writes)
+            return (
+                execution.producer_id.source_actor == "TIDE: External"
+                and writes
+                and all(
+                    is_autogenerated(write.stored_target)
+                    for write in writes
+                )
+            )
+
+        if not full_trace and self._scope_runner_ids:
+            shown_exec_ids = {
+                execution.exec_id
+                for execution in self._execution_records
+                if (
+                    execution.runner_id in self._scope_runner_ids
+                    or (
+                        show_undeclared
+                        and is_autogenerated_execution(execution)
+                    )
+                )
+            }
+            shown_trace = self._derived_view(
+                log=tuple(
+                    record
+                    for record in self._records
+                    if record.exec_id in shown_exec_ids
+                ),
+            )
+            return shown_trace.show(
+                color=color,
+                simple=simple,
+                colour=colour,
+                structural=structural,
+                full_trace=True,
+                show_sources=show_sources,
+                show_undeclared=show_undeclared,
+                values=values,
+            )
+
         color, simple = _show_options(color, simple, colour)
         if not isinstance(structural, bool):
             raise TypeError("show structural must be a bool")
         if structural:
             from tide_tooling.core import TIDE
 
-            model_options = self._tide_model_comparison_options()
-            if model_options.get("assign_unknown") is True:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(
-                        "ignore",
-                        message=(
-                            "Trace States have no host-identified producer:.*"
-                        ),
-                        category=RuntimeWarning,
-                    )
-                    structural_model = self.to_model(
-                        include_hashes=False,
-                        identity_mode="structural",
-                        **model_options,
-                    )
-            else:
-                structural_model = self.to_model(
-                    include_hashes=False,
-                    identity_mode="structural",
-                )
+            structural_model = self.to_model(
+                enrich=False,
+                identity_mode="structural",
+            )
             structural_trace = TIDE.from_model(
                 structural_model,
                 name=f"{self.name} [structural]",
             )
-            structural_trace.ocean_id = "structural"
+            structural_trace = structural_trace._derived_view(
+                log=structural_trace._log,
+                ocean_id="structural",
+            )
             return structural_trace.show(
                 color=color,
                 simple=simple,
+                show_sources=show_sources,
+                show_undeclared=show_undeclared,
+                values=values,
             )
         # 
         # Tide Run 0 
@@ -1613,18 +2294,106 @@ class Trace:
         #
 
         def not_template(value):
-            return True if not isinstance(value, __TIDE_TEMPLATE_VALUE__) else False
+            return True if not isinstance(value, __fallback__) else False
+
+
+        def dependency_occurrence_id(dependency):
+            return dependency.observation_id
+
+        def write_occurrence_id(write):
+            cause = getattr(write, "cause", None)
+            return (
+                getattr(cause, "event_id", None),
+                write.stored_target,
+                write.stored_version,
+            )
+
+        def effect_occurrence_id(effect):
+            return effect.event_id
+
+        immediate_dependencies = {
+            dependency_occurrence_id(dependency)
+            for record in self._records
+            if isinstance(record, ImmediateEffectRecord)
+            for dependency in record.deps
+        }
+        immediate_writes = {
+            write_occurrence_id(write)
+            for record in self._records
+            if isinstance(record, ImmediateEffectRecord)
+            for write in record.writes
+        }
+        immediate_effects = {
+            effect_occurrence_id(effect)
+            for record in self._records
+            if isinstance(record, ImmediateEffectRecord)
+            for effect in record.effects
+        }
+
+        def shown_dependencies(execution):
+            return tuple(
+                dependency
+                for dependency in execution.deps
+                if (
+                    isinstance(execution, ImmediateEffectRecord)
+                    or dependency_occurrence_id(dependency) not in immediate_dependencies
+                )
+                if show_undeclared or not is_autogenerated(dependency.unscoped_reference)
+            )
+
+        def shown_writes(execution):
+            return tuple(
+                write
+                for write in execution.writes
+                if (
+                    isinstance(execution, ImmediateEffectRecord)
+                    or write_occurrence_id(write) not in immediate_writes
+                )
+                if show_undeclared or not is_autogenerated(write.stored_target)
+            )
+
+        shown_log = tuple(
+            execution
+            for execution in self._execution_records
+            if show_undeclared or not is_autogenerated_execution(execution)
+        )
+        shown_exec_ids = {execution.exec_id for execution in shown_log}
+        shown_records = tuple(
+            record
+            for record in self._records
+            if record.exec_id in shown_exec_ids
+            or isinstance(record, ImmediateEffectRecord)
+        )
 
         def ref_colour(ref, ver):
-            consumers = self.index.ref_version_to_consumer_exec_ids.get(
+            consumers = self._index.consumer_exec_ids_by_ref_version.get(
                 (ref, ver),
                 [],
             )
             return (
                 SHOW_RED
-                if (ref, ver) in self.index.deleted_ref_versions
+                if (ref, ver) in self._index.deleted_ref_versions
                 or not consumers
                 else SHOW_GREEN
+            )
+
+        divergent_states = {
+            state
+            for warning in self.divergence.get("warnings", ())
+            if isinstance(warning, dict)
+            and warning.get("type") == "value_hash_mismatch"
+            and isinstance(warning.get("expected"), str)
+            for state in self._index.ref_versions_by_value_hash.get(
+                warning["expected"],
+                (),
+            )
+        }
+
+        def divergent_state_marker(ref, ver):
+            return (
+                f"{SHOW_RED}!{SHOW_RESET}"
+                if (ref, ver) in divergent_states
+                else ""
             )
 
         def effect_ref_colour(log, effect_entry):
@@ -1632,19 +2401,36 @@ class Trace:
             ref, ver = effect_entry.targets
 
             if effect == Effects.DELETE:
-                return SHOW_RED
+                return SHOW_RED if effect_entry.target_existed is True else SHOW_YELLOW
             if effect == Effects.READ:
                 return (
                     SHOW_GREEN
                     if effect_entry.target_existed is True
                     else SHOW_RED
-                )
+                ) 
+            if ver == None:
+                return SHOW_YELLOW
+            
             return ref_colour(ref, ver)
 
-        def lines_from_write(cause, result_name, ref, ver):
+        def lines_from_write(
+            cause,
+            result_name,
+            ref,
+            ver,
+            updated,
+            observed_mutable,
+        ):
+            cause = cause.description
             link = "as"
-            action = "wrote:"
+            action = "updated:" if updated else "wrote:"
             colour = ref_colour(ref, ver)
+            state = _state_occurrence_text(
+                ref,
+                ver,
+                observed_mutable=observed_mutable,
+            )
+            marker = divergent_state_marker(ref, ver)
             lines = []
             if cause.startswith("TIDE:"):
                 cause_str = cause.split(" ", 1)[1]
@@ -1662,7 +2448,7 @@ class Trace:
                             f"    {SHOW_DIM}{action}{SHOW_RESET} "
                             f"{SHOW_WHITE}{result_name}{SHOW_RESET} "
                             f"{SHOW_DIM}{link}{SHOW_RESET} "
-                            f"{colour}{ref}[v{ver}]{SHOW_RESET}"
+                            f"{marker}{colour}{state}{SHOW_RESET}"
                         ]
                         
                     case "observed value":
@@ -1671,7 +2457,7 @@ class Trace:
                         link = "as"
                         return [
                             f"    {SHOW_DIM}{action}{SHOW_RESET} "
-                            f"{colour}{ref}[v{ver}]{SHOW_RESET} "
+                            f"{colour}{state}{SHOW_RESET} "
                             f"{SHOW_DIM}{link}{SHOW_RESET} "
                             f"{SHOW_WHITE}{result_name}{SHOW_RESET} "
                             f"{SHOW_DIM}because {cause}{SHOW_RESET}"
@@ -1684,7 +2470,7 @@ class Trace:
                 f"    {SHOW_DIM}{action}{SHOW_RESET} "
                 f"{SHOW_WHITE}{result_name}{SHOW_RESET} "
                 f"{SHOW_DIM}{link}{SHOW_RESET} "
-                f"{colour}{ref}[v{ver}]{SHOW_RESET}"
+                f"{marker}{colour}{state}{SHOW_RESET}"
             )
             if cause and str(cause).lower() != "unknown":
                 lines[-1] += (
@@ -1693,97 +2479,253 @@ class Trace:
             return lines
                     
         
-        execution_count = len(self.exec_log)
+        execution_count = len(shown_log)
         execution_word = "execution" if execution_count == 1 else "executions"
-        read_count = len(self.reads)
+        read_count = sum(
+            len(self._index._concretised_from(dependency))
+            for execution in shown_log
+            for dependency in shown_dependencies(execution)
+        )
         read_word = "read" if read_count == 1 else "reads"
-        write_count = len(self.writes)
+        write_count = sum(len(shown_writes(execution)) for execution in shown_log)
         write_word = "write" if write_count == 1 else "writes"
         summary = (
-            f"{execution_count} {execution_word} found | "
+            f"{execution_count} {execution_word} shown | "
             f"{write_count} {write_word} | "
             f"{read_count} {read_word}"
         )
+        if self.divergent:
+            summary += f" | {SHOW_RED}DIVERGENT{SHOW_RESET}"
+        elif self.scope == "complete":
+            summary += f" | {SHOW_GREEN}COMPLETE{SHOW_RESET}"
+        else:
+            summary += f" | {SHOW_YELLOW}AMBIGUOUS{SHOW_RESET}"
+        if self.missing_referenced_events:
+            missing_count = len(self.missing_referenced_events)
+            summary += f" | {SHOW_RED}CORRUPTED: {missing_count} missing causal Events{SHOW_RESET}"
+        if self.causal_order_violations:
+            violation_count = len(self.causal_order_violations)
+            summary += f" | {SHOW_RED}CORRUPTED: {violation_count} causal ordering violations{SHOW_RESET}"
+        if self.deadlocked:
+            waiting_count = sum(
+                len(waiting)
+                for waiting in self._deadlock.values()
+            )
+            summary += (
+                f" | {SHOW_RED}DEADLOCKED: {waiting_count} "
+                f"waiting node{'s' if waiting_count != 1 else ''}{SHOW_RESET}"
+            )
         if self.host is not None:
             summary += f" | host: {self.host}"
-        run_label = "Tide Run" if len(self.source_runs) <= 1 else "Tide Runs"
-        pipeline_label = (
-            "Pipeline" if len(self.source_pipelines) <= 1 else "Pipelines"
+        sources = tuple(
+            {
+                "run": runner_id,
+                "pipeline_id": pipeline_id,
+                "pipeline": self._get_pipeline_named_tuple_from_id(
+                    pipeline_id
+                )[1],
+            }
+            for runner_id, pipeline_id in dict.fromkeys(
+                (execution.runner_id, execution.pipeline_id)
+                for execution in shown_log
+            )
+        )
+        source_runs = tuple(dict.fromkeys(source["run"] for source in sources))
+        source_pipelines = tuple(dict.fromkeys(source["pipeline"] for source in sources))
+        run_label = "Tide Run" if len(source_runs) <= 1 else "Tide Runs"
+        pipeline_label = "Pipeline" if len(source_pipelines) <= 1 else "Pipelines"
+        run = (
+            source_runs[0]
+            if len(source_runs) == 1
+            else f"MULTIPLE ({len(source_runs)})"
+            if source_runs
+            else "TIDE: UNKNOWN"
+        )
+        pipeline = (
+            source_pipelines[0]
+            if len(source_pipelines) == 1
+            else f"MULTIPLE ({len(source_pipelines)})"
+            if source_pipelines
+            else "TIDE: UNKNOWN"
         )
         identifier = (
             f"Ocean: {self.ocean_id} | "
-            f"{run_label}: {self.run} | "
-            f"{pipeline_label}: {self.pipeline}"
+            f"{run_label}: {run} | "
+            f"{pipeline_label}: {pipeline}"
         )
         lines = show_header("TRACE", summary, identifier)
         lines.extend(show_section("RUN"))
-        lines.append(
-            f"{SHOW_DIM}Sources:    "
-            f"{len(self.execution_sources)}{SHOW_RESET}"
-        )
-        if len(self.execution_sources) > 1:
-            for source_idx, source in enumerate(self.execution_sources):
-                lines.append(
-                    f"  {SHOW_CYAN}[{source_idx}]{SHOW_RESET} "
-                    f"{SHOW_WHITE}{source['run']}{SHOW_RESET} "
-                    f"{SHOW_DIM}| Pipeline: {source['pipeline']}{SHOW_RESET}"
-                )
+        if self._pipeline_starting_event_id is not None:
+            start_seq_id = next(
+                (
+                    index
+                    for index, event in enumerate(self.events)
+                    if event.event_id
+                    == self._pipeline_starting_event_id
+                ),
+                None,
+            )
+            marker = "---- PIPELINE START"
+            if start_seq_id is not None:
+                marker += f" [Event: {start_seq_id}]"
+            lines.append(f"{SHOW_GREEN}{marker} ----{SHOW_RESET}")
+        if show_sources:
+            lines.append(
+                f"{SHOW_DIM}Sources:    "
+                f"{len(sources)}{SHOW_RESET}"
+            )
+            if len(sources) > 1:
+                for source_idx, source in enumerate(sources):
+                    lines.append(
+                        f"  {SHOW_CYAN}[{source_idx}]{SHOW_RESET} "
+                        f"{SHOW_WHITE}{source['run']}{SHOW_RESET} "
+                        f"{SHOW_DIM}| Pipeline: {source['pipeline']}{SHOW_RESET}"
+                    )
         lines.extend(show_section("EXECUTIONS"))
 
-        for idx, log in enumerate(self.exec_log):
-            producer_id_repr = log.producer_id.source_actor
-            lines.append(f"{SHOW_CYAN}{idx}: {producer_id_repr}{SHOW_RESET}")
+        presentation_items = list(shown_records)
+        presentation_items.extend(
+            attempt
+            for attempt in self._ready_attempts
+            if attempt.outcome != "completed"
+            and (
+                self._selected_runner_id is None
+                or attempt.runner_id in self._scope_runner_ids
+            )
+        )
+        presentation_items.sort(
+            key=lambda item: (
+                getattr(item, "event_seq_id", None) is None,
+                getattr(item, "event_seq_id", 0) or 0,
+            )
+        )
+
+        for log in presentation_items:
+            if isinstance(log, ReadyAttemptRecord):
+                outcome = (
+                    "ATTEMPTED NODE_READY"
+                    if log.outcome == "ready"
+                    else f"NODE_READY {log.outcome.upper()}"
+                )
+                lines.append(
+                    f"{SHOW_RED if self.scope == 'complete' and log.outcome == 'ready' else SHOW_YELLOW}"
+                    f"[Event: {log.event_seq_id}] {outcome}: "
+                    f"{log.actor.source_actor}{SHOW_RESET}"
+                )
+                continue
+
+            producer = log.producer_id
+            producer_id_repr = (
+                producer.source_actor
+                if producer is not None
+                else "TIDE: Unknown Attempt"
+            )
+            if isinstance(log, ImmediateEffectRecord):
+                status = (
+                    f"EXEC_RECORD[{log.execution_reference.resolved_seq_id}]"
+                    if log.execution_reference.resolved
+                    else repr(log.execution_reference.ambiguous_occurrence)
+                )
+                lines.append(
+                    f"{SHOW_CYAN}{log.seq_id}: IMMEDIATE EFFECT "
+                    f"{producer_id_repr} -> {status}{SHOW_RESET}"
+                )
+            else:
+                lines.append(f"{SHOW_CYAN}{log.seq_id}: {producer_id_repr}{SHOW_RESET}")
+
+            parent_exec_id = getattr(log, "emitted_by_exec_id", None)
+            if parent_exec_id is not None:
+                parent = self._execs.get(parent_exec_id)
+                parent_display = (
+                    f"EXEC_RECORD[{parent.seq_id}]"
+                    if parent is not None
+                    else parent_exec_id
+                )
+                lines.append(
+                    f"     {SHOW_DIM}parent_exec:{SHOW_RESET} "
+                    f"{SHOW_CYAN}{parent_display}{SHOW_RESET}"
+                )
 
             # 
             # handle dependencies 
-            deps = log.deps
+            deps = shown_dependencies(log)
+            if not show_undeclared:
+                for dependency in log.deps:
+                    if is_autogenerated(dependency.unscoped_reference):
+                        value_type = self._show_value_name(dependency.resolved_value)
+                        lines.append(
+                            f"     {SHOW_DIM}used:{SHOW_RESET} "
+                            f"{SHOW_WHITE}{value_type}{SHOW_RESET} "
+                            f"{SHOW_DIM}as an{SHOW_RESET} "
+                            f"{SHOW_WHITE}undeclared_input{SHOW_RESET}"
+                        )
             if not_template(deps) and deps:
                 for dep_entry in deps:
                     dep_entry: DependencyUseRecord
                     ref = dep_entry.unscoped_reference
                     dep_type = dep_entry.type
-
                     if dep_type == "dynamic":
-                        version = "[dynamic]"
+                        lines.append(
+                            f"     {SHOW_DIM}used:{SHOW_RESET} "
+                            f"{SHOW_GREEN}{ref}[dynamic]{SHOW_RESET}"
+                        )
+                        for expanded_entry in dep_entry.expanded_to or ():
+                            expanded_state = _state_occurrence_text(
+                                expanded_entry.unscoped_reference,
+                                expanded_entry.resolved_version,
+                                observed_mutable=(
+                                    expanded_entry.observed_mutable
+                                ),
+                            )
+                            lines.append(
+                                f"        {SHOW_DIM}->{SHOW_RESET} "
+                                f"{divergent_state_marker(expanded_entry.unscoped_reference, expanded_entry.resolved_version)}"
+                                f"{SHOW_GREEN}{expanded_state}{SHOW_RESET}"
+                            )
+                        continue
+
+                    state = _state_occurrence_text(
+                        ref,
+                        dep_entry.resolved_version,
+                        observed_mutable=dep_entry.observed_mutable,
+                    )
+                    marker = divergent_state_marker(
+                        ref,
+                        dep_entry.resolved_version,
+                    )
+                    associated_input = getattr(
+                        dep_entry,
+                        "associated_input",
+                        None,
+                    )
+                    is_effect_read = (
+                        isinstance(associated_input, tuple)
+                        and associated_input
+                        and associated_input[0] == "runtime_read"
+                    )
+
+                    if is_effect_read:
+                        lines.append(
+                            f"     {SHOW_CYAN}read:{SHOW_RESET} "
+                            f"{SHOW_GREEN}{state}{SHOW_RESET} "
+                            f"{SHOW_DIM}via READ effect{SHOW_RESET}"
+                        )
                     else:
-                        resolved_ver = dep_entry.resolved_version
-                        version = f"[v{resolved_ver}]"
-                        associated_input = getattr(
-                            dep_entry,
-                            "associated_input",
-                            None,
-                        )
-                        is_effect_read = (
-                            isinstance(associated_input, tuple)
-                            and associated_input
-                            and associated_input[0] == "runtime_read"
+                        lines.append(
+                            f"     {SHOW_DIM}used:{SHOW_RESET} "
+                            f"{marker}{SHOW_GREEN}{state}{SHOW_RESET}"
                         )
 
-                        if is_effect_read:
-                            lines.append(
-                                f"     {SHOW_CYAN}read:{SHOW_RESET} "
-                                f"{SHOW_GREEN}{ref}{version}{SHOW_RESET} "
-                                f"{SHOW_DIM}via READ effect{SHOW_RESET}"
-                            )
-                        else:
-                            lines.append(
-                                f"     {SHOW_DIM}used:{SHOW_RESET} "
-                                f"{SHOW_GREEN}{ref}{version}{SHOW_RESET}"
-                            )
-
-                        if dep_type == "dynamic":
-                            for expanded_entry in dep_entry.expanded_to:
-                                expanded_ref = expanded_entry.unscoped_reference
-                                expanded_ver = expanded_entry.resolved_version
-                                lines.append(
-                                    f"        {SHOW_DIM}->{SHOW_RESET} "
-                                    f"{SHOW_GREEN}{expanded_ref}[v{expanded_ver}]{SHOW_RESET}"
-                                )
+            for reference in getattr(log, "mutated_during", {}):
+                lines.append(
+                    f"     {SHOW_YELLOW}mutated:{SHOW_RESET} "
+                    f"{SHOW_WHITE}{reference}{SHOW_RESET}"
+                )
 
             
             # 
             # handle stored values
-            error = log.error
+            error = getattr(log, "error", None)
             if not_template(error) and error:
                 if getattr(log, "handled_raise", False):
                     lines.append(
@@ -1795,13 +2737,44 @@ class Trace:
                         f"      {SHOW_RED}ERROR: {error}{SHOW_RESET}"
                     )
 
-            for write in log.writes:
+            for write in shown_writes(log):
                 stored_result = write.stored_result
                 stored_version = write.stored_version
                 if not_template(stored_result):
                     target_ref = write.stored_target
-                    result_name = self._show_value_name(stored_result)
-                    _lines_from_write = lines_from_write(write.cause, result_name, target_ref, stored_version) 
+                    descriptor = self._recorded_state_value_descriptor(
+                        target_ref,
+                        stored_version,
+                    )
+                    result_name = (
+                        descriptor.get("type")
+                        if isinstance(descriptor, dict)
+                        and isinstance(descriptor.get("type"), str)
+                        else self._show_value_name(stored_result)
+                    )
+                    if result_name in {"TIDEUnknownType", "TIDEUnknownValue"}:
+                        result_name = f"opaque<{result_name}>"
+                    if values:
+                        recorded_repr = (
+                            descriptor.get("repr")
+                            if isinstance(descriptor, dict)
+                            and isinstance(descriptor.get("repr"), str)
+                            else None
+                        )
+                        rendered_value = (
+                            recorded_repr
+                            if recorded_repr is not None
+                            else repr(stored_result)
+                        )
+                        result_name = f"{result_name} {rendered_value}"
+                    _lines_from_write = lines_from_write(
+                        write.cause,
+                        result_name,
+                        target_ref,
+                        stored_version,
+                        write.updated,
+                        write.observed_mutable,
+                    )
                     # action = "wrote" if not (cause.startswith("TIDE") and "Polling" in cause) else "dep available"
                     
                     lines.extend(_lines_from_write)
@@ -1809,1547 +2782,1553 @@ class Trace:
 
             #
             # handle effects
-            effects = log.effects
+            effects = tuple(
+                effect
+                for effect in log.effects
+                if isinstance(log, ImmediateEffectRecord)
+                or effect_occurrence_id(effect) not in immediate_effects
+            )
             if not_template(effects) and effects:
                 if effects: lines.append(f"  {SHOW_DIM}effects:{SHOW_RESET}")
                 for effect_entry in effects:
                     effect = effect_entry.effect
-                    targets = effect_entry.targets
-                    colour = effect_ref_colour(log, effect_entry)
+                    target = effect_entry.targets
+
+                    # State Effects have a reference and version; other Effects do not.
+                    if effect in {Effects.READ, Effects.WRITE, Effects.DELETE}:
+                        colour = effect_ref_colour(log, effect_entry)
+                        if target[1] is None:
+                            target_text = target[0]
+                        else:
+                            target_text = f"{target[0]}[v{target[1]}]"
+                    elif effect == Effects.EMIT:
+                        emitted = next((emitted for emitted in log.emitted_nodes if emitted.content_id == target), None)
+                        if emitted is None:
+                            colour = SHOW_YELLOW
+                            target_text = repr(target)
+                        elif emitted.emitted_by_exec_id != log.exec_id:
+                            owner = self._execs.get(emitted.emitted_by_exec_id)
+                            colour = SHOW_YELLOW
+                            target_text = emitted.func_name
+                            if owner is not None:
+                                target_text += f" (registered by EXEC_RECORD[{owner.seq_id}])"
+                        else:
+                            node = (emitted.runner_id, emitted.node_id)
+                            executed = any(
+                                self._execs[candidate_id].emitted_by_exec_id == log.exec_id
+                                for candidate_id in self._index.exec_ids_by_runner_node.get(node, ())
+                            )
+                            colour = SHOW_GREEN if executed else SHOW_CYAN
+                            target_text = emitted.func_name
+                    else:
+                        colour = SHOW_RESET
+                        target_text = repr(target)
+
                     lines.append(
                         f"        {SHOW_CYAN}{effect}{SHOW_RESET} "
                         f"{SHOW_DIM}->{SHOW_RESET} "
-                        f"{colour}{targets[0]}[v{targets[1]}]{SHOW_RESET}"
+                        f"{colour}{target_text}{SHOW_RESET}"
+                    )
+
+            if isinstance(log, ImmediateEffectRecord):
+                continue
+
+            owned_emissions = []
+            seen_emitted_nodes = set()
+            for emitted in log.emitted_nodes:
+                node = (emitted.runner_id, emitted.node_id)
+                if emitted.emitted_by_exec_id != log.exec_id or node in seen_emitted_nodes:
+                    continue
+                seen_emitted_nodes.add(node)
+                execution_count = sum(
+                    self._execs[candidate_id].emitted_by_exec_id == log.exec_id
+                    for candidate_id in self._index.exec_ids_by_runner_node.get(node, ())
+                )
+                owned_emissions.append((emitted.func_name, execution_count))
+
+            if owned_emissions:
+                lines.append(f"  {SHOW_DIM}emitted:{SHOW_RESET}")
+                for actor_name, execution_count in owned_emissions:
+                    execution_word = "execution" if execution_count == 1 else "executions"
+                    lines.append(
+                        f"        {SHOW_CYAN}{actor_name}{SHOW_RESET} "
+                        f"{SHOW_DIM}- {execution_count} {execution_word}{SHOW_RESET}"
                     )
 
             
-            #
-            #  handle emitted nodes            
-            logged_emitted_nodes = log.emitted_nodes
-            if not_template(logged_emitted_nodes) and logged_emitted_nodes:
-                if logged_emitted_nodes: lines.append(f"  {SHOW_DIM}emitted:{SHOW_RESET}")
-                for emitted in logged_emitted_nodes:
-                    emitted_id = emitted.node_id
-                    emitted_func_name = emitted.func_name
-                    lines.append(
-                        f"        {SHOW_CYAN}[{emitted_id}] {emitted_func_name}{SHOW_RESET}"
-                    )
-    
-                lines.append("")
+        if self.divergent:
+            lines.append(
+                f"{SHOW_RED}---- DIVERGENT ----{SHOW_RESET}"
+            )
+        elif self.scope == "complete":
+            lines.append(
+                f"{SHOW_GREEN}---- PIPELINE END ----{SHOW_RESET}"
+            )
+        else:
+            lines.append(
+                f"{SHOW_YELLOW}---- PIPELINE END NOT REPRESENTED: "
+                f"AMBIGUOUS SCOPE ----{SHOW_RESET}"
+            )
 
         return _show_render(lines, color)
 
     @staticmethod
     def _show_value_name(value):
-        if value.__class__.__name__ == "TIDEOpaqueValue":
-            value_hash = getattr(value, "value_hash", "unhashed")
-            return f"opaque<{value.type_name}>[{value_hash[:20]}]"
+        from tide_tooling.tooling_core.bundling.TIDEOpaqueValue import (
+            TIDEOpaqueValue,
+        )
+
+        if isinstance(value, TIDEOpaqueValue):
+            return value.type_name
 
         return type(value).__name__ if not isinstance(value, type) else value.__name__
 
             
-    # exec_record, actor, reference effect, value, 
-    def _infer_kind(self, input):
-        if isinstance(input, Inspected):
-            return "value"
+    def _infer_kind(self, value):
+        if isinstance(value, (Inspected, Object)):
+            return value.type
 
-        # Imported TIDE Models retain the host's opaque Execution identifiers.
-        # Resolve an exact indexed identity before applying native TIDE
-        # heuristics such as sequence-number or value inference.
         try:
-            if input in self.index.exec_by_exec_id:
+            if value in self._execs:
                 return "exec_record"
         except TypeError:
             pass
 
-        kind = "unknown"
-        if self._is_val_hash(input):
-            #print(f"Infered {input} as hash. If this is an wrong, please use trace.inspect(obj, kind='hash' or 'hash')")
+        if isinstance(value, Effects):
+            return "effect"
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance(value[0], Effects)
+        ):
+            return "effect"
+
+        if isinstance(value, Actor):
+            return "actor"
+        if (
+            isinstance(value, tuple)
+            and len(value) == 3
+            and all(isinstance(part, (int, str)) for part in value)
+        ):
+            return "actor"
+
+        if self._is_val_hash(value):
             return "hash"
-        # is input actor
-        if isinstance(input, tuple):
-            if len(input) == 2 and isinstance(input[0], Effects):
-                kind = "effect"
-            elif len(input) == 3 and isinstance(input[0], int):
-                if isinstance(input[1], (int, str)) and isinstance(input[2], (int, str)):
-                    #print(f"Infered {input} as Actor. If this is a value, please use trace.inspect(obj, kind='value') as input")
-                    kind = "actor"
-                    
-        # is reference or exec_id 
-        elif isinstance(input, str):
-            if _is_tide_exec_uuid(input):
-                kind ="exec_record"
-            elif ":" in input:
-                split = input.split(":")[0]
-                self.runner: PipelineRunner
-                if hasattr(self.runner, "store_router") and hasattr(self.runner.store_router, "registry") and hasattr(self.runner.store_router, "__seen_stores__"):
-                    if split in self.runner.store_router.registry.__seen_stores__:
-                    #print(f"Infered {input} as reference. If this is an wrong, please use trace.inspect(obj, kind='ref' or 'reference')")
-                        kind='reference'
-                elif any(split.startswith(store) for store in DEFAULT_TIDE_STORES):
-                    kind = 'reference' 
-            else:
-                #print(f"Infered {input} as Value. If this is a value, please use trace.inspect(obj, kind='') as input")
-                kind = "value"
-        elif isinstance(input, int):
-            if input < len(self.exec_log):
-                return "seq_id"
-            else:
-                kind = "value"
-        else:          
-            #print(f"Infered {input} as Value. If this is wrong, please use trace.inspect(obj, kind='value') as input")
-            kind = "value"
-            
-        return kind
-    
-    def _is_valid_obj_kind(self, candidate):
-        return candidate in [
-            "seq_id",
-            "exec",
-            "exec_id",
-            "exec_record",
-            "value",
-            "hash",
-            "ref", 
-            "reference",
-            "dep", 
-            "actor", 
-            "effect" 
-        ]
 
-    def inspect(
-        self,
-        reference: Any,
-        kind: str | None = None,
-        version=None,
-        grouped: bool = True,
-    ) -> Inspected | InspectedGroup:
-        
-        # if not kind:
-        #     raise RuntimeError(f"[INSPECT] {reference} used kind {kind}")    
-        if isinstance(reference, Inspected):
-            return reference
-        if isinstance(reference, Object):
-            reference = reference.id
-        if not kind:
-            kind = self._infer_kind(reference)  
-        
-        if not self._is_valid_obj_kind(kind):
-            raise InvalidObjectKindError(f"{reference} | type={kind} is not known or does not exist in TIDE!", kind)
-        object = Object(object=reference, type=kind, id=reference)
-        inspected = Inspected(object)
-        fallback = Inspected(object)
+        if isinstance(value, str):
+            if value in self._index.seen_refs:
+                return "reference"
+            if ":" in value:
+                store = value.split(":", 1)[0]
+                seen_stores = {
+                    reference.split(":", 1)[0]
+                    for reference in self._index.seen_refs
+                }
+                if store in DEFAULT_TIDE_STORES or store in seen_stores:
+                    return "reference"
+            return "value"
+
+        if isinstance(value, int) and any(
+            record.seq_id == value for record in self._records
+        ):
+            return "seq_id"
+
+        return "value"
+
+    def inspect(self, value, kind=None, version=None, grouped=True):
+        if isinstance(value, Inspected):
+            if value.trace is None:
+                value.trace = self
+            return value
+
+        if isinstance(value, Object):
+            kind = kind or value.type
+            value = value.id
+
+        kind = {
+            "exec": "exec_record",
+            "exec_id": "exec_record",
+            "ref": "reference",
+            "dep": "reference",
+        }.get(kind, kind)
+
+        if kind == "actor" and isinstance(value, str):
+            actor_name, occurrence = self._split_actor_occurrence(value, version)
+            if actor_name != value:
+                exact = next((record for record in self._execution_records if repr(record.producer_occurrence_id) == value), None)
+                if exact is not None:
+                    return self.inspect_actor(*exact.producer_id.id, version=occurrence)
+
+        if kind == "reference" and isinstance(value, str):
+            reference, state_version = self._split_state_identity(value, version)
+            if reference != value:
+                exact = self.inspect_ref(reference, state_version)
+                if exact.exists:
+                    return exact
+                nearby = self.find(reference, state_version).first("reference")
+                if nearby is not None:
+                    return self.inspect_ref(nearby.id, state_version)
+
+        actor_value, actor_version = self._split_actor_occurrence(value, version)
+        if kind == "actor" or (
+            kind is None
+            and actor_value in self._index.func_name_to_actors
+            and actor_version is not None
+        ):
+            value, version = actor_value, actor_version
+        value, version = self._split_state_identity(value, version)
+
+        kind = kind or self._infer_kind(value)
+        fallback = Inspected(
+            Object(value, kind, value),
+            trace=self,
+        )
+
         if kind == "seq_id":
-            if reference < len(self.exec_log):
-                exec_log = self.exec_log[reference]
-                reference = exec_log.exec_id
-                kind = "exec_id" 
+            record = next(
+                (record for record in self._records if record.seq_id == value),
+                None,
+            )
+            if isinstance(record, ExecRecord):
+                return self.inspect_exec(record.exec_id)
+            if isinstance(record, ImmediateEffectRecord):
+                return self.inspect_immediate_effect(record)
+            return fallback
 
-        if kind == "exec" or kind=="exec_record" or kind == "exec_id":   
-            inspected = self.inspect_exec(reference)
+        if kind == "immediate_effect_record":
+            record = next(
+                (
+                    record
+                    for record in self._records
+                    if isinstance(record, ImmediateEffectRecord)
+                    and (
+                        record.seq_id == value
+                        or record.event_id == value
+                    )
+                ),
+                None,
+            )
+            return (
+                self.inspect_immediate_effect(record)
+                if record is not None
+                else fallback
+            )
 
-        if kind == "value" or kind == "hash":
-            inspected = self.inspect_value(reference, kind)
+        if kind == "exec_record":
+            return self.inspect_exec(value)
 
-        if kind == "ref" or kind == "reference" or kind == "dep":
-            
-            if isinstance(reference, str) and ":" not in reference:
-                if not grouped:
-                    inspected_ref = self.find(reference, version).first("reference")
-                    reference = inspected_ref.id
-                else:
-                    inspected = self.inspect_as_group(reference, "reference", version)
-                    return inspected
-            
-            inspected = self.inspect_ref(reference, kind, version)
+        if kind in {"value", "hash"}:
+            return self.inspect_value(value, kind)
 
-        if kind == "actor": # add an Actor(object)\
-            if isinstance(reference, str):
-                if not grouped:
-                    inspected_actor = self.find(reference).first("actor")
-                    if inspected_actor and inspected_actor.object.source_ocean:
-                        reference = inspected_actor.id
-                else:
-                    inspected = self.inspect_as_group(reference, "actor")
-                    return inspected
-            if isinstance(reference, Actor):
-                reference = (reference.source_ocean, reference.source_runner, reference.source_actor)
-            if isinstance(reference, str):
-                return inspected
+        if kind == "reference":
+            if isinstance(value, str) and ":" not in value:
+                if grouped:
+                    return self.inspect_as_group(value, "reference", version)
 
-            inspected = self.inspect_actor(*reference)
-            
-                
-           
+                match = self.find(value, version).first("reference")
+                return (
+                    self.inspect_ref(match.id, version)
+                    if match is not None
+                    else fallback
+                )
+
+            return self.inspect_ref(value, version)
+
+        if kind == "actor":
+            if isinstance(value, str):
+                if grouped and version is None:
+                    return self.inspect_as_group(value, "actor")
+
+                match = self.find(value, version).first("actor")
+                return (
+                    self.inspect_actor(*match.id.id, version=version)
+                    if match is not None
+                    else fallback
+                )
+
+            actor = value if isinstance(value, Actor) else Actor(*value)
+            return self.inspect_actor(*actor.id, version=version)
 
         if kind == "effect":
-            inspected = self.inspect_effect(reference, version)
+            return self.inspect_effect(value, version)
 
-        if inspected.exists:
-            return inspected
-        return fallback
-    def _get_pipeline_named_tuple_from_id(self, pipeline_id, runner_id=None):
-        supplied_name = self._source_pipeline_names.get(
-            (runner_id, pipeline_id)
+        raise InvalidObjectKindError(
+            f"{value} | type={kind} is not known to TIDE",
+            kind,
         )
-        if supplied_name is not None:
-            return pipeline_id, supplied_name
-
-        pipeline_tuple = self.all_known_pipelines.get(pipeline_id, None)
-        if pipeline_tuple is not None:
-            pipeline_name = pipeline_tuple[0].name
-        else:
-            pipeline_name = pipeline_id
-        named_tuple = (pipeline_id, pipeline_name)
-        return named_tuple
+    def _get_pipeline_named_tuple_from_id(self, pipeline_id, runner_id=None):
+        return pipeline_id, self._pipeline_names.get(pipeline_id, pipeline_id)
 
     def _dep_records(self, record: DependencyUseRecord):
         return record.expanded_to if record.type == "dynamic" else [record]
 
-    def inspect_exec(self, exec_id: str):
-        try:
-            exec_log: ExecRecord = self.index.exec_by_exec_id[exec_id]
-        except KeyError:
-            object = Object(object=exec_id, type="exec_record", id=exec_id)
-            inspected = Inspected(object)
-            return inspected
+    def inspect_exec(self, exec_id):
+        retained = self._execs.get(exec_id)
+        execution = retained
+        if execution is None:
+            return Inspected(Object(exec_id, "exec_record", exec_id), trace=self)
 
-        obj = Object(exec_log)
-        obj.type = "exec_record"
-        obj.id = exec_log.exec_id
-        obj.source_runner = [exec_log.runner_id]
-        obj.source_ocean = [exec_log.source_ocean_id]
-        obj.source_pipeline = [self._get_pipeline_named_tuple_from_id(
-            exec_log.pipeline_id,
-            exec_log.runner_id,
-        )]
+        # Describe the recorded execution and its source.
+        obj = Object(execution, "exec_record", exec_id, exists=True)
+        obj.source_ocean = [execution.source_ocean_id]
+        obj.source_runner = [execution.runner_id]
+        pipeline_name = self._pipeline_names.get(execution.pipeline_id)
+        obj.source_pipeline = (
+            [(execution.pipeline_id, pipeline_name)]
+            if pipeline_name is not None
+            else []
+        )
 
+        obj.reads = execution.deps
+        obj.writes = execution.writes
+        obj.effects = execution.effects
 
-        def strip_expansion(dynamic_dep_record: DependencyUseRecord):
-            if dynamic_dep_record.type == "dynamic":
-                stripped = copy.deepcopy(dynamic_dep_record)
-                stripped.expanded_to = []
-                return stripped
-            return dynamic_dep_record
-
-        obj.declared = {
-            "deps": copy.deepcopy(exec_log.declared_deps),
-            "effects": copy.deepcopy(exec_log.declared_effects),
-            "targets": copy.deepcopy(exec_log.declared_targets),
-        }
-
-        used_deps = DedupedList()
-        for dep in exec_log.deps:
-            for dep_record in self._dep_records(dep):
-                used_deps.append((dep_record.unscoped_reference, dep_record.resolved_version))
-
-            
-        obj.used = {
-            "deps": used_deps,
-            "effects": exec_log.effects,
-            "targets": [(write.stored_target, write.stored_version) for write in exec_log.writes],
-        }
-
-        obj.reads = exec_log.deps
-        obj.writes = exec_log.writes
-        obj.effects = exec_log.effects
-
-        obj.output = __TEMPLATE__
-
+        # Derive the executions which led into this one.
         upstream = deduped_dict()
+        for edge in self._index.producer_edges_by_exec_id[exec_id]:
+            producer = self._execs.get(edge.producer_exec_id)
+            if producer is not None:
+                upstream[producer.producer_id].add(producer.exec_id)
 
-        # for _, record in exec_log.inputs.items():
-        #     record: InputUseRecord
-        #     dep_records = record.dependencies
-        for dependency in exec_log.deps:
-            for dep_record in self._dep_records(dependency):
-                dep_record: DependencyUseRecord
-                producer_exec_id = dep_record.producer_exec_id
-                if producer_exec_id is None:
-                    continue
-
-                producer_exec = self.index.exec_by_exec_id.get(producer_exec_id)
-                if producer_exec is None:
-                    continue
-
-                upstream[producer_exec.producer_id].append(producer_exec_id)
-
+        # Derive the executions which followed from this one.
         downstream = deduped_dict()
-        for record in exec_log.writes:
-            record: WriteRecord
-            reference = record.stored_target
-            version = record.stored_version
-            consumer_exec_ids = self.index.ref_version_to_consumer_exec_ids.get((reference, version), [])
-            
-            for id in consumer_exec_ids:
-                consumer_exec = self.index.exec_by_exec_id[id]    
-                downstream[consumer_exec.producer_id].append(id)
+        for edge in self._index.consumed_edges_by_exec_id[exec_id]:
+            consumer = self._execs.get(edge.consumer_exec_id)
+            if consumer is not None:
+                downstream[consumer.producer_id].add(consumer.exec_id)
 
-        inspected = Inspected(obj, None, upstream, downstream)
-
-        return inspected
-
-    def inspect_value(self, value_or_hash: Any, kind: str):
-        hashed = tide_value_hasher(value_or_hash) if kind == "value" else value_or_hash
-
-        if kind == "hash":
-            value = self.index.value_by_hash[hashed]
-            obj = Object(value)
-        else:
-            obj = Object(value_or_hash)
-        obj.id = hashed
-        obj.type = "value"
-
-        producer_exec_ids = self.index.value_hash_to_producer_exec_ids.get(hashed, [])
-
-        upstream = deduped_dict()
-
-        source_oceans = DedupedList()
-        source_runners = DedupedList()
-        source_pipelines = DedupedList()
-        for exec_id in producer_exec_ids:
-            exec_log = self.index.exec_by_exec_id[exec_id]
-            source_oceans.add(exec_log.source_ocean_id)
-            source_runners.add(exec_log.runner_id)
-            source_pipelines.add(self._get_pipeline_named_tuple_from_id(exec_log.pipeline_id))
-            upstream[exec_log.producer_id].append(exec_log.exec_id)
-
-        obj.source_ocean = source_oceans
-        obj.source_runner = source_runners
-        obj.source_pipeline = source_pipelines
-
-        history = self.index.value_hash_to_versioned_refs.get(hashed, [])
-
-        for ver_ref in history:
-            
-            if ver_ref in self.index.ref_ver_to_read_egdes:
-                obj.reads.extend(self.index.ref_ver_to_read_egdes[ver_ref])
-            if ver_ref in self.index.ref_ver_to_write_egde:
-                obj.writes.append(self.index.ref_ver_to_write_egde[ver_ref])
-
-
-        downstream = deduped_dict()
-        for exec_id in self.index.value_hash_to_consumer_exec_ids.get(hashed, []):
-            exec_log = self.index.exec_by_exec_id[exec_id]
-            downstream[exec_log.producer_id].append(exec_log.exec_id)
-
-        inspected = Inspected(obj, history, upstream, downstream)
-        return inspected
-
-    def inspect_ref(self, reference: str, kind: str, version: int = None):
-        obj = Object(reference)
-        obj.type = "reference"
-        obj.id = reference
-        full_version_history = list(self.index.versions_by_ref.get(reference, []))
-        if not full_version_history:
-            return Inspected(obj)
-
-        if version is not None:
-            obj.version = version
-            if version not in full_version_history:
-                return Inspected(obj)
-
-        if version is not None:
-            version_history = [
-                value_version
-                for value_version in full_version_history
-                if value_version <= version
-            ]
-        else:
-            version_history = full_version_history
-
-        for ver in version_history:
-            if version is not None and version != ver:
-                continue
-            ver_ref = (reference, ver)
-            
-            if ver_ref in self.index.ref_ver_to_read_egdes:
-                obj.reads.extend(self.index.ref_ver_to_read_egdes[(reference, ver)])
-            if ver_ref in self.index.ref_ver_to_write_egde:
-                obj.writes.append(self.index.ref_ver_to_write_egde[(reference, ver)])
-
-        if kind != "dep":
-            producer_exec_ids = self.index.ref_to_writer_exec_ids.get(reference, [])
-
-            source_oceans = DedupedList()
-            source_runners = DedupedList()
-            source_pipelines = DedupedList()
-            for exec_id in producer_exec_ids:
-                for ver in version_history:
-                    if version is not None: 
-                        if version != ver or exec_id != self.index.ref_version_to_producer_exec_id[(reference, ver)]:
-                            continue
-                        
-                    exec_log = self.index.exec_by_exec_id[exec_id]
-                    source_oceans.add(exec_log.source_ocean_id)
-                    source_runners.add(exec_log.runner_id)
-                    source_pipelines.add(self._get_pipeline_named_tuple_from_id(exec_log.pipeline_id))
-            obj.source_ocean = source_oceans
-            obj.source_runner = source_runners
-            obj.source_pipeline = source_pipelines
-
-        downstream = deduped_dict()
-        if version is not None:
-            consumer_exec_ids = self.index.ref_version_to_consumer_exec_ids.get((reference, version), [])
-        else:
-            consumer_exec_ids = self.index.ref_to_consumer_exec_ids.get(reference, [])
-
-        for exec_id in consumer_exec_ids:
-            for ver in version_history:
-                if version is not None: 
-                    if version != ver or exec_id not in  self.index.ref_version_to_consumer_exec_ids[(reference, ver)]:
-                        continue
-                exec_log = self.index.exec_by_exec_id[exec_id]
-
-                downstream[exec_log.producer_id].append(exec_log.exec_id)
-
-        upstream = deduped_dict()
-        for v in version_history:
-            producer_exec_id = self.index.ref_version_to_producer_exec_id.get((reference, v))
-            if producer_exec_id is None:
-                continue
-            for ver in version_history:
-                if version is not None: 
-                    if version != ver or producer_exec_id != self.index.ref_version_to_producer_exec_id[(reference, ver)]:
-                        continue
-                exec_log = self.index.exec_by_exec_id[producer_exec_id]
-                
-                upstream[exec_log.producer_id].append(exec_log.exec_id)
-
-        inspected = Inspected(obj, version_history, upstream, downstream)
-
-        return inspected
-
-    # def inspect_ref_as_group(self, ref_name:str):
-
-    def inspect_as_group(self, reference: str, kind=None, version=None):
-        if not kind:
-            kind = self._infer_kind(reference)
-
-        if kind == "reference":
-            find_kind = "refs"
-        elif kind == "actor":
-            find_kind = "actors"
-        else:
-            object = Object(reference, kind, reference)
-            return Inspected(object)
-        found = self.find(reference, version)
-        
-        if not found:
-            object = Object(reference, kind, reference)
-            return Inspected(object)
-        
-        found_kind = getattr(found.nearby, f"{find_kind}")
-        
-        objects = []
-        source_oceans = DedupedList()
-        source_runners = DedupedList()
-        source_pipelines = DedupedList()
-        history = DedupedList()
-        history_dict = deduped_dict()
-        upstream = deduped_dict()
-        downstream = deduped_dict()
-
-        reads = DedupedList()
-        writes = DedupedList()
-
-        for found_inspected in found_kind:
-            found_inspected: Inspected
-            if version is not None:
-                if version not in found_inspected.history:
-                    continue
-                found_inspected = self.inspect(found_inspected.id, "reference", version)
-            objects.append(found_inspected.object)
-            reads.extend(found_inspected.object.reads)
-            writes.extend(found_inspected.object.writes)
-            source_oceans.extend(found_inspected.object.source_ocean)
-            source_runners.extend(found_inspected.object.source_runner)
-            source_pipelines.extend(found_inspected.object.source_pipeline)
-            if found_inspected.type == "reference":
-                history.extend([(found_inspected.object.id, ver) for ver in found_inspected.history])
-            else:
-                curr_hist = [self.inspect(exec_id, "exec_record") for exec_id in found_inspected.history]
-                for inspected_exec in curr_hist:
-                    history_dict[inspected_exec.object.object.seq_id] = inspected_exec.id
-
-            for source_id, execs in found_inspected.upstream.items():
-                upstream[source_id].extend(execs)
-            
-            for source_id, execs in found_inspected.downstream.items():
-                downstream[source_id].extend(execs)
-        if not history:    
-           history = [history_dict[idx] for idx in sorted(history_dict)]        
-            
-
-        inspected_group = InspectedGroup(objects, kind, reference, history, upstream, downstream, source_oceans, source_runners, source_pipelines, version=version, reads=reads, writes=writes)
-        return inspected_group
-
-    def inspect_actor(self, ocean_id: int | None, source: str | int, actor: str | int):
-        actor = Actor(ocean_id, source, actor)
-
-        obj = Object(actor)
-        obj.type = "actor"
-        obj.id = actor
-
-        exec_ids = self.index.actor_to_exec_ids.get(actor, [])
-
-        obj.source_ocean = [ocean_id]
-        obj.source_runner = [source]
-        
-        obj.source_pipeline = DedupedList()
-
-        upstream = deduped_dict()
-        downstream = deduped_dict()
-
-        # Emission is a causal actor relationship even when no value
-        # dependency connects the two nodes. The event log already records
-        # and indexes this relationship; expose it to the same path surface
-        # used by read/write dependencies.
-        for emitted_actor in self.index.actors_by_emitter_actor.get(actor, []):
-            downstream[emitted_actor].extend(
-                self.index.actor_to_exec_ids.get(emitted_actor, [])
-            )
-
-        for emitter_exec_id in (
-            self.index.emitted_actor_to_emitter_exec_ids.get(actor, [])
-        ):
-            emitter_log = self.index.exec_by_exec_id[emitter_exec_id]
-            upstream[emitter_log.producer_id].append(emitter_exec_id)
-
-        for exec_id in exec_ids:
-            exec_inspected = self.inspect(exec_id, "exec_record")
-            reads = self.index.reads_by_exec_id.get(exec_id, [])
-            writes = self.index.writes_by_exec_id.get(exec_id, [])
-
-            obj.reads.extend(reads)
-            obj.writes.extend(writes)
-            
-            obj.source_pipeline.extend(exec_inspected.object.source_pipeline)
-
-            
-            for record in reads:
-                for dep_record in self._dep_records(record):
-                    dep_record: DependencyUseRecord
-                    reference = dep_record.unscoped_reference
-                    version = dep_record.resolved_version
-                    producer_exec_log = self.index.exec_by_exec_id[
-                        self.index.ref_version_to_producer_exec_id[(reference, version)]
-                    ]
-                    upstream[producer_exec_log.producer_id].append(producer_exec_log.exec_id)
-
-            for record in writes:
-                record: WriteRecord
-                reference = record.stored_target
-                version = record.stored_version
-                exec_logs = [
-                    self.index.exec_by_exec_id[consumer_exec_id]
-                    for consumer_exec_id in self.index.ref_version_to_consumer_exec_ids.get((reference, version), [])
-                ]
-                for exec_log in exec_logs:
-                    downstream[exec_log.producer_id].append(exec_log.exec_id)
-
-            obj.effects.extend(exec_inspected.object.effects)
-
-        inspected = Inspected(obj, exec_ids, upstream, downstream)
-
-        return inspected
-
-    def inspect_effect(self, reference, version):
-        effect = None
-        target = None
-        embedded_version = None
-
-        if isinstance(reference, Effects):
-            effect = reference
-        elif isinstance(reference, tuple) and len(reference) == 2:
-            effect = reference[0]
-            target = reference[1]
-            if isinstance(target, tuple) and len(target) == 2:
-                target, embedded_version = target
-        else:
-            raise TypeError(
-                "Trace effect identifiers must be Effects.KIND, "
-                "(Effects.KIND, reference), or "
-                "(Effects.KIND, (reference, version))"
-            )
-
-        if not isinstance(effect, Effects):
-            raise TypeError("Trace effect kind must be an Effects value")
-
-        selected_version = version if version is not None else embedded_version
-        if target is None:
-            effect_id = effect
-            records = self.index.effect_records_by_type.get(effect, [])
-            producer_exec_ids = self.index.effect_type_to_producer_exec_ids.get(
-                effect,
-                [],
-            )
-            all_affected = self.index.effect_type_to_affected.get(effect, [])
-        elif selected_version is None:
-            effect_id = (effect, target)
-            records = self.index.effect_records_by_target.get(effect_id, [])
-            producer_exec_ids = self.index.effect_to_producer_exec_ids.get(
-                effect_id,
-                [],
-            )
-            all_affected = self.index.effect_to_affected.get(effect_id, [])
-        else:
-            effect_id = (effect, (target, selected_version))
-            records = self.index.effect_records_by_versioned_target.get(
-                (effect, target, selected_version),
-                [],
-            )
-            producer_exec_ids = (
-                self.index.effect_versioned_target_to_producer_exec_ids.get(
-                    (effect, target, selected_version),
-                    [],
-                )
-            )
-            all_affected = self.index.effect_versioned_target_to_affected.get(
-                (effect, (target, selected_version)),
-                [],
-            )
-
-        obj = Object(effect_id)
-        obj.id = effect_id
-        obj.type = "effect"
-        obj.version = selected_version
-        obj.effects.extend(records)
-
-        source_oceans = DedupedList()
-        source_runners = DedupedList()
-        source_pipelines = DedupedList()
-
-        upstream = deduped_dict()
-
-        for exec_id in producer_exec_ids:
-            exec_log = self.index.exec_by_exec_id[exec_id]
-            source_oceans.add(exec_log.source_ocean_id)
-            source_runners.add(exec_log.runner_id)
-            source_pipelines.add(self._get_pipeline_named_tuple_from_id(exec_log.pipeline_id))
-            upstream[exec_log.producer_id].append(exec_log.exec_id)
-
-        obj.source_ocean = source_oceans
-        obj.source_runner = source_runners
-        obj.source_pipeline = source_pipelines
-
-        downstream = deduped_dict()
-
-        for affected in all_affected:
-            for affectee, record in affected.items():
-                record: AffectedRecord
-                affected_exec_id = record.affected_exec_id
-                affected_actor = affectee
-                affected_inputs = record.affected_inputs
-                downstream[affected_actor].append(affected_exec_id or affected_inputs)
-
-        inspected = Inspected(
+        return Inspected(
             obj,
-            history=list(producer_exec_ids),
             upstream=upstream,
             downstream=downstream,
-        )
-        return inspected
-
-    @staticmethod
-    def _validate_stream_limits(depth, max_paths):
-        if depth is not None and (
-            isinstance(depth, bool)
-            or not isinstance(depth, int)
-            or depth < 0
-        ):
-            raise ValueError("stream depth must be a non-negative int or None")
-        if max_paths is not None and (
-            isinstance(max_paths, bool)
-            or not isinstance(max_paths, int)
-            or max_paths < 1
-        ):
-            raise ValueError("stream max_paths must be a positive int or None")
-
-    def _stream_adjacency(self, direction):
-        if direction == "upstream":
-            return (
-                self.index.consumer_exec_id_to_producer_input_edges,
-                "producer_exec_id",
-            )
-        if direction == "downstream":
-            return (
-                self.index.producer_exec_id_to_consumer_input_edges,
-                "consumer_exec_id",
-            )
-        raise ValueError(
-            "stream direction must be 'upstream' or 'downstream'"
+            trace=self,
         )
 
-    @staticmethod
-    def _stream_root_state_versions(inspected, direction):
-        """Constrain a downstream State query to that exact State.
+    def _ancestry_source(self, value, kind=None):
+        inspected = self.inspect(value, kind=kind, grouped=False)
+        if inspected.type != "exec_record" or not inspected.exists:
+            return inspected, None
+        return inspected, inspected.object.object
 
-        Traversal is Execution-based after the first handoff.  A reference or
-        value query must therefore select its own State-labelled root edges
-        before traversal begins; otherwise sibling outputs of the same
-        producer appear as false downstream ancestry.
-        """
-        if direction != "downstream":
+    def parents_of(self, value, kind=None):
+        inspected, execution = self._ancestry_source(value, kind)
+        parents = ()
+        if execution is not None:
+            parent_exec_id = self._index.parent_exec_id_by_exec_id.get(
+                execution.exec_id
+            )
+            parent = self._execs.get(parent_exec_id)
+            if parent is not None:
+                parents = (parent,)
+        return ExecutionAncestry(self, execution, parents, "parents")
+
+    def children_of(self, value, kind=None):
+        inspected, execution = self._ancestry_source(value, kind)
+        children = ()
+        if execution is not None:
+            children = tuple(
+                sorted(
+                    (
+                        self._execs[exec_id]
+                        for exec_id in self._index.child_exec_ids_by_exec_id.get(
+                            execution.exec_id,
+                            (),
+                        )
+                        if exec_id in self._execs
+                    ),
+                    key=lambda child: child.seq_id,
+                )
+            )
+        return ExecutionAncestry(self, execution, children, "children")
+
+    def inspect_immediate_effect(self, record):
+        obj = Object(
+            record,
+            "immediate_effect_record",
+            record.seq_id,
+            exists=True,
+        )
+        actor = record.producer_id
+        if actor is not None:
+            obj.source_ocean = [actor.source_ocean]
+            obj.source_runner = [actor.source_runner]
+        obj.reads = record.deps
+        obj.writes = record.writes
+        obj.effects = record.effects
+        return Inspected(obj, trace=self)
+
+    def inspect_value(self, value_or_hash, kind):
+        value_hash = value_or_hash if kind == "hash" else tide_value_hasher(value_or_hash)
+        captured = self._index.value_by_hash.get(value_hash, value_or_hash)
+        obj = Object(detached_tide_value(captured), "value", value_hash)
+        history = list(self._index.ref_versions_by_value_hash.get(value_hash, ()))
+
+        if not history:
+            return Inspected(obj, trace=self)
+
+        obj.exists = True
+        upstream = deduped_dict()
+        downstream = deduped_dict()
+        source_oceans = DedupedList()
+        source_runners = DedupedList()
+        source_pipelines = DedupedList()
+
+        # Collect every State occurrence carrying this value.
+        for ref_version in history:
+            obj.reads.extend(tuple(
+                self._index.read_records_by_ref_version[ref_version]
+            ))
+
+            obj.writes.extend(tuple(
+                self._index.write_records_by_ref_version.get(ref_version, ())
+            ))
+
+            # Derive producing execution evidence.
+            for producer_exec_id in self._index.producer_exec_ids_by_ref_version.get(
+                ref_version,
+                (),
+            ):
+                producer = self._execs.get(producer_exec_id)
+                if producer is not None:
+                    upstream[producer.producer_id].add(producer.exec_id)
+                    source_oceans.add(producer.source_ocean_id)
+                    source_runners.add(producer.runner_id)
+
+                    pipeline_name = self._pipeline_names.get(producer.pipeline_id)
+                    if pipeline_name is not None:
+                        source_pipelines.add((producer.pipeline_id, pipeline_name))
+
+            # Derive consuming execution evidence.
+            for consumer_exec_id in self._index.consumer_exec_ids_by_ref_version[ref_version]:
+                consumer = self._execs.get(consumer_exec_id)
+                if consumer is not None:
+                    downstream[consumer.producer_id].add(consumer.exec_id)
+
+        obj.source_ocean = source_oceans
+        obj.source_runner = source_runners
+        obj.source_pipeline = source_pipelines
+        return Inspected(obj, history, upstream, downstream, trace=self)
+
+    def inspect_ref(self, reference, version=None):
+        if isinstance(reference, DataRef):
+            scoped_reference = DataRef.to_string(reference, prefix=False)
+            reference = (
+                reference.key
+                if reference.key in self._index.seen_refs
+                else scoped_reference
+            )
+
+        obj = Object(reference, "reference", reference)
+        history = list(self._index.versions_by_ref.get(reference, ()))
+
+        if not history or (version is not None and version not in history):
+            return Inspected(obj, trace=self)
+
+        obj.exists = True
+        obj.version = version
+        selected_versions = history if version is None else [version]
+
+        # Collect the exact read and write evidence.
+        for selected_version in selected_versions:
+            ref_version = (reference, selected_version)
+            obj.reads.extend(tuple(
+                self._index.read_records_by_ref_version[ref_version]
+            ))
+
+            obj.writes.extend(tuple(
+                self._index.write_records_by_ref_version.get(ref_version, ())
+            ))
+
+        # Derive producing and consuming executions.
+        upstream = deduped_dict()
+        downstream = deduped_dict()
+        source_oceans = DedupedList()
+        source_runners = DedupedList()
+        source_pipelines = DedupedList()
+
+        for selected_version in selected_versions:
+            ref_version = (reference, selected_version)
+            for producer_exec_id in self._index.producer_exec_ids_by_ref_version.get(
+                ref_version,
+                (),
+            ):
+                producer = self._execs.get(producer_exec_id)
+
+                if producer is not None:
+                    upstream[producer.producer_id].add(producer.exec_id)
+                    source_oceans.add(producer.source_ocean_id)
+                    source_runners.add(producer.runner_id)
+
+                    pipeline_name = self._pipeline_names.get(producer.pipeline_id)
+                    if pipeline_name is not None:
+                        source_pipelines.add((producer.pipeline_id, pipeline_name))
+
+            for consumer_exec_id in self._index.consumer_exec_ids_by_ref_version[ref_version]:
+                consumer = self._execs.get(consumer_exec_id)
+                if consumer is not None:
+                    downstream[consumer.producer_id].add(consumer.exec_id)
+
+        obj.source_ocean = source_oceans
+        obj.source_runner = source_runners
+        obj.source_pipeline = source_pipelines
+        return Inspected(obj, history, upstream, downstream, trace=self)
+
+    def inspect_as_group(self, value, kind, version=None):
+        if kind not in {"reference", "actor"}:
+            return Inspected(Object(value, kind, value))
+
+        searched = self.find(value, version)
+        matches = DedupedList(searched.get_exact(kind) + searched.get_nearby(kind))
+
+        objects = []
+        history = DedupedList()
+        actor_exec_ids = DedupedList()
+        reads = DedupedList()
+        writes = DedupedList()
+        upstream = deduped_dict()
+        downstream = deduped_dict()
+        source_oceans = DedupedList()
+        source_runners = DedupedList()
+        source_pipelines = DedupedList()
+
+        # Combine each matching exact inspection.
+        for inspected in matches:
+            objects.append(inspected.object)
+            reads.extend(inspected.reads)
+            writes.extend(inspected.writes)
+            source_oceans.extend(inspected.source_oceans or ())
+            source_runners.extend(inspected.source_runners or ())
+            source_pipelines.extend(inspected.source_pipelines or ())
+
+            if kind == "reference":
+                history.extend((inspected.id, selected_version) for selected_version in inspected.history)
+            else:
+                actor_exec_ids.extend(inspected.history)
+
+            for source, exec_ids in inspected.upstream.items():
+                upstream[source].extend(exec_ids)
+
+            for source, exec_ids in inspected.downstream.items():
+                downstream[source].extend(exec_ids)
+
+        # Actor history follows recorded execution order.
+        if kind == "actor":
+            history.extend(sorted(actor_exec_ids, key=lambda exec_id: self._execs[exec_id].seq_id))
+
+        return InspectedGroup(
+            objects,
+            kind,
+            value,
+            history,
+            upstream,
+            downstream,
+            source_oceans,
+            source_runners,
+            source_pipelines,
+            version=version,
+            reads=reads,
+            writes=writes,
+            trace=self,
+        )
+
+    def inspect_actor(self, ocean_id, runner_id, actor_name, version=None):
+        actor = Actor(ocean_id, runner_id, actor_name)
+        obj = Object(actor, "actor", actor)
+        if version is None:
+            exec_ids = list(self._index.actor_to_exec_ids.get(actor, ()))
+        else:
+            exec_id = self._index.actor_occurrence_to_exec_id.get((actor, version))
+            if exec_id is None: exec_ids = None
+            else: exec_ids = (exec_id,)
+
+                    
+
+        if not exec_ids:
+            return Inspected(obj, trace=self)
+
+        obj.exists = True
+        obj.source_ocean = [ocean_id]
+        obj.source_runner = [runner_id]
+        obj.source_pipeline = DedupedList()
+        obj.version = version
+        upstream = deduped_dict()
+        downstream = deduped_dict()
+
+        # Combine evidence from every execution of this actor.
+        for exec_id in exec_ids:
+            execution = self._execs[exec_id]
+            inspected = self.inspect_exec(exec_id)
+            detached_execution = inspected.object.object
+
+            obj.reads.extend(detached_execution.deps)
+            obj.writes.extend(detached_execution.writes)
+            obj.effects.extend(detached_execution.effects)
+            obj.source_pipeline.extend(inspected.source_pipelines)
+
+            for source, related_exec_ids in inspected.upstream.items():
+                upstream[source].extend(related_exec_ids)
+
+            for source, related_exec_ids in inspected.downstream.items():
+                downstream[source].extend(related_exec_ids)
+
+            # Infer actual executions of nodes this execution registered.
+            for emitted_node in execution.emitted_nodes:
+                if emitted_node.emitted_by_exec_id != exec_id:
+                    continue
+
+                node_key = (emitted_node.runner_id, emitted_node.node_id)
+                for candidate_id in self._index.exec_ids_by_runner_node[node_key]:
+                    candidate = self._execs[candidate_id]
+                    downstream[candidate.producer_id].add(candidate_id)
+
+            # Infer the execution which registered this execution's node.
+            emitter = self._execs.get(execution.emitted_by_exec_id)
+            if emitter is not None:
+                upstream[emitter.producer_id].add(emitter.exec_id)
+
+        return Inspected(obj, exec_ids, upstream, downstream, trace=self)
+
+    def inspect_effect(self, identifier, version=None):
+        # Parse the Effect query.
+        if isinstance(identifier, Effects):
+            effect, target = identifier, None
+        elif isinstance(identifier, tuple) and len(identifier) == 2:
+            effect, target = identifier
+        else:
+            raise TypeError("Effect inspection requires Effects.KIND or (Effects.KIND, target)")
+
+        if not isinstance(effect, Effects):
+            raise TypeError("Effect inspection requires an Effects value")
+
+        state_effect = effect in {Effects.READ, Effects.WRITE, Effects.DELETE}
+        embedded_version = None
+        if state_effect and isinstance(target, tuple) and len(target) == 2:
+            target, embedded_version = target
+
+        selected_version = version if version is not None else embedded_version
+
+        # Resolve matching target-level occurrences.
+        if target is None:
+            effect_id = effect
+            occurrences = self._index.effect_occurrences_by_type.get(effect, ())
+        elif selected_version is None:
+            effect_id = (effect, target)
+            occurrences = self._index.effect_occurrences_by_target.get((effect, target), ())
+        else:
+            effect_id = (effect, (target, selected_version))
+            occurrences = self._index.effect_occurrences_by_ref_version.get((effect, target, selected_version), ())
+
+        obj = Object(effect_id, "effect", effect_id, exists=bool(occurrences))
+        obj.version = selected_version
+        producer_exec_ids = DedupedList()
+        upstream = deduped_dict()
+        downstream = deduped_dict()
+        source_oceans = DedupedList()
+        source_runners = DedupedList()
+        source_pipelines = DedupedList()
+
+        # Collect each exact Effect occurrence.
+        for occurrence in occurrences:
+            producer_exec_id, record = self._index.effect_by_occurrence[occurrence]
+            obj.effects.append(record)
+            producer_exec_ids.add(producer_exec_id)
+
+            producer = self._execs.get(producer_exec_id)
+            if producer is not None:
+                upstream[producer.producer_id].add(producer_exec_id)
+                source_oceans.add(producer.source_ocean_id)
+                source_runners.add(producer.runner_id)
+
+                pipeline_name = self._pipeline_names.get(producer.pipeline_id)
+                if pipeline_name is not None:
+                    source_pipelines.add((producer.pipeline_id, pipeline_name))
+
+            for affected in self._index.affected_records_by_effect_occurrence[occurrence]:
+                affected_execution = self._execs.get(affected.affected_exec_id)
+                if affected_execution is not None:
+                    downstream[affected_execution.producer_id].add(affected_execution.exec_id)
+                elif affected.affected_inputs:
+                    downstream[affected.affectee].add(affected.affected_inputs)
+
+        obj.source_ocean = source_oceans
+        obj.source_runner = source_runners
+        obj.source_pipeline = source_pipelines
+        return Inspected(obj, producer_exec_ids, upstream, downstream, trace=self)
+
+    @staticmethod
+    def _state_history(source):
+        if source.type == "value" or source.grouped:
+            return list(source.history)
+
+        versions = source.history if source.version is None else [source.version]
+        return [(source.id, version) for version in versions]
+
+    def _normalise_query_source(self, source, kind, version, grouped):
+        if isinstance(source, Investigate):
+            source = source.inspected
+
+        if isinstance(source, Inspected):
+            return source
+
+        kind = kind or self._infer_kind(source)
+        if grouped:
+            return self.inspect(source, kind, version, grouped=True)
+
+        return self.find(source, version).first(kind)
+
+    @staticmethod
+    def _execution_history(source):
+        if source.type == "exec_record":
+            return [source.id] if source.exists else []
+        if source.type == "actor":
+            return list(source.history)
+
+        raise TypeError(
+            "relationship queries require a State, Actor, or ExecRecord"
+        )
+
+    def produced_by(
+        self,
+        source,
+        kind=None,
+        version=None,
+        group=True,
+    ):
+        source = self._normalise_query_source(
+            source,
+            kind,
+            version,
+            group,
+        )
+        if source is None:
             return None
 
-        if inspected.type == "reference":
-            if inspected.grouped:
-                return set(inspected.history)
+        by_exec = deduped_dict()
 
-            versions = (
-                [inspected.version]
-                if inspected.version is not None
-                else inspected.history
-            )
-            return {
-                (inspected.id, version)
-                for version in versions
-            }
+        # State -> executions which produced those exact State occurrences.
+        if source.type in {"reference", "value"}:
+            for state in self._state_history(source):
+                for exec_id in self._index.producer_exec_ids_by_ref_version[
+                    state
+                ]:
+                    by_exec[exec_id].append(state)
+            execs = list(by_exec)
 
-        if inspected.type == "value":
-            return set(inspected.history)
+        # Actor/ExecRecord -> State occurrences written by those executions.
+        else:
+            execs = self._execution_history(source)
+            for exec_id in execs:
+                for write in self._execs[exec_id].writes:
+                    by_exec[exec_id].append((
+                        write.stored_target,
+                        write.stored_version,
+                    ))
 
-        if inspected.type == "effect":
-            return {
-                record.targets
-                for record in inspected.object.effects
-                if record.targets[0] != "Runner"
-            }
-
-        return None
-
-    def _get_stream(self, inspected, depth, direction, max_paths):
-        """Walk exact relationship paths, then derive a unique layer view."""
-        self._validate_stream_limits(depth, max_paths)
-        adjacency, next_relation = self._stream_adjacency(direction)
-        seeds = self._execution_seeds(inspected)
-        root_state_versions = self._stream_root_state_versions(
-            inspected,
-            direction,
+        refs = DedupedList()
+        refs.extend(
+            state
+            for states in by_exec.values()
+            for state in states
         )
-        paths_by_root = defaultdict(list)
-        path_keys_by_root = defaultdict(set)
-        path_count = 0
-        truncated = False
+        return ProducedBy(self.inspect, source, execs, refs, by_exec)
 
-        def add_path(root_exec_id, path):
-            nonlocal path_count, truncated
-            path_key = tuple(Stream._edge_key(edge) for edge in path)
-            if path_key in path_keys_by_root[root_exec_id]:
-                return True
-            if max_paths is not None and path_count >= max_paths:
-                truncated = True
-                return False
-            path_keys_by_root[root_exec_id].add(path_key)
-            paths_by_root[root_exec_id].append(path)
-            path_count += 1
-            return True
+    def consumed_by(
+        self,
+        source,
+        kind=None,
+        version=None,
+        group=True,
+    ):
+        source = self._normalise_query_source(
+            source,
+            kind,
+            version,
+            group,
+        )
+        if source is None:
+            return None
 
-        for root_exec_id in seeds:
-            for root_edge in adjacency[root_exec_id]:
-                if truncated:
-                    break
-                if (
-                    root_state_versions is not None
-                    and (
-                        root_edge.produced_ref,
-                        root_edge.produced_ver,
-                    ) not in root_state_versions
+        by_exec = deduped_dict()
+
+        # State -> executions which consumed those exact State occurrences.
+        if source.type in {"reference", "value"}:
+            execs = DedupedList()
+            for state in self._state_history(source):
+                for exec_id in self._index.consumer_exec_ids_by_ref_version.get(
+                    state,
+                    (),
                 ):
-                    continue
-                next_exec_id = getattr(root_edge, next_relation)
-                stack = [(
-                    next_exec_id,
-                    [root_edge],
-                    depth,
-                    {root_exec_id, next_exec_id},
-                )]
+                    execs.add(exec_id)
+                    by_exec[exec_id].append(state)
 
-                while stack and not truncated:
-                    current_exec_id, path, remaining, visited = stack.pop()
-                    if remaining == 0:
-                        add_path(root_exec_id, path)
-                        continue
-
-                    candidates = []
-                    for edge in adjacency[current_exec_id]:
-                        candidate_exec_id = getattr(edge, next_relation)
-                        if candidate_exec_id in visited:
-                            continue
-                        candidates.append((edge, candidate_exec_id))
-
-                    if not candidates:
-                        add_path(root_exec_id, path)
-                        continue
-
-                    next_remaining = (
-                        None if remaining is None else remaining - 1
-                    )
-                    for edge, candidate_exec_id in reversed(candidates):
-                        stack.append((
-                            candidate_exec_id,
-                            [*path, edge],
-                            next_remaining,
-                            visited | {candidate_exec_id},
+        # Actor/ExecRecord -> State occurrences read by those executions.
+        else:
+            execs = self._execution_history(source)
+            for exec_id in execs:
+                for dependency in self._execs[exec_id].deps:
+                    for read in self._index._concretised_from(dependency):
+                        by_exec[exec_id].append((
+                            read.unscoped_reference,
+                            read.resolved_version,
                         ))
-            if truncated:
-                break
 
-        stream_stack = defaultdict(lambda: defaultdict(list))
-        for root_exec_id, paths in paths_by_root.items():
-            edge_projection = {}
-            projection_order = 0
-            for path in paths:
-                for index, edge in enumerate(path):
-                    layer = "root" if index == 0 else index - 1
-                    edge_key = Stream._edge_key(edge)
-                    layer_rank = -1 if layer == "root" else layer
-                    projected = edge_projection.get(edge_key)
-                    if projected is None:
-                        edge_projection[edge_key] = {
-                            "edge": edge,
-                            "layer": layer,
-                            "layer_rank": layer_rank,
-                            "order": projection_order,
-                        }
-                        projection_order += 1
-                    elif layer_rank < projected["layer_rank"]:
-                        projected["layer"] = layer
-                        projected["layer_rank"] = layer_rank
-
-            for projected in sorted(
-                edge_projection.values(),
-                key=lambda item: (item["layer_rank"], item["order"]),
-            ):
-                stream_stack[root_exec_id][projected["layer"]].append(
-                    projected["edge"]
-                )
-
-        return stream_stack, paths_by_root, truncated
-
+        refs = DedupedList()
+        refs.extend(
+            state
+            for states in by_exec.values()
+            for state in states
+        )
+        return ConsumedBy(self.inspect, source, execs, refs, by_exec)
 
     def upstream(
         self,
-        inspected: Any,
-        type: str | None = None,
-        grouped: bool = True,
-        depth: int | None = None,
-        max_paths: int | None = DEFAULT_STREAM_MAX_PATHS,
-    ) -> Upstream:
-        if not isinstance(inspected, Inspected):
-            inspected = self.inspect(
-                inspected,
-                type,
-                grouped=grouped,
-            )
-        stream_stack, stream_paths, truncated = self._get_stream(
-            inspected,
+        source,
+        type=None,
+        grouped=True,
+        depth=None,
+        max_paths=DEFAULT_STREAM_MAX_PATHS,
+    ):
+        return self._direction_stream(
+            source,
+            type,
+            grouped,
             depth,
-            "upstream",
             max_paths,
-        )
-        return Upstream(
-            inspected,
-            stream_stack,
-            stream_paths,
-            inspect=self.inspect,
-            truncated=truncated,
-            max_paths=max_paths,
+            "upstream",
         )
 
 
     def downstream(
         self,
-        inspected: Any,
-        type: str | None = None,
-        grouped: bool = True,
-        depth: int | None = None,
-        max_paths: int | None = DEFAULT_STREAM_MAX_PATHS,
-    ) -> Downstream:
-        if not isinstance(inspected, Inspected):
-            inspected = self.inspect(
-                inspected,
-                type,
-                grouped=grouped,
-            )
-        stream_stack, stream_paths, truncated = self._get_stream(
-            inspected,
+        source,
+        type=None,
+        grouped=True,
+        depth=None,
+        max_paths=DEFAULT_STREAM_MAX_PATHS,
+    ):
+        return self._direction_stream(
+            source,
+            type,
+            grouped,
             depth,
-            "downstream",
             max_paths,
+            "downstream",
         )
-        return Downstream(
-            inspected,
-            stream_stack,
-            stream_paths,
+
+
+    def _starting_exec_ids(self, source):
+        # Actor and ExecRecord histories already contain execution IDs.
+        if source.type in {"actor", "exec_record"}:
+            return self._execution_history(source)
+
+        # State histories begin at the execution which produced each State.
+        if source.type in {"reference", "value"}:
+            exec_ids = DedupedList()
+            for state in self._state_history(source):
+                exec_ids.extend(
+                    self._index.producer_exec_ids_by_ref_version[state]
+                )
+            return exec_ids
+
+        # Effect histories contain the executions which produced those Effects.
+        if source.type == "effect":
+            return list(source.history)
+
+        raise TypeError(
+            "streams require a State, Actor, ExecRecord, or Effect"
+        )
+
+
+    def _direction_stream(
+        self,
+        source,
+        kind,
+        grouped,
+        depth,
+        max_paths,
+        direction,
+    ):
+        # Accept only upstream/downstream and their supported limits.
+        if direction not in {"upstream", "downstream"}:
+            raise ValueError("direction must be 'upstream' or 'downstream'")
+        if depth is not None and (
+            isinstance(depth, bool)
+            or not isinstance(depth, int)
+            or depth < 0
+        ):
+            raise ValueError("depth must be a non-negative int or None")
+        if max_paths is not None and (
+            isinstance(max_paths, bool)
+            or not isinstance(max_paths, int)
+            or max_paths < 1
+        ):
+            raise ValueError("max_paths must be a positive int or None")
+
+        # Resolve the endpoint whose execution relationships will be followed.
+        if isinstance(source, Investigate):
+            source = source.inspected
+        if not isinstance(source, Inspected):
+            source = self.inspect(source, kind, grouped=grouped)
+
+        starting_exec_ids = self._starting_exec_ids(source)
+        source_states = (
+            set(self._state_history(source))
+            if direction == "downstream"
+            and source.type in {"reference", "value"}
+            else None
+        )
+        source_effects = (
+            tuple(source.object.effects)
+            if direction == "downstream" and source.type == "effect"
+            else None
+        )
+
+        paths = defaultdict(list)
+        path_count = 0
+        truncated = False
+
+        # Group parallel handoffs by the one next execution they lead to.
+        def grouped_handoffs(edges):
+            by_exec_id = {}
+            for edge in edges:
+                next_exec_id = (
+                    edge.producer_exec_id
+                    if direction == "upstream"
+                    else edge.consumer_exec_id
+                )
+                if next_exec_id is None:
+                    continue
+                by_exec_id.setdefault(next_exec_id, []).append(edge)
+            return by_exec_id.items()
+
+        # Walk every execution path without revisiting an execution in that path.
+        for starting_exec_id in starting_exec_ids:
+            starting_edges = [
+                edge
+                for _, handoffs in self._path_handoffs(
+                    starting_exec_id,
+                    direction,
+                )
+                for edge in handoffs
+            ]
+
+            # A downstream State or Effect starts only through its exact evidence.
+            if source_states is not None:
+                starting_edges = [
+                    edge
+                    for edge in starting_edges
+                    if (
+                        isinstance(edge, ReadEdge)
+                        and (
+                            edge.read.unscoped_reference,
+                            edge.read.resolved_version,
+                        )
+                        in source_states
+                    ) or (
+                        isinstance(edge, EffectEdge)
+                        and edge.effect_record.targets in source_states
+                    )
+                ]
+            if source_effects is not None:
+                starting_edges = [
+                    edge
+                    for edge in starting_edges
+                    if isinstance(edge, EffectEdge)
+                    and any(
+                        _same_effect_record(edge.effect_record, effect)
+                        for effect in source_effects
+                    )
+                ]
+
+            for following_exec_id, handoffs in grouped_handoffs(starting_edges):
+                stack = [(
+                    following_exec_id,
+                    [starting_exec_id, following_exec_id],
+                    [handoffs],
+                    depth,
+                    {starting_exec_id, following_exec_id},
+                )]
+
+                while stack and not truncated:
+                    (
+                        current_exec_id,
+                        executions,
+                        path_handoffs,
+                        remaining,
+                        visited,
+                    ) = stack.pop()
+
+                    following = []
+                    if remaining != 0:
+                        for candidate_exec_id, candidate_handoffs in self._path_handoffs(
+                            current_exec_id,
+                            direction,
+                        ):
+                            if candidate_exec_id is None:
+                                continue
+                            if candidate_exec_id not in visited:
+                                following.append((
+                                    candidate_exec_id,
+                                    candidate_handoffs,
+                                ))
+
+                    # A path is complete at its requested depth or final execution.
+                    if not following:
+                        if max_paths is not None and path_count >= max_paths:
+                            truncated = True
+                            break
+                        paths[starting_exec_id].append({
+                            "executions": executions,
+                            "handoffs": path_handoffs,
+                        })
+                        path_count += 1
+                        continue
+
+                    next_remaining = (
+                        None if remaining is None else remaining - 1
+                    )
+                    for candidate_exec_id, candidate_handoffs in reversed(following):
+                        stack.append((
+                            candidate_exec_id,
+                            [*executions, candidate_exec_id],
+                            [*path_handoffs, candidate_handoffs],
+                            next_remaining,
+                            visited | {candidate_exec_id},
+                        ))
+
+            if truncated:
+                break
+
+        stream = defaultdict(lambda: defaultdict(list))
+
+        # Derive the shallow layer view from the complete paths.
+        for starting_exec_id, complete_paths in paths.items():
+            projected = {}
+            order = 0
+            for path in complete_paths:
+                for index, handoffs in enumerate(path["handoffs"]):
+                    layer = "root" if index == 0 else index - 1
+                    rank = -1 if layer == "root" else layer
+                    for handoff in handoffs:
+                        if handoff not in projected:
+                            projected[handoff] = (rank, order, layer)
+                            order += 1
+                        elif rank < projected[handoff][0]:
+                            _, first_order, _ = projected[handoff]
+                            projected[handoff] = (rank, first_order, layer)
+
+            for handoff, (_, _, layer) in sorted(
+                projected.items(),
+                key=lambda item: item[1][:2],
+            ):
+                stream[starting_exec_id][layer].append(handoff)
+
+        # Return the existing public result for the requested direction.
+        result = Upstream if direction == "upstream" else Downstream
+        return result(
+            source,
+            stream,
+            paths,
             inspect=self.inspect,
             truncated=truncated,
             max_paths=max_paths,
         )
 
-    def _execution_seeds(self, inspected: Inspected) -> list[str]:
-        """Return the execution occurrences represented by a query endpoint."""
-        if not isinstance(inspected, Inspected):
-            raise ValueError("execution seeding requires an Inspected endpoint")
-
-        seeds = DedupedList()
-
-        if inspected.type == "exec_record":
-            return [inspected.object.id]
-        elif inspected.type == "actor":
-            seeds.extend(inspected.history)
-        elif inspected.type in ["reference", "value"]:
-            if inspected.type == "reference" and not inspected.grouped:
-                versions = (
-                    [inspected.version]
-                    if inspected.version is not None
-                    else inspected.history
-                )
-                history = [
-                    (inspected.id, version)
-                    for version in versions
-                ]
-            else:
-                history = inspected.history
-
-            for ref_ver in history:
-                seeds.add(
-                    self.index.ref_version_to_producer_exec_id[ref_ver]
-                )
-            # to find consumers of ref use trace.producers_of(ref)
-
-        elif inspected.type == "effect":
-            seeds.extend(inspected.history)
-
-        else:
-            raise NotImplementedError(f"Seeding currently only works for execs, refs, actors, values, and effects | was {inspected.type}")
-
-        return seeds
-    
-    def _get_target_refs(self, inspected_root: Inspected, direction:str):
-        if inspected_root.type in ["reference", "value"]:
-            if direction == "upstream":
-                target_refs = [
-                    (write.stored_target, write.stored_version)
-                    for write in inspected_root.writes
-                ]
-            else:
-                target_refs = [
-                    (read.unscoped_reference, read.resolved_version)
-                    for read in inspected_root.reads
-                ]
-
-            return list(target_refs)
-        elif inspected_root.type == "effect":
-            return [
-                record.targets
-                for record in inspected_root.object.effects
-                if record.targets[0] != "Runner"
-            ]
-        else:
-            return []
-        
-
-    def _lines_from_edges(self, edges, direction, indent="      "):
-        if direction == "upstream":
-            actor = "producer"
-        else:
-            actor = "consumer"
-
-        lines = []
-        connector = "└─"
-        source_to_lines = defaultdict(list)
-        for depth, edge in enumerate(edges):
-            current_indent = indent if not depth == 0 else indent * 1
-            because = (
-                f"{edge.produced_ref}[v{edge.produced_ver}]"
-                if isinstance(edge, StackLink)
-                else f"{edge.cause_effect} at {edge.produced_ref}[v{edge.produced_ver}]"
-            )
-
-            via = (
-                edge.consumer_input
-                if isinstance(edge, StackLink)
-                else [inputs[0] for inputs in edge.consumer_inputs]
-            )
-
-            to_link__exe = getattr(edge, f'{actor}_exec_id')
-            inspected = self.inspect(to_link__exe, "exec_id")
-            to_link__acto = repr(inspected.object)
-            
-            source_to_lines[to_link__acto].append(f"{current_indent}{connector} via {because}, affected {via}")
-
-        for actor_source, actor_lines in source_to_lines.items():
-            lines.append(actor_source)
-            lines.extend(actor_lines)
-        
-        return lines
-
     @staticmethod
-    def _path_target_states(target):
-        """Return the exact State occurrences represented by an endpoint."""
-        if target.type not in {"reference", "value"}:
-            return set()
-        return {
-            (write.stored_target, write.stored_version)
-            for write in target.writes
-        }
+    def _effect_history(source):
+        # Return the exact Effect records represented by this endpoint.
+        objects = source.object if source.grouped else (source.object,)
+        return [
+            effect
+            for item in objects
+            for effect in item.effects
+        ]
 
-    def _edge_reaches_path_target(
-        self,
-        edge,
-        next_exec,
-        source,
-        target,
-        target_execs,
-        direction,
-        deep_link,
-    ):
-        """Decide endpoint reachability from graph facts, never display text."""
-        if isinstance(edge, EmittedStackLink):
-            if target.type == "actor":
-                return (
-                    edge.consumer_actor == target.id
-                    or (
-                        target.grouped
-                        and edge.consumer_actor.source_actor == target.id
-                    )
+
+    def _path_handoffs(self, exec_id, direction):
+        # Begin with the same recorded handoffs as directional streams.
+        edges_by_exec = (
+            self._index.producer_edges_by_exec_id
+            if direction == "upstream"
+            else self._index.consumed_edges_by_exec_id
+        )
+        handoffs = list(edges_by_exec.get(exec_id, ()))
+
+        execution = self._index.exec_by_exec_id[exec_id]
+
+        # Follow an executed emitted node back to its registering execution.
+        if direction == "upstream":
+            emitter_id = execution.emitted_by_exec_id
+            emitter = self._index.exec_by_exec_id.get(emitter_id)
+            if emitter is not None:
+                handoffs.extend(
+                    EmissionEdge(emitter, emitted, exec_id)
+                    for emitted in emitter.emitted_nodes
+                    if emitted.emitted_by_exec_id == emitter_id
+                    and emitted.runner_id == execution.runner_id
+                    and emitted.node_id == execution.node_id
                 )
 
-        if target.type not in {"reference", "value"}:
-            return next_exec in target_execs
+        # Follow each registered emitted node to its execution occurrences.
+        else:
+            for emitted in execution.emitted_nodes:
+                node = (emitted.runner_id, emitted.node_id)
+                emitted_exec_ids = (
+                    [
+                        candidate_id
+                        for candidate_id in self._index.exec_ids_by_runner_node.get(
+                            node,
+                            (),
+                        )
+                        if self._index.exec_by_exec_id[
+                            candidate_id
+                        ].emitted_by_exec_id == exec_id
+                    ]
+                    if emitted.emitted_by_exec_id == exec_id
+                    else []
+                )
+                if emitted_exec_ids:
+                    handoffs.extend(
+                        EmissionEdge(execution, emitted, emitted_exec_id)
+                        for emitted_exec_id in emitted_exec_ids
+                    )
+                else:
+                    handoffs.append(EmissionEdge(execution, emitted))
 
+        # Keep every handoff between the same adjacent executions in one step.
+        by_exec_id = {}
+        terminal_handoffs = []
+        for handoff in handoffs:
+            next_exec_id = (
+                handoff.producer_exec_id
+                if direction == "upstream"
+                else handoff.consumer_exec_id
+            )
+            if next_exec_id is None:
+                terminal_handoffs.append((None, [handoff]))
+            else:
+                by_exec_id.setdefault(next_exec_id, []).append(handoff)
+
+        return [*by_exec_id.items(), *terminal_handoffs]
+
+    def _direct_path_evidence(
+        self,
+        root_exec_id,
+        source,
+        target,
+        target_exec_ids,
+        direction,
+    ):
+        execution = self._index.exec_by_exec_id[root_exec_id]
+
+        # X -> X is proved only by that execution's evidence in this direction.
         if (
-            direction == "upstream"
-            and not deep_link
-            and source.type in {"reference", "value"}
+            source.type in {"actor", "exec_record"}
+            and target.type in {"actor", "exec_record"}
+            and root_exec_id in target_exec_ids
         ):
-            return False
-
-        target_states = self._path_target_states(target)
-        edge_state = (edge.produced_ref, edge.produced_ver)
-        if edge_state in target_states:
-            return True
-
-        if direction != "downstream" or not deep_link:
-            return False
-
-        candidate = self.index.exec_by_exec_id.get(next_exec)
-        if candidate is None:
-            return False
-        return any(
-            (write.stored_target, write.stored_version) in target_states
-            for write in candidate.writes
-        )
-
-    def _edge_path_explanation(
-        self,
-        edge,
-        next_exec,
-        source,
-        target,
-        direction,
-        deep_link,
-        terminal,
-    ):
-        """Project one traversed edge into the existing display contract."""
-        if isinstance(edge, EmittedStackLink):
-            return []
-
-        ref = edge.produced_ref
-        ver = edge.produced_ver
-        producer = getattr(
-            edge.producer_actor,
-            "source_actor",
-            str(edge.producer_actor),
-        )
-        consumer = getattr(
-            edge.consumer_actor,
-            "source_actor",
-            str(edge.consumer_actor),
-        )
-
-        if isinstance(edge, AffectedStackLink):
             if direction == "downstream":
-                return [f"read {ref}[v{ver}] from {producer}"]
-            return [f"wrote {ref}[v{ver}] used by {consumer}"]
+                return list(execution.writes)
+            return [
+                read
+                for dependency in execution.deps
+                for read in self._index._concretised_from(dependency)
+            ]
 
-        value_query = source.type == "value" or target.type == "value"
-        if direction == "downstream":
-            action = "read as" if value_query else "read"
-            lines = [f"{action} {ref}[v{ver}] from {producer}"]
-
-            if deep_link and target.type in {"reference", "value"}:
-                target_states = self._path_target_states(target)
-                candidate = self.index.exec_by_exec_id.get(next_exec)
-                if candidate is not None:
-                    write_action = "written as" if value_query else "wrote"
-                    for write in candidate.writes:
-                        state = (write.stored_target, write.stored_version)
-                        if state in target_states and state != (ref, ver):
-                            lines.append(
-                                f"{write_action} {state[0]}[v{state[1]}]"
-                            )
-            return lines
-
-        action = "written as" if value_query else "wrote"
-        if value_query or (
-            terminal
-            and
-            source.type == "reference" and target.type == "reference"
+        # Execution/Actor -> exact State or Effect produced by that execution.
+        if (
+            direction == "downstream"
+            and source.type in {"actor", "exec_record"}
         ):
-            return [f"{action} {ref}[v{ver}]"]
-        return [f"{action} {ref}[v{ver}] used by {consumer}"]
+            if target.type in {"reference", "value"}:
+                target_states = set(self._state_history(target))
+                return [
+                    write
+                    for write in execution.writes
+                    if (
+                        write.stored_target,
+                        write.stored_version,
+                    ) in target_states
+                ]
 
-    def _direct_path_explanation(
-        self,
-        root_exec,
-        source,
-        target,
-        target_execs,
-        direction,
-    ):
-        """Explain a direct endpoint incidence without traversing an edge."""
-        if direction == "downstream" and source.type in {"reference", "value"}:
+            if target.type == "effect":
+                target_effects = self._effect_history(target)
+                return [
+                    effect
+                    for effect in execution.effects
+                    if any(
+                        _same_effect_record(effect, target_effect)
+                        for target_effect in target_effects
+                    )
+                ]
+
             return []
 
-        record = self.index.exec_by_exec_id[root_exec]
-        reads = [
-            (read.unscoped_reference, read.resolved_version)
-            for dependency in record.deps
-            for read in self._dep_records(dependency)
-        ]
-        writes = [
-            (write.stored_target, write.stored_version)
-            for write in record.writes
-        ]
+        # Exact State or Effect -> its producing Execution/Actor.
+        if (
+            direction != "upstream"
+            or target.type not in {"actor", "exec_record"}
+            or root_exec_id not in target_exec_ids
+        ):
+            return []
 
         if source.type in {"reference", "value"}:
-            source_states = self._path_target_states(source)
-            writes = [state for state in writes if state in source_states]
-
-        if target.type in {"reference", "value"}:
-            target_states = self._path_target_states(target)
-            reads = []
-            writes = [state for state in writes if state in target_states]
-        elif root_exec not in target_execs:
-            return []
-        elif direction == "downstream":
-            reads = []
-        elif source.type == "value":
-            reads = []
-        elif source.type != "reference":
-            writes = []
-
-        value_query = source.type == "value" or target.type == "value"
-        lines = []
-        for ref, ver in reads:
-            producer_exec = self.index.ref_version_to_producer_exec_id[
-                (ref, ver)
+            source_states = set(self._state_history(source))
+            return [
+                write
+                for write in execution.writes
+                if (
+                    write.stored_target,
+                    write.stored_version,
+                ) in source_states
             ]
-            producer = self.index.exec_by_exec_id[
-                producer_exec
-            ].producer_id.source_actor
-            action = "read as" if value_query else "read"
-            lines.append(f"{action} {ref}[v{ver}] from {producer}")
 
-        action = "written as" if value_query else "wrote"
-        lines.extend(f"{action} {ref}[v{ver}]" for ref, ver in writes)
-        return lines
+        if source.type == "effect":
+            source_effects = self._effect_history(source)
+            return [
+                effect
+                for effect in execution.effects
+                if any(
+                    _same_effect_record(effect, source_effect)
+                    for source_effect in source_effects
+                )
+            ]
+
+        return []
+
+    def _path_ending(
+        self,
+        handoffs,
+        next_exec_id,
+        target,
+        target_exec_ids,
+        direction,
+        deep_link,
+    ):
+        # Actor and ExecRecord endpoints end at their execution occurrence.
+        if target.type in {"actor", "exec_record"}:
+            if next_exec_id in target_exec_ids:
+                return []
+
+            # An emitted Actor can exist before its node has executed.
+            if target.type == "actor":
+                objects = (
+                    target.object
+                    if target.grouped
+                    else (target.object,)
+                )
+                target_actors = {
+                    item.object
+                    for item in objects
+                }
+                evidence = [
+                    handoff
+                    for handoff in handoffs
+                    if isinstance(handoff, EmissionEdge)
+                    and handoff.emitted_node.producer_id in target_actors
+                ]
+                if evidence:
+                    return evidence
+
+            return None
+
+        # A State carried by this edge is already exact endpoint evidence.
+        if target.type in {"reference", "value"}:
+            target_states = set(self._state_history(target))
+            for handoff in handoffs:
+                handoff_state = None
+                if isinstance(handoff, ReadEdge):
+                    handoff_state = (
+                        handoff.read.unscoped_reference,
+                        handoff.read.resolved_version,
+                    )
+                elif isinstance(handoff, EffectEdge):
+                    handoff_state = handoff.effect_record.targets
+                if handoff_state in target_states:
+                    return []
+
+            # A deeper downstream path may end at a write by the next execution.
+            if (
+                direction == "downstream"
+                and deep_link
+                and next_exec_id is not None
+            ):
+                evidence = [
+                    write
+                    for write in self._index.exec_by_exec_id[
+                        next_exec_id
+                    ].writes
+                    if (
+                        write.stored_target,
+                        write.stored_version,
+                    ) in target_states
+                ]
+                return evidence or None
+
+            return None
+
+        # An Effect is exact on its edge or as output of the next execution.
+        target_effects = self._effect_history(target)
+        if any(
+            isinstance(handoff, EffectEdge)
+            and any(
+                _same_effect_record(handoff.effect_record, target_effect)
+                for target_effect in target_effects
+            )
+            for handoff in handoffs
+        ):
+            return []
+
+        if (
+            direction == "downstream"
+            and deep_link
+            and next_exec_id is not None
+        ):
+            evidence = [
+                effect
+                for effect in self._index.exec_by_exec_id[
+                    next_exec_id
+                ].effects
+                if any(
+                    _same_effect_record(effect, target_effect)
+                    for target_effect in target_effects
+                )
+            ]
+            return evidence or None
+
+        return None
+
+    def _normalise_path_endpoint(
+        self,
+        endpoint,
+        kind,
+        version,
+        grouped,
+    ):
+        # Preserve a missing loose query as an inspectable empty path endpoint.
+        raw_endpoint = endpoint
+        if isinstance(endpoint, Investigate):
+            endpoint_kind = endpoint.inspected.type
+        elif isinstance(endpoint, Inspected):
+            endpoint_kind = endpoint.type
+        else:
+            endpoint_kind = self._infer_kind(endpoint)
+        kind = kind or endpoint_kind
+        endpoint = self._normalise_query_source(
+            endpoint,
+            kind,
+            version,
+            grouped,
+        )
+        if endpoint is not None:
+            return endpoint
+        return self.inspect(
+            raw_endpoint,
+            kind,
+            version,
+            grouped=False,
+        )
+
 
     def path(
         self,
-        source: Any,
-        target: Any,
-        source_type: str | None = None,
-        target_type: str | None = None,
+        source,
+        target,
+        source_type=None,
+        target_type=None,
         source_ver=None,
         target_ver=None,
-        group: bool = True,
-        deep_link: bool = True,
-        direction: str = "downstream",
-    ) -> Pathed:
-        if isinstance(source, Investigate):
-            source = source.inspected
-            source_type = source.type
-            
-        if not isinstance(source, Inspected):
-            if not source_type:    
-                source_type = self._infer_kind(source)
-            if not self._is_valid_obj_kind(source_type):
-                raise InvalidObjectKindError(f"{source} | type={source_type} is not known or does not exist in TIDE!", source_type)
-            
-            if group:
-                source = self.inspect(source, source_type, source_ver)
-            else:
-                source_match = self.find(source, source_ver).first(source_type)
-                source = (
-                    source_match
-                    if source_match is not None
-                    else self.inspect(source, source_type, source_ver)
-                )
-        
-        if isinstance(target, Investigate):
-            target = target.inspected
-            target_type = target.type
+        group=True,
+        deep_link=True,
+        direction="downstream",
+    ):
+        # Accept only a supported direction.
+        if direction not in {"upstream", "downstream"}:
+            raise ValueError("direction must be 'upstream' or 'downstream'")
 
-        if not isinstance(target, Inspected):
-            if not target_type:
-                target_type = self._infer_kind(target)
-            if not self._is_valid_obj_kind(target_type):
-                raise InvalidObjectKindError(f"{target} | type={target_type} is not known or does not exist in TIDE!", target_type)    
-            
-            if group:
-                target = self.inspect(target, target_type, target_ver)
-            else:
-                target_match = self.find(target, target_ver).first(target_type)
-                target = (
-                    target_match
-                    if target_match is not None
-                    else self.inspect(target, target_type, target_ver)
-                )
-        
-        
-
-
-
-        target_seeds = self._execution_seeds(target)
-        valid_paths = defaultdict(list)
-        source_seeds = self._execution_seeds(source)
-        adjacency, next_relation = self._stream_adjacency(direction)
-        root_state_versions = self._stream_root_state_versions(
+        # Resolve both endpoints once through the shared query semantics.
+        source = self._normalise_path_endpoint(
             source,
-            direction,
+            source_type,
+            source_ver,
+            group,
+        )
+        target = self._normalise_path_endpoint(
+            target,
+            target_type,
+            target_ver,
+            group,
         )
 
-        for root_exec_id in source_seeds:
-            # 1. Direct/root proof:
-            link = self._direct_path_explanation(
+        source_exec_ids = self._starting_exec_ids(source)
+        target_exec_ids = self._starting_exec_ids(target)
+        target_exec_id_set = set(target_exec_ids)
+        source_states = (
+            set(self._state_history(source))
+            if source.type in {"reference", "value"}
+            else None
+        )
+        source_effects = (
+            self._effect_history(source)
+            if source.type == "effect"
+            else None
+        )
+        paths = defaultdict(list)
+
+        for root_exec_id in source_exec_ids:
+            # Record direct incidence without manufacturing a handoff.
+            direct_evidence = self._direct_path_evidence(
                 root_exec_id,
                 source,
                 target,
-                target_seeds,
+                target_exec_id_set,
                 direction,
             )
+            if direct_evidence:
+                paths[root_exec_id].append({
+                    "executions": [root_exec_id],
+                    "handoffs": [],
+                    "endpoint_evidence": direct_evidence,
+                })
 
-            if link:
-                valid_paths[root_exec_id].append(link)
-
-            # 2. Edge-walk proof.  A stack frame either expands one execution
-            # or evaluates one pending edge.  Reversing expansion order keeps
-            # the same deterministic depth-first order as the former recursive
-            # walk without depending on Python's call-stack limit.
-            stack = [("expand", root_exec_id, [], {root_exec_id}, True)]
+            stack = [(
+                root_exec_id,
+                [root_exec_id],
+                [],
+                {root_exec_id},
+                True,
+            )]
             while stack:
-                frame, current_exec_id, branch_path, visited, is_root = stack.pop()
+                (
+                    current_exec_id,
+                    executions,
+                    path_handoffs,
+                    visited,
+                    is_root,
+                ) = stack.pop()
 
-                if frame == "expand":
-                    edges = adjacency[current_exec_id]
-                    for curr_step in reversed(edges):
-                        if (
-                            is_root
-                            and root_state_versions is not None
-                            and (
-                                curr_step.produced_ref,
-                                curr_step.produced_ver,
-                            ) not in root_state_versions
-                        ):
-                            continue
-                        stack.append((
-                            curr_step,
-                            current_exec_id,
-                            branch_path,
-                            visited,
-                            is_root,
-                        ))
-                    continue
-
-                curr_step = frame
-                if is_root and source.type == "effect":
-                    effect_id = source.id
-                    effect_kind = (
-                        effect_id[0]
-                        if isinstance(effect_id, tuple)
-                        else effect_id
-                    )
-                    effect_refs = set(
-                        self._get_target_refs(source, direction)
-                    )
-                    if effect_kind in {Effects.WRITE, Effects.DELETE}:
-                        if not isinstance(curr_step, AffectedStackLink):
-                            continue
-                        if curr_step.cause_effect != effect_kind:
-                            continue
-                        if effect_refs and (
-                            curr_step.produced_ref,
-                            curr_step.produced_ver,
-                        ) not in effect_refs:
-                            continue
-
-                next_exec = getattr(curr_step, next_relation)
-                next_path = [*branch_path, curr_step]
-                terminal = self._edge_reaches_path_target(
-                    curr_step,
-                    next_exec,
-                    source,
-                    target,
-                    target_seeds,
-                    direction,
-                    deep_link,
-                )
-                link = self._edge_path_explanation(
-                    curr_step,
-                    next_exec,
-                    source,
-                    target,
-                    direction,
-                    deep_link,
-                    terminal,
-                )
-                if link:
-                    next_path.extend(link)
-
-                # Match the target before suppressing a revisited execution.
-                # This preserves a closing edge such as X -> ... -> X, while
-                # the visited set still prevents expansion around the cycle.
-                if terminal:
-                    valid_paths[root_exec_id].append(next_path)
-                    continue
-
-                if (
-                    deep_link
-                    and next_exec is not None
-                    and next_exec not in visited
+                for next_exec_id, handoffs in reversed(
+                    self._path_handoffs(current_exec_id, direction)
                 ):
-                    stack.append((
-                        "expand",
-                        next_exec,
-                        next_path,
-                        visited | {next_exec},
-                        False,
-                    ))
+                    # A downstream State or Effect starts at its exact evidence.
+                    if is_root and direction == "downstream":
+                        if source_states is not None:
+                            handoffs = [
+                                handoff
+                                for handoff in handoffs
+                                if (
+                                    (
+                                        handoff.read.unscoped_reference,
+                                        handoff.read.resolved_version,
+                                    )
+                                    if isinstance(handoff, ReadEdge)
+                                    else handoff.effect_record.targets
+                                    if isinstance(handoff, EffectEdge)
+                                    else None
+                                )
+                                in source_states
+                            ]
+                        if source_effects is not None:
+                            handoffs = [
+                                handoff
+                                for handoff in handoffs
+                                if isinstance(handoff, EffectEdge)
+                                and any(
+                                    _same_effect_record(
+                                        handoff.effect_record,
+                                        source_effect,
+                                    )
+                                    for source_effect in source_effects
+                                )
+                            ]
+                        if not handoffs:
+                            continue
 
-        pathed = Pathed(self.inspect, self.index, source, source_seeds, target, target_seeds, valid_paths, direction)
-        return pathed
+                    next_executions = (
+                        executions
+                        if next_exec_id is None
+                        else [*executions, next_exec_id]
+                    )
+                    next_handoffs = (
+                        path_handoffs
+                        if next_exec_id is None
+                        else [*path_handoffs, handoffs]
+                    )
+                    endpoint_evidence = self._path_ending(
+                        handoffs,
+                        next_exec_id,
+                        target,
+                        target_exec_id_set,
+                        direction,
+                        deep_link,
+                    )
 
-    def produced_by(
-        self,
-        source: Any,
-        kind: str | None = None,
-        version=None,
-        group: bool = True,
-    ) -> ProducedBy | None:
-        if not isinstance(source, Inspected):
-            kind = kind or self._infer_kind(source)
+                    # Retain the complete path when this step reaches the target.
+                    if endpoint_evidence is not None:
+                        paths[root_exec_id].append({
+                            "executions": next_executions,
+                            "handoffs": next_handoffs,
+                            "endpoint_evidence": endpoint_evidence,
+                        })
 
-            if group:
-                source = self.inspect(source, kind=kind, version=version)
-            else:
-                source = self.find(source, version).first(kind)
+                    # Continue only when this step did not reach the target.
+                    if (
+                        endpoint_evidence is None
+                        and deep_link
+                        and next_exec_id is not None
+                        and next_exec_id not in visited
+                    ):
+                        stack.append((
+                            next_exec_id,
+                            next_executions,
+                            next_handoffs,
+                            visited | {next_exec_id},
+                            False,
+                        ))
 
-            if not source:
-                return None
-
-        produced_refs_by_exec = deduped_dict()
-
-        if source.type in ["reference", "value"]:
-            execs = []
-
-            if source.type == "reference":
-                for ver_ref in source.history:
-                    if not source.grouped:
-                        ver_ref = (source.id, source.version)
-
-                    producer_exec = self.index.ref_version_to_producer_exec_id[ver_ref]
-                    execs.append(producer_exec)
-                    produced_refs_by_exec[producer_exec].append(ver_ref)
-
-            if source.type == "value":
-                for ver_ref in source.history:
-                    producer_exec = self.index.ref_version_to_producer_exec_id[ver_ref]
-                    execs.append(producer_exec)
-                    produced_refs_by_exec[producer_exec].append(ver_ref)
-
-            produced_refs = DedupedList(
-                ver_ref
-                for ver_refs in produced_refs_by_exec.values()
-                for ver_ref in ver_refs
-            )
-
-            return ProducedBy(
-                self.inspect,
-                source,
-                execs,
-                produced_refs,
-                produced_refs_by_exec,
-            )
-
-        if source.type == "exec_record":
-            execs = [source.id]
-
-        elif source.type == "actor":
-            execs = list(source.history)
-
-        else:
-            raise RuntimeWarning(
-                f".produced_by() received an invalid type! was {source.type}"
-            )
-
-        for inspected in [
-            self.inspect(exec_id, "exec_record")
-            for exec_id in execs
-        ]:
-            for write in inspected.object.writes:
-                write: WriteRecord
-
-                ref = write.stored_target
-                ver = write.stored_version
-
-                produced_refs_by_exec[inspected.id].append((ref, ver))
-
-        produced_refs = DedupedList(
-            ver_ref
-            for ver_refs in produced_refs_by_exec.values()
-            for ver_ref in ver_refs
-        )
-
-        return ProducedBy(
-            self.inspect,
+        return Pathed(
             source,
-            execs,
-            produced_refs,
-            produced_refs_by_exec,
+            target,
+            paths,
+            direction,
+            inspect=self.inspect,
         )
 
-    def consumed_by(
-        self,
-        source: Any,
-        kind: str | None = None,
-        version=None,
-        group: bool = True,
-    ) -> ConsumedBy | None:
-        if not isinstance(source, Inspected):
-            kind = kind or self._infer_kind(source)
-
-            if group:
-                source = self.inspect(source, kind=kind, version=version)
-            else:
-                source = self.find(source, version).first(kind)
-
-            if not source:
-                return None
-
-        consumed_refs_by_exec = defaultdict(lambda: DedupedList())
-
-        if source.type in ["reference", "value"]:
-            execs = []
-
-            if source.type == "reference":
-                for ver_ref in source.history:
-                    if not source.grouped:
-                        ver_ref = (source.id, source.version)
-
-                    for exec_id in self.index.ref_version_to_consumer_exec_ids[ver_ref]:
-                        execs.append(exec_id)
-                        consumed_refs_by_exec[exec_id].append(ver_ref)
-
-            if source.type == "value":
-                for ver_ref in source.history:
-                    for exec_id in self.index.ref_version_to_consumer_exec_ids[ver_ref]:
-                        execs.append(exec_id)
-                        consumed_refs_by_exec[exec_id].append(ver_ref)
-
-            consumed_refs = DedupedList(
-                ver_ref
-                for ver_refs in consumed_refs_by_exec.values()
-                for ver_ref in ver_refs
-            )
-
-            return ConsumedBy(
-                self.inspect,
-                source,
-                execs,
-                consumed_refs,
-                consumed_refs_by_exec,
-            )
-
-        if source.type == "exec_record":
-            execs = [source.id]
-
-        elif source.type == "actor":
-            execs = list(source.history)
-
-        else:
-            raise RuntimeWarning(
-                f".consumed_by() received an invalid type! was {source.type}"
-            )
-
-        for inspected in [
-            self.inspect(exec_id, "exec_record")
-            for exec_id in execs
-        ]:
-            for dep_use in inspected.object.reads:
-                queue = self.index._dep_queue(dep_use)
-
-                for record in queue:
-                    record: DependencyUseRecord
-
-                    ref = record.unscoped_reference
-                    ver = record.resolved_version
-
-                    consumed_refs_by_exec[inspected.id].append((ref, ver))
-
-        consumed_refs = DedupedList(
-            ver_ref
-            for ver_refs in consumed_refs_by_exec.values()
-            for ver_ref in ver_refs
-        )
-
-        return ConsumedBy(
-            self.inspect,
-            source,
-            execs,
-            consumed_refs,
-            consumed_refs_by_exec,
-        )
-                
     def investigate(
         self,
         inspected: Any,
         kind: str | None = None,
-        version=None,
+        version: int=None,
         grouped: bool = True,
     ) -> Investigate:
         if not isinstance(inspected, Inspected):
-            if kind:
-                found = self.find(inspected, version)
-                
-                if not found.exists(kind)[0]:
-                    if grouped and isinstance(inspected, str) and kind in ["reference", "actor"]:
-                        inspected = self.inspect_as_group(inspected, kind=kind, version=version)
-                    else:    
-                        found = self.find(inspected).first(kind)
-                        if found is None:
-                            inspected = self.inspect(inspected, kind=kind, version=version)
-                        else:
-                            inspected = found
-
-                        inspected = self.inspect(inspected, kind=kind, version=version)
-                else:
-                    inspected = found.first(kind)
-
-            else:
-                kind = self._infer_kind(inspected)
-                inspected = self.inspect(inspected, kind=kind, version=version)
-
-                    
+            inspected = self.inspect(
+                inspected,
+                kind=kind,
+                version=version,
+                grouped=grouped,
+            )
 
         return Investigate(
             trace=self,
             inspect=self.inspect,
             inspected=inspected,
         )
+
+    def why(
+        self,
+        inspected: Any,
+        kind: str | None = None,
+        version: int | None = None,
+        grouped: bool = True,
+        **show_options,
+    ):
+        return self.investigate(
+            inspected,
+            kind=kind,
+            version=version,
+            grouped=grouped,
+        ).show(**show_options)
 
 
     # def to_dict(self):

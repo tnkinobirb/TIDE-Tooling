@@ -1,6 +1,6 @@
 import pytest
 
-from tide_tooling import Ocean, TIDE, node, pipeline
+from tide_tooling import Ocean, Pipeline, TIDE, node, pipeline
 from tide_tooling.tooling_core.engine.errors import NodeDefinitionError, StoreAlreadyRegisteredError
 
 # ================================================================
@@ -59,7 +59,7 @@ def ref(trace, name, version=None):
 def registered_store_names(tide):
     registry = tide.ocean.store_router.registry
 
-    return (set(registry._stores.keys()), set(registry._locals.keys()))
+    return (set(registry._globals), set(registry._local_templates) | set(registry._locals))
 
 
 def register_seeded_store(ocean, name, values):
@@ -99,8 +99,8 @@ def test_node_declaration_inputs_and_unpacked_targets_run_without_call_inputs():
     assert trace.value_of("report_available_flag") == [True]
 
 
-def test_ocean_can_disable_unrepresented_primary_input_tracking():
-    ocean = Ocean(track_unrepresented=False)
+def test_ocean_always_tracks_untracked_primary_inputs():
+    ocean = Ocean()
 
     @node(targets="global:result")
     def consume(value):
@@ -112,20 +112,20 @@ def test_ocean_can_disable_unrepresented_primary_input_tracking():
 
     trace = ocean.run_pipeline(flow, mode="sequential")
     consumer = next(
-        record for record in trace.exec_log
+        record for record in trace.log
         if record.func_name == "consume"
     )
 
     assert trace.value_of("global:result", 0) == 3
-    assert consumer.deps == []
-    assert not any(
-        record.func_name == "TIDE_OBSERVER"
-        for record in trace.exec_log
+    assert len(consumer.deps) == 1
+    assert any(
+        record.func_name == "TIDE: External"
+        for record in trace.log
     )
 
 
-def test_tide_passes_unrepresented_tracking_setting_to_direct_exec():
-    tide = TIDE(track_unrepresented=False)
+def test_tide_direct_exec_always_tracks_untracked_primary_inputs():
+    tide = TIDE()
 
     result = tide.exec(
         lambda value: value + 1,
@@ -134,20 +134,20 @@ def test_tide_passes_unrepresented_tracking_setting_to_direct_exec():
     )
     trace = tide.trace()
     consumer = next(
-        record for record in trace.exec_log
-        if record.producer_id.source_actor != "TIDE_OBSERVER"
+        record for record in trace.log
+        if record.producer_id.source_actor != "TIDE: External"
     )
 
     assert result == 3
     assert trace.value_of("global:result", 0) == 3
-    assert consumer.deps == []
-    assert not any(
-        record.func_name == "TIDE_OBSERVER"
-        for record in trace.exec_log
+    assert len(consumer.deps) == 1
+    assert any(
+        record.func_name == "TIDE: External"
+        for record in trace.log
     )
 
 
-def test_direct_exec_reconstruction_does_not_replay_unnamed_observation():
+def test_direct_exec_reconstruction_does_not_replay_untracked_observation():
     tide = TIDE()
 
     def get_data(data_available_flag):
@@ -160,8 +160,8 @@ def test_direct_exec_reconstruction_does_not_replay_unnamed_observation():
     first_trace = tide.trace()
     observer_exec_id = next(
         record.exec_id
-        for record in first_trace.exec_log
-        if record.func_name == "TIDE_OBSERVER"
+        for record in first_trace.log
+        if record.func_name == "TIDE: External"
     )
 
     tide.exec(report_data, reads=["got_data"], writes=["report"])
@@ -170,35 +170,35 @@ def test_direct_exec_reconstruction_does_not_replay_unnamed_observation():
 
     observer_records = [
         record
-        for record in trace.exec_log
-        if record.func_name == "TIDE_OBSERVER"
+        for record in trace.log
+        if record.func_name == "TIDE: External"
     ]
-    unnamed_writes = [
+    untracked_writes = [
         write
         for record in observer_records
         for write in record.writes
-        if write.stored_target.startswith("__unnamed__")
+        if write.stored_target.startswith("__untracked__")
     ]
 
     assert [record.exec_id for record in observer_records] == [
         observer_exec_id
     ]
-    assert len(unnamed_writes) == 1
-    assert unnamed_writes[0].stored_version == 0
+    assert len(untracked_writes) == 1
+    assert untracked_writes[0].stored_version == 0
 
     get_data_record = next(
-        record for record in trace.exec_log
+        record for record in trace.log
         if record.func_name == "get_data"
     )
     assert [
         (read.unscoped_reference, read.resolved_version)
         for read in get_data_record.deps
-    ] == [(unnamed_writes[0].stored_target, 0)]
+    ] == [(untracked_writes[0].stored_target, 0)]
 
 
 @pytest.mark.parametrize("runtime", [Ocean, TIDE])
-def test_unrepresented_tracking_setting_must_be_boolean(runtime):
-    with pytest.raises(TypeError, match="track_unrepresented must be a bool"):
+def test_unrepresented_tracking_setting_is_not_supported(runtime):
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
         runtime(track_unrepresented="no")
 
 
@@ -282,7 +282,7 @@ def test_tide_registered_store_seed_read_preserves_store_scope():
     tide.exec(UseSeed, args=["@testing:@seed"], writes=["@out"])
 
     trace = tide.trace()
-    use_exec = get_exec(trace, 1) if len(trace.exec_log) > 1 else get_exec(trace, 0)
+    use_exec = get_exec(trace, 1) if len(trace.log) > 1 else get_exec(trace, 0)
 
     assert refs_from_reads(use_exec) == [
         ("testing:@seed", 0)
@@ -344,8 +344,8 @@ def test_tide_exec_registers_runner_local_physical_stores_without_changing_globa
     assert not new_globals
     print(exec_pipeline_id)
     print(after_locals)
-    assert any(name == f"mem_TIDE: .exec({exec_pipeline_id})" for name in new_locals)
-    assert any(name == f"__tide___TIDE: .exec({exec_pipeline_id})" for name in new_locals)
+    assert f"mem_{trace.log[0].runner_id}" in new_locals
+    assert f"__tide___{trace.log[0].runner_id}" in new_locals
 
 
 def test_tide_explicit_mem_ref_routes_to_physical_runner_store_when_supported():
@@ -364,7 +364,7 @@ def test_tide_explicit_mem_ref_routes_to_physical_runner_store_when_supported():
 
     written_ref, version = writes[0]
     trace.show()
-    assert written_ref.startswith(f"mem_TIDE")
+    assert written_ref.startswith(f"mem_{trace.log[0].runner_id}")
     assert written_ref.endswith(":@local")
     assert version == 0
 
@@ -391,8 +391,8 @@ def test_trace_show_summary_includes_read_and_write_counts(capsys):
     shown = tide.trace().show()
     capsys.readouterr()
 
-    assert "2 executions found | 1 write | 1 read" in shown
-    assert "\033[2mSources:    1\033[0m" in shown
+    assert "2 executions shown | 1 write | 1 read" in shown
+    assert "Sources:" not in shown
     assert "TBT" not in shown
 
 
@@ -437,7 +437,7 @@ def test_tide_global_and_mem_same_key_stay_distinct_when_supported():
     mem_refs = [
         match.id
         for match in trace.find("@shared").nearby.refs
-        if str(match.id).startswith("mem_TIDE")
+        if str(match.id).startswith("mem_")
     ]
 
     assert mem_refs
@@ -482,9 +482,10 @@ def test_raw_ocean_default_unscoped_node_write_routes_to_local_mem():
     # Placeholder: replace with real raw Ocean node/pipeline construction.
     # Do not use tide.exec here, because TIDE wrapper intentionally defaults to global.
 
-    trace, *_ = ocean.run_node(node=WriteA.as_node())
+    trace = ocean.run_pipeline(Pipeline([WriteA.as_node()]), mode="sequential")
 
     assert trace.find("mem_0:@A").exists("reference") == (True, False)
+    assert "because result_ready" in trace.show(color=False)
 
 
 # @pytest.mark.xfail(
@@ -510,9 +511,9 @@ def test_raw_ocean_local_mem_is_per_runner_or_pipeline():
     tide = TIDE()
 
     ocean = tide.ocean
-    trace_one, *_ = ocean.run_node(node=WriteA.as_node())
-    trace_two, *_ = ocean.run_node(node=WriteA.as_node())
-    trace_three, *_ = ocean.run_node(node=WriteADiff.as_node())
+    trace_one = ocean.run_pipeline(Pipeline([WriteA.as_node()]), mode="sequential")
+    trace_two = ocean.run_pipeline(Pipeline([WriteA.as_node()]), mode="sequential")
+    trace_three = ocean.run_pipeline(Pipeline([WriteADiff.as_node()]), mode="sequential")
 
     assert trace_one.find("mem_0:@local").exists("reference") == trace_two.find("mem_1:@local").exists("reference")
     assert (False, False) == trace_one.find("mem_0:@diff_local").exists("reference")
@@ -531,7 +532,7 @@ def test_raw_ocean_local_mem_is_per_runner_or_pipeline():
 def physical_mem_write_refs(trace):
     refs = []
 
-    for exec_record in trace.exec_log:
+    for exec_record in trace.log:
         for stored_ref, version in refs_from_writes(exec_record):
             if stored_ref.startswith("mem_"):
                 refs.append((stored_ref, version))
@@ -821,7 +822,7 @@ def test_trace_rebuild_preserves_exec_count_after_mem_and_global_writes():
 
     trace = tide.trace()
 
-    assert len(trace.exec_log) == 2
+    assert len(trace.log) == 2
 
 
 def test_trace_rebuild_preserves_store_scopes_after_mixed_global_testing_mem_refs():

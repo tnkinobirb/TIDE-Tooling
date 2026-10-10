@@ -598,6 +598,20 @@ def test_consumed_by_value_tracks_all_static_ref_consumers():
     assert Actor(trace.ocean_id, "TIDE: .event()", "UseTesting") in consumed.actors
 
 
+def test_consumed_by_state_deduplicates_top_level_refs():
+    tide = TIDE()
+    tide.event("A", writes={"@A": "same"})
+    tide.event("UseA1", reads="@A")
+    tide.event("UseA2", reads="@A")
+    trace = tide.trace()
+
+    consumed = trace.consumed_by(
+        trace.inspect("global:@A", "reference", version=0)
+    )
+
+    assert consumed.refs == [("global:@A", 0)]
+
+
 def test_produced_by_exec_record_returns_only_that_exec_writes():
     tide = TIDE()
 

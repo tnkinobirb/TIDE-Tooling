@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  core:
     name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -40,3 +40,66 @@ jobs:
 
       - name: Run test suite
         run: python -m pytest
+
+  now:
+    name: noWorkflow / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install TIDE, tests and noWorkflow
+        run: python -m pip install -e ".[test,now]"
+
+      - name: Run noWorkflow integration tests
+        run: python -m pytest testing/test_noworkflow_adapter.py testing/test_demos.py
+
+  numpy:
+    name: NumPy / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install TIDE and tests
+        run: python -m pip install -e ".[test]"
+
+      - name: Install NumPy
+        run: python -m pip install "numpy>=2.0"
+
+      - name: Run NumPy integration tests
+        run: >-
+          python -m pytest
+          testing/test_audit_regressions.py::test_record_equality_handles_array_values_and_dependency_objects
+          testing/test_serialiser.py::test_get_value_kind_handles_numpy_when_available
+
+  signing:
+    name: Signing / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install TIDE, tests and signing
+        run: python -m pip install -e ".[test,signing]"
+
+      - name: Run signing and extreme release gates
+        run: >-
+          python -m pytest
+          testing/test_tide_bundle.py
+          testing/test_extreme_release_torture.py

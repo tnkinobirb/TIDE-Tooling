@@ -14,387 +14,631 @@ from queue              import Queue, Empty
 from collections        import defaultdict
 from tide_tooling.tooling_core               import debug_enabled, debug_print
 
-_user_print = print
 print = debug_print
 
-from .index             import PipelineIndex
-from .utils             import _print_dict_struct, _node_worker, DedupedList, deduped_dict, create_tide_exec_uuid, tide_snapshot_value
+from .index             import PipelineIndex, _project_pipeline_index_to_tide_plan
+from .utils             import _node_worker, DedupedList, deduped_dict, create_tide_exec_uuid, ensure_tide_snapshot, tide_snapshot_value
 from .DependencyTools   import DependencyTools
 from .PipelineIndex     import PipelineIndexBuilder
 from .errors            import NodeDefinitionError, PipelineRuntimeError, PipelineDeadlockError, NodeToDagRegistrationError, EventHandlerError, NodeFailed, MissingRefDuringResolutionError, DynamicRefCountLessThanAvailableKeysError, RaiseHandlingError, TIDEError
-from .classes           import Node, RunnerNode, RuntimeDag, Pipeline, Stage, Event, DataRef, RunnerNodeInput, END, DELETE, WRITE, RUN, __TIDE_TEMPLATE_VALUE__, Effect, EMIT
+from .classes           import Node, RunnerNode, RuntimeDag, Pipeline, Event, DataRef, RunnerNodeInput, END, DELETE, WRITE, RUN, RAISE, __fallback__, Effect, EMIT, EffectRuntime
 from .NodeProcessor     import NodeProcessor
-from .events            import PipelineEvents, RouterEvents, ExecutorEvents, OceanEvents, LogEvents, Effects
+from .events            import Cause, PipelineEvents, RouterEvents, ExecutorEvents, OceanEvents, LogEvents, Effects
+from .event_payloads    import DependencyConcretised, EffectOccurrence, EmittedNodes, MissingReferences, NodeBlocked, Nodes, NodeSnapshot, PipelineRun, Reference, Result, State, Work
 
 
 
-class PipelineRunner: 
-
-    _global_runner_count = 0
-
-    def __init__(self, id:int=None, name:str=None, pipeline: Pipeline | List[Stage] | None=None, parallel='thread', event_interface=None, store_interface=None, mem_store_templates:dict[str, Any]|None=None, mode="rerun", max_attempts=400000, track_unrepresented=True, intent_dynamic_refs=None):# init takes data_store and pipeline_node_dict
-        
-        # | INITIALISATION OF RUNNER ATTRS |
-        # Empty pipe
-        if not pipeline:
-            raise NodeDefinitionError("[PIPELINE] - Pipeline is None! Nothing to do | Watcher pipelines still in WIP!")
+class PipelineRunner:
+    def __init__(
+        self,
+        id,
+        ocean_id,
+        pipeline,
+        event_interface,
+        store_router,
+        now_coordinator,
+        synchronous_event_router,
+        pipeline_lookup,
+        parallel="thread",
+        dynamic_ref_plan=None,
+        name=None,
+    ):
+        # A Runner executes one concrete Pipeline definition.
         if not isinstance(pipeline, Pipeline):
-            raise NodeDefinitionError(f"[PIPELINE] - Pipeline is not a valid Pipeline obj! was {type(pipeline)}")
+            raise NodeDefinitionError(
+                "PipelineRunner requires a Pipeline"
+            )
 
-        # Instance counter
+        # Retain runner identity and execution configuration.
         self.id = id
-        PipelineRunner._global_runner_count += 1
-        if name:
-            self.id = name 
-        
-        # Runner Configuration
-        self.attempt_count = 0
-        self.max_attempts = max_attempts  # Max tick attempts per idle state.
-        if not isinstance(track_unrepresented, bool):
-            raise TypeError("track_unrepresented must be a bool")
-        self.track_unrepresented = track_unrepresented
-        self.intent_dynamic_refs = intent_dynamic_refs
-        self.poll = True            # if true, at the beginning of the run, dependencies will be polled for availability to ready dependent nodes for execution.
-        self.mode = mode            # rerun node | cached (if target exists in store dont rerun ) # NOTE: strengthen semantics
-        self.parallel = parallel    # execution/processing mode. NOTE: can probs be moved to nodes but also have blanket default  
-        self.complete = False       # mark as complete if no waiting nodes and other conditions are true
-        self.stay_alive = False     # dont die unless triggered by event | overrides self.complete
-        self.build_mode = False     # if true, nodes are not released automatically and must be triggered through the build command. Execution will still not happen unless dependencies are available.
-        
-        # Runner State
-        self.purgatory: bool = False
-        self._start_time = time.time()
-        self.running_nodes = {} # node.id -> node
-        self.exec_id_to_node_id = {}
-        self.failure = None
-               
-        # Queues 
-        self.event_queue = Queue()
-        
-        # Metadata
-        self.history = []
-
-        # | WIRE INTERFACES | #
-        # Subscribe to events + setup event emitter:
-        event_interface.event_subscriber(PipelineEvents, self.consume_event)
-        self.event_emitter= event_interface.emit_event_to_ocean
-        
-        # Create a scope store router instance 
-        mem_store_templates = mem_store_templates or {}
-        self.store_router: StoreRouter = store_interface.create_scoped_router(self.id, mem_store_templates=copy.deepcopy(mem_store_templates))
-
-        # | SETUP PROCESSING TOOLS | # 
-        # Node processing tools
-        self.dep_tools = DependencyTools(store_router=self.store_router)
-        self.node_processor: NodeProcessor = NodeProcessor(dep_tools=self.dep_tools)
-    
-        # | COMPILE PIPELINE FOR RUN | #       
-        # Pipeline
+        self.ocean_id = ocean_id
+        self.name = name
         self.pipeline = pipeline
-    
-        # Build DAG | Fill pipeline index
-        self.index: PipelineIndex = PipelineIndexBuilder(pipeline, self.node_processor, event_interface, mode=self.mode).build() # returns populated pipeline_index  
+        self.parallel = parallel
+        self.dynamic_ref_plan = dynamic_ref_plan
 
-        # Select and convert indexed dag to RuntimeDag
-        self.dag_to_run = self.index.dag_index.intent_dag
-        self.runtime_dag = RuntimeDag(self.dag_to_run)
-        
+        # Retain lifecycle and live execution state.
+        self.poll = True
+        self.complete = False
+        self.stay_alive = False
+        self.build_mode = False
+        self.purgatory = False
+        self._end_requested = False
+        self.running_nodes = {}
+        self.completed_node_ids = set()
+        self.ready_node_causes = {}
+        # Assign the ordinary execution identity when one readiness attempt
+        # begins.  The same identity is carried by NODE_READY, RESULT_READY,
+        # NODE_BLOCKED, or MISSING_REFS; the causal Event remains in ``cause``.
+        self.ready_exec_ids = {}
+        self.failure = None
+        self.deadlock = None
+        self.deadlock_reported = False
 
-        # Event handlers
+        # Receive routed Events and emit resulting Events through Ocean.
+        self.event_queue = Queue()
+        self.event_emitter = event_interface.emit_event_to_ocean
+        self.now_coordinator = now_coordinator
+        self.event_router_route = synchronous_event_router
+        self.pipeline_lookup = pipeline_lookup
+
+        # Resolve this Runner's Stores through Ocean's StoreRouter and registry.
+        self.store_router = store_router
+        self.dep_tools = DependencyTools(self.store_router)
+        self.node_processor = NodeProcessor(self.dep_tools)
+
+        # Index Pipeline intent and project its TIDE plan.
+        self.index = PipelineIndexBuilder(
+            self.pipeline,
+            self.node_processor,
+        ).build()
+        self._tide_plan = self._create_plan()
+
+        # Copy indexed dependencies into mutable runtime readiness.
+        self.runtime_dag = RuntimeDag(self.index.intent_dag)
+
+        # Handle only Events routed to this Runner.
         self.event_handlers = {
-            # State Events
-            PipelineEvents.DEP_AVAILABLE : self.on_dep_available,
-            PipelineEvents.DEP_DELETED : self.on_dep_delete,
-            PipelineEvents.DEP_UPDATED : self.on_dep_update,
-            PipelineEvents.RESULT_READY : self._on_node_completion,
-            
-            # Command Events
-            PipelineEvents.REGISTER_NODE : self.on_register_node,
-            PipelineEvents.RUN_NODE : self.on_node_run,
-            PipelineEvents.BUILD : self.on_build,
-            PipelineEvents.PRINT: self.on_print,
-            PipelineEvents.WAITING : self.on_print_waiting,
-            PipelineEvents.DONE : self.on_print_done,
-            PipelineEvents.KILL : self.on_kill
+            PipelineEvents.DEP_AVAILABLE: self.on_dep_available,
+            PipelineEvents.DEP_DELETED: self.on_dep_delete,
+            PipelineEvents.DEP_UPDATED: self.on_dep_update,
+            PipelineEvents.RESULT_READY: self._on_node_completion,
+            PipelineEvents.REGISTER_NODE: self.on_register_node,
+            PipelineEvents.RUN_NODE: self.on_node_run,
+            PipelineEvents.BUILD: self.on_build,
         }
 
-    ####################
-    # EVENT MANAGEMENT #
-    ####################  
-
-    def _scope_store_reference(self, store):
-        #already scoped (is root name, not alias)
-        if store in self.store_router.store_alias:
-            return store
-        # is scoped to runner, else reference actual store . e.g. mem_1 -> runner_0 will acces mem_1 and not mem_0
-        if store.endswith(f"_{self.id}"):
-            store = store.rsplit("_", 1)[0]
-        
-        return store
-    
-    def _unscope_store_reference(self, store):
-        if store in self.store_router.store_alias:
-            store = store + f"_{self.id}"
-        return store
+    def _unscope_data_ref(self, ref):
+        # Convert Pipeline intent into this Runner's actual Store reference.
+        store = self.store_router.registry.resolve_runner_store(
+            self.id,
+            ref.store,
+        )
+        return DataRef(
+            key=ref.key,
+            store=store,
+            count=ref.count,
+            max=ref.max,
+            literal=ref.literal,
+            prefix=ref.prefix,
+        )
 
     def _scope_data_ref(self, ref):
-        store = self._scope_store_reference(ref.store)
-        return DataRef(ref.key, store, ref.count, ref.max)
+        # Convert this Runner's actual Store reference back into Pipeline intent.
+        store = self.store_router.registry.resolve_pipeline_store(
+            self.id,
+            ref.store,
+        )
+        return DataRef(
+            key=ref.key,
+            store=store,
+            count=ref.count,
+            max=ref.max,
+            literal=ref.literal,
+            prefix=ref.prefix,
+        )
 
-    def _unscope_data_ref(self, ref):
-        store = self._unscope_store_reference(ref.store)
-        return DataRef(ref.key, store, ref.count, ref.max)
-    
+    def _create_plan(self):
+        # Retain this Runner's indexed TIDE plan and dynamic-ref plan.
+        return _project_pipeline_index_to_tide_plan(
+            self.index,
+            self.dynamic_ref_plan,
+            runner_id=self.id,
+            resolve_ref=self._unscope_data_ref,
+        )
+
     def consume_event(self, event):
         self.event_queue.put(event)
 
-    def handle_event(self, event):
-        self.event_handlers[event.event_type](event)
-
     def _process_event_queue(self):
-        while not self.event_queue.empty():
+        while True:
             try:
                 event = self.event_queue.get_nowait()
-                self.handle_event(event)
-                self.event_queue.task_done()
             except Empty:
-                break
+                return
+
+            try:
+                self.event_handlers[event.type](event)
             except RaiseHandlingError:
                 raise
-            except Exception as e:
-                raise EventHandlerError(f"Error while handling event[{event}]! : {e} ")
+            except Exception as error:
+                raise EventHandlerError(
+                    f"Error while handling Event {event.event_id}"
+                ) from error
+            finally:
+                self.event_queue.task_done()
 
-    #############
-    # ON EVENTS #
-    #############
+    def _remember_node_ready_cause(self, node_ids, event):
+        for node_id in node_ids or ():
+            self.ready_node_causes[node_id] = Cause.from_event(event)
+            if node_id not in self.ready_exec_ids:
+                self.ready_exec_ids[node_id] = create_tide_exec_uuid()
 
-    def on_kill(self, event):
-        self.index.dag_index.post_runtime_dag = copy.deepcopy(self.runtime_dag)
-        self.stay_alive = False
-        print("Pipeline dying :(")
-        return 
-    def on_print(self, event):
-        _user_print(f"Store = mem_{self.id}:")
-        _print_dict_struct(self.dep_tools.dump_store(f"mem_{self.id}")) 
+    def remember_initial_ready_nodes(self, event):
+        self._remember_node_ready_cause(self.runtime_dag.ready_nodes_queue, event)
 
-    def on_print_waiting(self, event):
-        _user_print(f"\nRunner [{self.id}] waiting=")
-        for nid, deps in self.runtime_dag.forward_map.items():                      
-            if deps or not self.index.node_index.node_by_id[nid].state.evaluated:    
-                node_name = self.index.node_index.node_by_id[nid].node_name
-                _user_print(f"{nid}:{node_name} | {deps }")
-        return
+    def _concretise_dep_link(self, node, dynamic_ref, concrete_ref):
+        # Link one concrete reference through every dynamic dependency index.
+        node.dynamic_to_static_deps[dynamic_ref].append(concrete_ref)
+        node.static_to_dynamic_deps[concrete_ref].append(dynamic_ref)
+        self.runtime_dag.reverse_map[concrete_ref].append(node.id)
 
-    def on_print_done(self, event):
-        _user_print(f"Pipeline[{self.id}]\ndone=")
-        for nid, deps in self.runtime_dag.forward_map.items():    
-            done_node = self.index.node_index.node_by_id[nid]
-            evaluated = done_node.state.evaluated                    
-            if evaluated:
-                _user_print(f"{nid}: {self.index.node_index.node_by_id[nid].node_name}")
-        return
+        for input_name, node_input in node.dep_to_input_map[dynamic_ref]:
+            node.dep_to_input_map[concrete_ref].append((input_name, node_input))
 
-    def on_node_run(self, event):
-        if not self.build_mode:
-            print("Running a specific node is only allowed in build_mode!")
-            return
-        node_id = event.payload
-        print(f"Pipeline[{self.id}] Attempting to run node [{node_id}]")
-        if node_id not in self.runtime_dag.forward_map:
-            print(f"Node[{node_id}] is not registered in this pipeline. retuning.")
-            return
-        if self.runtime_dag.forward_map[node_id]:
-            print(f"Node[{node_id}] is still waiting on dependencies: {self.runtime_dag.forward_map[node_id]}")
-            return
-        node = self.index.node_index.node_by_id[node_id]
-        self._on_node_ready(node)
-        return
+    def on_dep_available(self, event):
+        # Satisfy nodes waiting for this exact static reference.
+        available_ref = self._scope_data_ref(event.payload.ref)
+        released_nodes = self.runtime_dag.satisfy_dependency(available_ref)
+        self._remember_node_ready_cause(released_nodes, event)
 
-    def _effect_read_values(self):
-        """Snapshot visible store values for READ calls inside a node."""
-        values = {}
-        registry = self.store_router.registry
-
-        for store_name in dict.fromkeys(registry.__seen_stores__):
-            if not registry.exists(store_name):
-                continue
-            for key, value in registry.get(store_name).dump().items():
-                values[f"{store_name}:{key}"] = value
-
-        for alias, physical_names in self.store_router.store_alias.items():
-            if not isinstance(physical_names, (list, tuple, set)):
-                physical_names = [physical_names]
-            for physical_name in physical_names:
-                if not registry.exists(physical_name):
-                    continue
-                for key, value in registry.get(physical_name).dump().items():
-                    values[f"{alias}:{key}"] = value
-
-        return values
-
-    def _effect_runtime(self, node, exec_id):
-        runtime = {
-            "read_values": self._effect_read_values(),
-            "effects": [],
-            "inside_process_pool": self.parallel == "process",
-            "default_store": DataRef.default_store,
-        }
-
-        runtime["delete_now"] = lambda ref: self._delete_now(
-            node,
-            exec_id,
-            runtime,
-            ref,
-        )
-        return runtime
-
-    def _delete_now(self, node, exec_id, runtime, ref):
-        """Synchronously remove ``ref`` for an in-function DELETE_NOW call."""
-        pending_effects = runtime.setdefault("effects", [])
-
-        target = self._unscope_data_ref(ref)
-        found, _ = self.store_router.get_store(
-            target.store
-        ).pop_if_present(target.key)
-
-        # READ uses a dispatch snapshot. Keep that private snapshot coherent so
-        # a later READ in this same function observes the immediate deletion.
-        read_values = runtime.setdefault("read_values", {})
-        read_values.pop(DataRef.to_string(ref, strip_leading=True), None)
-        read_values.pop(DataRef.to_string(target, strip_leading=True), None)
-
-        effect = {
-            "effect": Effects.DELETE,
-            "reference": target,
-            "found": found,
-        }
-        pending_effects.append(effect)
-
-        return found
-
-    def _emit_delete_occurrence(
-        self,
-        node,
-        exec_id,
-        target,
-        output,
-        origin,
-    ):
-        """Record one DELETE in order, then route its atomic mutation."""
-        metadata = {"origin": origin}
-        source = f"{node.func.__name__}[{node.id}]"
-        self.event_emitter(Event(
-            source="runner",
-            source_id=self.id,
-            event_type=LogEvents.EFFECT,
-            payload=(Effects.DELETE, exec_id, [target], output, metadata),
-            exec_id=exec_id,
-        ))
-        self.event_emitter(Event(
-            source="store_router",
-            source_id=self.id,
-            target_runner_id=self.id,
-            event_type=RouterEvents.DELETE,
-            payload=(
-                target.store,
-                target.key,
-                source,
-                Effects.DELETE,
-                output,
-                metadata,
-            ),
-            exec_id=exec_id,
-        ))
-
-    def _emit_in_function_effects(self, node, exec_id, effects):
-        for effect in effects or ():
-            if not isinstance(effect, dict):
+        # Add this reference to every persistent dynamic dependency.
+        for dynamic_ref, node_ids in tuple(self.runtime_dag.reverse_map.items()):
+            if not dynamic_ref.dynamic:
                 continue
 
-            effect_kind = effect.get("effect")
-            if effect_kind not in {Effects.READ, Effects.DELETE}:
+            same_store = available_ref.store == dynamic_ref.store
+            matching_key = self.dep_tools.matches(available_ref.key, dynamic_ref.key)
+
+            if not (same_store and matching_key):
                 continue
 
-            target = self._unscope_data_ref(effect["reference"])
-            node.runtime_effects.append(effect)
-
-            targets = (
-                {target: effect["value"]}
-                if effect_kind == Effects.READ
-                else [target]
+            required = 1 if dynamic_ref.count is None else dynamic_ref.count
+            satisfied = False
+            waiting_node_ids = self.runtime_dag.waiting_dynamic_deps.get(
+                dynamic_ref,
+                (),
             )
 
-            self.event_emitter(Event(
-                source="runner",
-                source_id=self.id,
-                event_type=LogEvents.EFFECT,
-                payload=(
-                    effect_kind,
-                    exec_id,
-                    targets,
-                    __TIDE_TEMPLATE_VALUE__(),
-                    {
-                        "found": effect.get("found", False),
-                        "immediate": effect_kind == Effects.DELETE,
-                        "origin": "runtime",
-                    },
-                ),
-                exec_id=exec_id,
-            ))
+            for node_id in node_ids:
+                node = self.index.node_index.node_by_id[node_id]
+                self._concretise_dep_link(node, dynamic_ref, available_ref)
 
-            if effect_kind == Effects.DELETE and effect.get("found", False):
-                # The live store was already mutated by DELETE_NOW. This event
-                # updates DAG readiness after the execution receipt exists; it
-                # deliberately does not route through StoreRouter.DELETE and
-                # therefore cannot delete a later replacement value twice.
+                # Already-satisfied nodes retain the candidate without re-readying.
+                if node_id not in waiting_node_ids:
+                    continue
+
+                if (len(node.dynamic_to_static_deps[dynamic_ref]) < required):
+                    continue
+
+                satisfied = True
+
+                # Record the concrete references selected for each input.
+                concrete_refs = tuple(
+                    self._unscope_data_ref(ref)
+                    for ref in node.dynamic_to_static_deps[dynamic_ref][
+                        :dynamic_ref.max
+                    ]
+                )
+
+                for input_name, _ in node.dep_to_input_map[dynamic_ref]:
+                    self.event_emitter(Event(
+                        ocean_id=self.ocean_id,
+                        source="runner",
+                        source_id=self.id,
+                        type=LogEvents.DEP_CONCRETISED,
+                        cause=Cause.from_event(event),
+                        payload=DependencyConcretised(
+                            input_name,
+                            self._unscope_data_ref(dynamic_ref),
+                            concrete_refs,
+                            self._snapshot_execution_evidence(node),
+                        ),
+                        exec_id=event.exec_id,
+                    ))
+
+            # Equal dynamic predicates become satisfied together.
+            if satisfied:
+                released_nodes = self.runtime_dag.satisfy_dependency(dynamic_ref)
+                self._remember_node_ready_cause(released_nodes, event)
+
+    def on_dep_delete(self, event):
+        deleted_ref = self._scope_data_ref(event.payload.ref)
+
+        # Check every node that has depended on the deleted State.
+        for node_id in tuple(self.runtime_dag.reverse_map.get(deleted_ref, ())):
+            node = self.index.node_index.node_by_id[node_id]
+            missing_dependencies = self.runtime_dag.forward_map[node_id]
+
+            # Ignore nodes that can never execute again.
+            if node.status == "exhausted":
+                self.ready_exec_ids.pop(node_id, None)
+                continue
+
+            unsatisfied_dependencies = DedupedList()
+
+            # Remove the deleted State from its dynamic dependencies.
+            for dynamic_ref in tuple(node.static_to_dynamic_deps.get(deleted_ref, ())):
+                node.dynamic_to_static_deps[dynamic_ref].remove(deleted_ref)
+                node.static_to_dynamic_deps[deleted_ref].remove(dynamic_ref)
+
+                required = 1 if dynamic_ref.count is None else dynamic_ref.count
+
+                # Record only dependencies that cross SATISFIED -> UNSATISFIED.
+                below_minimum = len(node.dynamic_to_static_deps[dynamic_ref]) < required
+                if below_minimum and dynamic_ref not in missing_dependencies:
+                    unsatisfied_dependencies.append(dynamic_ref)
+
+            # A deleted exact dependency also becomes unsatisfied.
+            if deleted_ref in node.deps and deleted_ref not in missing_dependencies:
+                unsatisfied_dependencies.append(deleted_ref)
+
+            # Stop when no dependency became unsatisfied.
+            if not unsatisfied_dependencies:
+                continue
+
+            # If executing, remember the dependencies and change nothing else.
+            if node.executing:
+                node._pending_deleted_dependencies.extend(unsatisfied_dependencies)
+                continue
+
+            # Otherwise unsatisfy the dependencies and unresolve their inputs.
+            was_ready = not missing_dependencies
+            for dependency in unsatisfied_dependencies:
+                self.runtime_dag.unsatisfy_dependency(node_id, dependency)
+
+                for _, node_input in node.dep_to_input_map[dependency]:
+                    node._unresolve_input(node_input)
+
+            self.ready_node_causes.pop(node_id, None)
+
+            # Record the one READY -> BLOCKED transition.
+            if was_ready:
+                blocked_exec_id = self.ready_exec_ids.pop(node_id, None)
+                input_names = tuple(dict.fromkeys(
+                    input_name
+                    for dependency in unsatisfied_dependencies
+                    for input_name, _ in node.dep_to_input_map[dependency]
+                ))
                 self.event_emitter(Event(
-                    source="store_router",
-                    source_id=self.store_router.id,
-                    target_runner_id=self.id,
-                    event_type=PipelineEvents.DEP_DELETED,
-                    payload=(
-                        target.store,
-                        target.key,
-                        f"{node.func.__name__}[{node.id}]",
-                        Effects.DELETE,
+                    ocean_id=self.ocean_id,
+                    source="runner",
+                    source_id=self.id,
+                    type=LogEvents.NODE_BLOCKED,
+                    cause=Cause.from_event(event),
+                    payload=NodeBlocked(
+                        self._unscope_data_ref(deleted_ref),
+                        input_names,
+                        self._snapshot_execution_evidence(node),
                     ),
-                    exec_id=exec_id,
+                    exec_id=blocked_exec_id,
                 ))
 
-    def _snapshot_execution_evidence(self, node: RunnerNode):
-        """Freeze occurrence-specific evidence before reusable node execution.
+    def on_dep_update(self, event):
+        updated_ref = self._scope_data_ref(event.payload.ref)
 
-        RunnerNode is mutable runtime machinery and may be resolved or executed
-        again. Historical ExecRecords must therefore be reconstructed from this
-        dispatch snapshot rather than from the node's eventual live state.
-        """
+        # Check every node that currently consumes the updated State.
+        for node_id in tuple(self.runtime_dag.reverse_map.get(updated_ref, ())):
+            node = self.index.node_index.node_by_id[node_id]
+            missing_dependencies = self.runtime_dag.forward_map[node_id]
+
+            # Ignore nodes that can never execute again.
+            if node.status == "exhausted":
+                self.ready_exec_ids.pop(node_id, None)
+                continue
+
+            updated_dependencies = DedupedList()
+
+            # Collect the exact and dynamic dependencies affected by the update.
+            if updated_ref in node.deps and updated_ref not in missing_dependencies:
+                updated_dependencies.append(updated_ref)
+
+            for dynamic_ref in node.static_to_dynamic_deps.get(updated_ref, ()):
+                if dynamic_ref not in missing_dependencies:
+                    updated_dependencies.append(dynamic_ref)
+
+            # Stop when this node no longer consumes the State.
+            if not updated_dependencies:
+                continue
+
+            # If executing, remember the updated dependencies and change nothing else.
+            if node.executing:
+                node._pending_updated_dependencies.extend(updated_dependencies)
+                continue
+
+            was_ready = not missing_dependencies
+            self.ready_node_causes.pop(node_id, None)
+
+            # Invalidate every affected dependency before checking availability.
+            for dependency in updated_dependencies:
+                self.runtime_dag.unsatisfy_dependency(node_id, dependency)
+
+                for _, node_input in node.dep_to_input_map[dependency]:
+                    node._unresolve_input(node_input)
+
+            # Record the one READY -> BLOCKED transition.
+            if was_ready:
+                blocked_exec_id = self.ready_exec_ids.pop(node_id, None)
+                input_names = tuple(dict.fromkeys(
+                    input_name
+                    for dependency in updated_dependencies
+                    for input_name, _ in node.dep_to_input_map[dependency]
+                ))
+                self.event_emitter(Event(
+                    ocean_id=self.ocean_id,
+                    source="runner",
+                    source_id=self.id,
+                    type=LogEvents.NODE_BLOCKED,
+                    cause=Cause.from_event(event),
+                    payload=NodeBlocked(
+                        self._unscope_data_ref(updated_ref),
+                        input_names,
+                        self._snapshot_execution_evidence(node),
+                    ),
+                    exec_id=blocked_exec_id,
+                ))
+
+            # A still-available dependency becomes satisfied again.
+            for dependency in updated_dependencies:
+                # Leave the dependency blocked if it is no longer available.
+                if not self.dep_tools.is_available(self._unscope_data_ref(dependency)):
+                    continue
+
+                released = self.runtime_dag.satisfy_dependency(dependency)
+                self._remember_node_ready_cause(released, event)
+
+    def _poll_waiting_deps(self):
+        existing = {}
+
+        # Find every available static dependency.
+        for dependency in tuple(self.runtime_dag.waiting_static_deps):
+            ref = self._unscope_data_ref(dependency)
+
+            if self.dep_tools.is_available(ref):
+                existing[ref] = self.dep_tools.resolve_exact(ref)
+
+        # Link every existing dynamic member before availability can release a node.
+        for dependency, node_ids in tuple(self.runtime_dag.waiting_dynamic_deps.items()):
+            ref = self._unscope_data_ref(dependency)
+
+            for concrete_ref in self.dep_tools.matching_refs(ref):
+                existing[concrete_ref] = self.dep_tools.resolve_exact(concrete_ref)
+                scoped_ref = self._scope_data_ref(concrete_ref)
+
+                for node_id in tuple(node_ids):
+                    node = self.index.node_index.node_by_id[node_id]
+                    self._concretise_dep_link(node, dependency, scoped_ref)
+
+        # Send every pre-existing State through normal dependency handling.
+        for ref, value in existing.items():
+            self.event_emitter(Event(
+                ocean_id=self.ocean_id,
+                source="runner",
+                source_id=self.id,
+                type=PipelineEvents.DEP_AVAILABLE,
+                cause=Cause(self.runner_start_event_id, str(OceanEvents.RUN_PIPELINE)),
+                target_runner_id=self.id,
+                payload=State(
+                    ref,
+                    value,
+                    tide_snapshot_value(value, boundary="write"),
+                    state_occurrence=False,
+                    value_type=type(value),
+                ),
+            ))
+
+        self.poll = False
+
+    def _resolve_node_inputs(self, node):
+        if node is None:
+            raise PipelineRuntimeError("Ready node was None")
+
+        reads, unrepresented = self.node_processor.resolve_all_inputs(
+            self._unscope_data_ref,
+            node,
+        )
+        return reads, unrepresented
+
+    def _emit_missing_references(self, node, cause, error, exec_id):
+        # Normalize the Store observations made by the failed resolution.
+        available_refs = tuple(
+            self._unscope_data_ref(
+                ref
+                if isinstance(ref, DataRef)
+                else DataRef(ref, error.ref.store)
+            )
+            for ref in error.available_keys
+        )
+
+        # Record the attempted dispatch without inventing an execution.
+        missing_event = Event(
+            ocean_id=self.ocean_id,
+            source="runner",
+            source_id=self.id,
+            type=LogEvents.MISSING_REFS,
+            cause=cause,
+            payload=MissingReferences(
+                self._unscope_data_ref(error.ref),
+                available_refs,
+                self._snapshot_execution_evidence(node),
+            ),
+            exec_id=exec_id,
+        )
+        self.event_emitter(missing_event)
+        return missing_event
+
+    def _on_node_ready(self, node, cause):
+        # An exhausted one-shot node cannot create another execution.
+        if node.status == "exhausted":
+            return
+
+        exec_id = self.ready_exec_ids.pop(node.id, None)
+        if exec_id is None:
+            exec_id = create_tide_exec_uuid()
+
+        # Resolve inputs before creating an execution identity.
+        try:
+            reads, unrepresented = self._resolve_node_inputs(node)
+        except DynamicRefCountLessThanAvailableKeysError as error:
+            missing_event = self._emit_missing_references(
+                node,
+                cause,
+                error,
+                exec_id,
+            )
+            available_keys = set(error.available_keys)
+
+            for concrete_ref in node.dynamic_to_static_deps[error.ref]:
+                if concrete_ref.key not in available_keys:
+                    self.event_emitter(Event(
+                        ocean_id=self.ocean_id,
+                        source="runner",
+                        source_id=self.id,
+                        type=PipelineEvents.DEP_DELETED,
+                        cause=Cause.from_event(missing_event),
+                        target_runner_id=self.id,
+                        payload=Reference(self._unscope_data_ref(concrete_ref)),
+                        exec_id=exec_id,
+                    ))
+            return
+
+        except MissingRefDuringResolutionError as error:
+            missing_event = self._emit_missing_references(
+                node,
+                cause,
+                error,
+                exec_id,
+            )
+            self.event_emitter(Event(
+                ocean_id=self.ocean_id,
+                source="runner",
+                source_id=self.id,
+                type=PipelineEvents.DEP_DELETED,
+                cause=Cause.from_event(missing_event),
+                target_runner_id=self.id,
+                payload=Reference(self._unscope_data_ref(error.ref)),
+                exec_id=exec_id,
+            ))
+            return
+
+        # Assign identity only once resolution has genuinely reached execution.
+        self._represent_untracked_inputs(node, exec_id, reads, unrepresented, cause)
+
+        # Freeze reconstruction evidence and construct live Executor work.
+        node_snapshot = self._snapshot_execution_evidence(node, reads)
+        runtime = self._create_effect_runtime(exec_id)
+        work = Work(node.func, node.args.resolved, node.kwargs.resolved, self.parallel, runtime, node_snapshot)
+
+        # Register all live state before publishing the execution.
+        node.executing = True
+        ready_event = Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=ExecutorEvents.NODE_READY, cause=cause, payload=work, exec_id=exec_id)
+        runtime.node_ready_event_id = ready_event.event_id
+        self.running_nodes[node.id] = node
+        self.event_emitter(ready_event)
+
+    def _represent_untracked_inputs(
+        self,
+        runner_node,
+        exec_id,
+        reads,
+        unrepresented,
+        cause,
+    ):
+        # Build stable reference components for this pending execution.
+        exec_token = exec_id.split(":", 1)[-1]
+        node_name = "".join(
+            character
+            if character.isalnum() or character in "-_."
+            else "_"
+            for character in str(runner_node.node_name)
+        )
+
+        # Represent each otherwise-untracked input occurrence as a TIDE State.
+        for input_name, occurrences in unrepresented.items():
+            for occurrence, (value, value_snapshot, input_path) in enumerate(occurrences):
+                observer_exec_id = create_tide_exec_uuid()
+                key = f"{node_name}.{input_name}.{occurrence}.{exec_token}"
+                ref = self._unscope_data_ref(DataRef(key=key, store="__untracked__"))
+                write_snapshot = value_snapshot.at_boundary("write")
+                read_snapshot = value_snapshot.at_boundary("read")
+
+                # The observer produces the otherwise-unrepresented State.
+                self.event_emitter(Event(
+                    ocean_id=self.ocean_id,
+                    source="TIDE: External",
+                    source_id="TIDE: External",
+                    type=RouterEvents.STORE_WRITE,
+                    cause=Cause(cause.event_id, "TIDE: untracked input"),
+                    target_runner_id=self.id,
+                    payload=State(
+                        ref,
+                        write_snapshot.restore(),
+                        write_snapshot,
+                        value_type=type(value),
+                    ),
+                    exec_id=observer_exec_id,
+                ))
+
+                # Attach the genuine input occurrence to its synthetic observer State.
+                reads[input_name].append((
+                    ref,
+                    value,
+                    read_snapshot,
+                    None,
+                    input_path,
+                ))
+
+    def _snapshot_execution_evidence(
+        self,
+        runner_node: RunnerNode,
+        reads=None,
+    ):
+        # Snapshot each live object once while retaining boundary-specific views.
         snapshots_by_identity = {}
 
         def snapshot(value, boundary):
             identity = id(value)
-            if identity not in snapshots_by_identity:
-                snapshots_by_identity[identity] = tide_snapshot_value(
+            cached = snapshots_by_identity.get(identity)
+            if cached is None:
+                captured = tide_snapshot_value(
                     value,
                     boundary=boundary,
                 )
-            return snapshots_by_identity[identity].at_boundary(boundary)
+                # Keep the original object alive for as long as its id is a
+                # cache key.  Several callers pass temporary containers, and
+                # Python may otherwise recycle their ids during this capture.
+                snapshots_by_identity[identity] = (value, captured)
+            else:
+                original, captured = cached
+                if original is not value:
+                    raise RuntimeError("Snapshot identity collision")
 
-        base_node = self.index.node_index.node_id_to_definiton_node.get(
-            node.id
-        )
+            return captured.at_boundary(boundary)
+
+        # Preserve every representation of each runtime input.
         inputs = {}
-
-        for input_name, node_input in node.get_all_inputs().items():
+        for input_name, node_input in runner_node.get_all_inputs().items():
             dependencies = []
             for dependency in node_input.deps:
+                unscoped = self._unscope_data_ref(dependency)
                 dependencies.append({
                     "dependency": snapshot(
                         dependency,
                         f"dispatch.{input_name}.dependency",
                     ),
-                    "unscoped_reference": (
-                        f"{self._unscope_store_reference(dependency.store)}:"
-                        f"{dependency.key}"
+                    "unscoped_reference": DataRef.to_string(
+                        unscoped,
+                        prefix=False,
                     ),
                 })
 
@@ -418,10 +662,12 @@ class PipelineRunner:
                 "dependencies": dependencies,
             }
 
+        # Preserve each dynamic dependency and its selected concrete references.
         dynamic_dependencies = []
-        for dynamic_dependency, static_dependencies in (
-            node.dynamic_to_static_deps.items()
-        ):
+        for dynamic_dependency, static_dependencies in runner_node.dynamic_to_static_deps.items():
+            selected_dependencies = static_dependencies[
+                :dynamic_dependency.max
+            ]
             dynamic_dependencies.append({
                 "dependency": snapshot(
                     dynamic_dependency,
@@ -433,1237 +679,732 @@ class PipelineRunner:
                             static_dependency,
                             "dispatch.expanded_dependency",
                         ),
-                        "unscoped_reference": (
-                            f"{self._unscope_store_reference(static_dependency.store)}:"
-                            f"{static_dependency.key}"
+                        "unscoped_reference": DataRef.to_string(
+                            self._unscope_data_ref(static_dependency),
+                            prefix=False,
                         ),
                     }
-                    for static_dependency in static_dependencies
+                    for static_dependency in selected_dependencies
                 ],
             })
 
-        unscoped_store_refs = []
+        # Retain every actual Store touched by declared or concretised references.
         references = [
-            *node.targets,
-            *node.deps,
+            *runner_node.targets,
+            *runner_node.deps,
             *[
                 dependency
-                for dependencies in node.dynamic_to_static_deps.values()
+                for dependencies in runner_node.dynamic_to_static_deps.values()
                 for dependency in dependencies
             ],
         ]
+        unscoped_store_refs = []
         for reference in references:
-            store = self._unscope_store_reference(reference.store)
+            store = self._unscope_data_ref(reference).store
             if store not in unscoped_store_refs:
                 unscoped_store_refs.append(store)
 
-        declared_deps = list(node.deps)
-        declared_effects = list(node.effects)
-        declared_targets = list(node.targets)
+        # Preserve the exact reads selected for this dispatch.
+        read_receipts = []
+        for input_name, occurrences in (reads or {}).items():
+            for ref, value, read_snapshot, parent, input_path in occurrences:
+                read_receipts.append({
+                    "input_name": input_name,
+                    "reference": DataRef.to_string(
+                        ref,
+                        prefix=False,
+                    ),
+                    "value": snapshot(
+                        value,
+                        "dispatch.read.value",
+                    ),
+                    "snapshot": ensure_tide_snapshot(
+                        read_snapshot,
+                        boundary="read",
+                    ),
+                    "parent": (
+                        self._unscope_data_ref(parent)
+                        if parent is not None
+                        else None
+                    ),
+                    "input_path": tuple(input_path or ()),
+                })
+
+        # Freeze the complete occurrence evidence consumed by reconstruction.
+        return {
+            "runner_id": self.id,
+            "pipeline_id": self.pipeline.id,
+            "node_id": runner_node.id,
+            "func": runner_node.func,
+            "func_name": runner_node.func.__name__,
+            "inputs": inputs,
+            "dynamic_dependencies": dynamic_dependencies,
+            "declared_deps": snapshot(
+                list(runner_node.deps),
+                "dispatch.declared_deps",
+            ),
+            # Effect descriptors are typed Event structure.  Freeze their
+            # current graph, then let the single Event codec encode that
+            # structure and its embedded runtime values.
+            "declared_effects": copy.deepcopy(list(runner_node.effects)),
+            "declared_targets": snapshot(
+                list(runner_node.targets),
+                "dispatch.declared_targets",
+            ),
+            "unscoped_store_refs": tuple(unscoped_store_refs),
+            "base_node_id": runner_node.node.id,
+            "base_node_content_id": runner_node.node.content_id,
+            "content_id": runner_node.content_id,
+            "emitted_by_exec_id": runner_node.emitted_by_exec_id,
+            "node_options": {
+                "force_update": runner_node.force_update,
+                "one_shot": runner_node.one_shot,
+                "unpack": runner_node.unpack,
+                "share_implicit_target": runner_node.share_implicit_target,
+            },
+            "reads": tuple(read_receipts),
+        }
+
+    def _snapshot_node_definition(self, runner_node: RunnerNode):
+        """Freeze only the definition established by NODE_EMITTED.
+
+        Emission does not prove that any dependency was available or used, so
+        this payload deliberately contains no resolved input stages, concrete
+        dynamic expansions, or read receipts.
+        """
+        snapshots_by_identity = {}
+
+        def snapshot(value, boundary):
+            identity = id(value)
+            cached = snapshots_by_identity.get(identity)
+            if cached is None:
+                captured = tide_snapshot_value(value, boundary=boundary)
+                snapshots_by_identity[identity] = (value, captured)
+            else:
+                original, captured = cached
+                if original is not value:
+                    raise RuntimeError("Snapshot identity collision")
+            return captured.at_boundary(boundary)
+
+        inputs = {}
+        for input_name, node_input in runner_node.get_all_inputs().items():
+            inputs[input_name] = {
+                "raw": snapshot(
+                    node_input.raw,
+                    f"definition.{input_name}.raw",
+                ),
+            }
+
+        references = [*runner_node.targets, *runner_node.deps]
+        unscoped_store_refs = []
+        for reference in references:
+            store = self._unscope_data_ref(reference).store
+            if store not in unscoped_store_refs:
+                unscoped_store_refs.append(store)
 
         return {
             "runner_id": self.id,
             "pipeline_id": self.pipeline.id,
-            "node_id": node.id,
-            "func": node.func,
-            "func_name": node.func.__name__,
+            "node_id": runner_node.id,
+            "func": runner_node.func,
+            "func_name": runner_node.func.__name__,
             "inputs": inputs,
-            "dynamic_dependencies": dynamic_dependencies,
             "declared_deps": snapshot(
-                declared_deps,
-                "dispatch.declared_deps",
+                list(runner_node.deps),
+                "definition.declared_deps",
             ),
-            "declared_effects": snapshot(
-                declared_effects,
-                "dispatch.declared_effects",
-            ),
+            "declared_effects": copy.deepcopy(list(runner_node.effects)),
             "declared_targets": snapshot(
-                declared_targets,
-                "dispatch.declared_targets",
+                list(runner_node.targets),
+                "definition.declared_targets",
             ),
             "unscoped_store_refs": tuple(unscoped_store_refs),
-            "resolve_output": node.resolve_output,
-            "base_node_id": base_node.id if base_node else None,
-            "base_node_content_id": (
-                base_node.content_id if base_node else None
-            ),
-            "content_id": node.content_id,
+            "base_node_id": runner_node.node.id,
+            "base_node_content_id": runner_node.node.content_id,
+            "content_id": runner_node.content_id,
+            "emitted_by_exec_id": runner_node.emitted_by_exec_id,
             "node_options": {
-                "recompute": node.recompute,
-                "resolve_output": node.resolve_output,
-                "inject_data_store": node.inject_data_store,
+                "force_update": runner_node.force_update,
+                "one_shot": runner_node.one_shot,
+                "unpack": runner_node.unpack,
+                "share_implicit_target": runner_node.share_implicit_target,
             },
         }
 
-    def _on_node_ready(self, node: RunnerNode):
+    def _process_ready_nodes(self):
+        if self._end_requested:
+            return
+        while self.runtime_dag.ready_nodes_queue:
+            node_id = self.runtime_dag.ready_nodes_queue.popleft()
+            cause = self.ready_node_causes.pop(node_id)
+            node = self.index.node_index.node_by_id[node_id]
+
+            if node.status == "exhausted":
+                continue
+
+            if not node.evaluated:
+                self._on_node_ready(node, cause)
+
+    def _create_effect_runtime(self, exec_id):
+        return EffectRuntime(
+            exec_id=exec_id,
+            default_store=DataRef.default_store,
+            read_handler=self._read_now,
+            write_handler=self._write_now,
+            delete_handler=self._delete_now,
+        )
+
+    def _read_now(self, runtime, effect):
+        return self.now_coordinator("read", self.id, runtime, effect)
+
+    def _write_now(self, runtime, effect):
+        return self.now_coordinator("write", self.id, runtime, effect)
+
+    def _delete_now(self, runtime, effect):
+        return self.now_coordinator("delete", self.id, runtime, effect)
+
+    def _apply_now(self, operation, runtime, effect):
+        handlers = {
+            "read": self._apply_read_now,
+            "write": self._apply_write_now,
+            "delete": self._apply_delete_now,
+        }
         try:
-            exec_id = create_tide_exec_uuid()
-            reads, unrepresented = self._resolve_node_inputs(node)
-            self._represent_unnamed_inputs(
-                node,
-                exec_id,
-                reads,
-                unrepresented,
-            )
-            self._emit_read_events_from_reads(reads, exec_id)
-        except DynamicRefCountLessThanAvailableKeysError as e:
-            print(f"[DYNAMIC:ON_NODE_READY:ERROR] {node.node_name} failed to resolve due to unsatisfied count error ")
-            missing_ref = e.ref
-            available_keys = e.available_keys
-            for static_ref in node.dynamic_to_static_deps[missing_ref]:
-                if static_ref.key not in available_keys:
-                    print(f"[INPUT_RESOLVER] {static_ref.key} was missing during dynamic resolution! Creating fallback delete dep event!")
-                    self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.MISSING_REFS, payload=(node, missing_ref, available_keys)))
-                    self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_DELETED, payload=(missing_ref.store, static_ref.key, "TIDE: InputResolver", "TIDE: MissingRefFallback")))             
-            return
-        except MissingRefDuringResolutionError as e:
-            print(f"[ON_NODE_READY:ERROR] {node.node_name} failed to resolve due to missing error ")
-            missing_ref = e.ref
-            available_keys = e.available_keys
-            print(f"[INPUT_RESOLVER] {missing_ref} missing during resolution! Creating fallback delete dep event!")
-            self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.MISSING_REFS, payload=(node, missing_ref, available_keys)))
-            self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_DELETED, payload=(missing_ref.store, missing_ref.key, "TIDE: InputResolver", "TIDE: MissingRefFallback")))
-            return
+            handler = handlers[operation]
+        except KeyError as error:
+            raise ValueError(
+                f"Unsupported immediate operation: {operation!r}"
+            ) from error
+        return handler(runtime, effect)
 
-        _MODE = self.parallel
-        _WORKER = _node_worker
-        effect_runtime = self._effect_runtime(node, exec_id)
-        worker_effect_runtime = effect_runtime
-        if self.parallel == "process":
-            # The live callback is intentionally retained only on the parent
-            # event. The process receives a serialisable marker and asks the
-            # Executor to replay this occurrence in a shared-memory thread if
-            # DELETE_NOW (or READ) is actually called.
-            worker_effect_runtime = {
-                key: value
-                for key, value in effect_runtime.items()
-                if key != "delete_now"
-            }
-            effect_runtime["inside_process_pool"] = False
+    def _apply_read_now(self, runtime, effect):
+        # Resolve the one requested reference through this Runner.
+        ref = self._unscope_data_ref(effect.targets[0])
+        resolved_effect = effect.__class__(ref, fallback=effect.fallback)
 
-        _WORKER_INPUTS = (
-            node.func,
-            node.args.resolved,
-            node.kwargs.resolved,
-            worker_effect_runtime,
-        )
-        _PAYLOAD = (node.id, (_WORKER, _WORKER_INPUTS, _MODE))
-        
-        node.state.executing = True
-        self.exec_id_to_node_id[exec_id] = node.id
-        
-        
-        
-        ready_node_event = Event(source="runner", source_id=self.id, target_runner_id=None, event_type=ExecutorEvents.NODE_READY, payload=_PAYLOAD, exec_id=exec_id)
-        ready_node_event.execution_evidence = (
-            self._snapshot_execution_evidence(node)
-        )
-        ready_node_event.thread_effect_runtime = effect_runtime
-        self.event_emitter(ready_node_event) 
-        self.running_nodes[node.id] = node 
+        # Read the live Store once and retain whether the reference existed.
+        value = self.store_router.get_store(ref.store).get(ref.key)
+        found = not isinstance(value, __fallback__)
+        if not found:
+            value = effect.fallback
 
-    def _handle_node_result(
-        self,
-        node: RunnerNode,
-        exec_id: uuid = None,
-        effects=None,
-        store_result=True,
-        preserve_effect_output_to_node_targets=True,
-    ):
+        # Publish the exact observation before the function resumes.
+        snapshot = tide_snapshot_value(value, boundary="read")
+        self.event_router_route(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=LogEvents.EFFECT, cause=Cause(runtime.node_ready_event_id, str(ExecutorEvents.NODE_READY)), payload=EffectOccurrence(Effects.READ, (ref,), snapshot, "runtime", True, (found,)), exec_id=runtime.exec_id))
+        runtime.effects.append(resolved_effect)
+        return value
 
+    def _apply_write_now(self, runtime, effect):
+        # Resolve the one requested reference through this Runner.
+        supplied_ref, value = effect.targets[0]
+        ref = self._unscope_data_ref(supplied_ref)
+        snapshot = tide_snapshot_value(value, boundary="write")
+
+        found = self.store_router.exists(store=ref.store)
+
+        resolved_effect = WRITE(ref, value)
+
+        effect_event = Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=LogEvents.EFFECT, cause=Cause(runtime.node_ready_event_id, str(ExecutorEvents.NODE_READY)), payload=EffectOccurrence(Effects.WRITE, ((ref, value),), effect.output, "runtime", True, found=(found, )), exec_id=runtime.exec_id)
+        self.event_router_route(effect_event)
+
+    
         
+        # updated=True means this is an update.
+        if found:
+            updated = self.store_router.get_store(ref.store).set(ref.key, value)
+            self.event_router_route(Event(ocean_id=self.ocean_id, source="store_router", source_id=self.store_router.id, type=PipelineEvents.DEP_UPDATED if updated else PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(effect_event), target_runner_id=self.id, payload=State(ref, value, snapshot, value_type=type(value)), exec_id=runtime.exec_id))
 
+        runtime.effects.append(resolved_effect)
+        return found
+
+    def _apply_delete_now(self, runtime, effect):
+        # Resolve the one requested reference through this Runner.
+        ref = self._unscope_data_ref(effect.targets[0])
+        resolved_effect = DELETE(ref)
+
+        # Delete atomically and retain whether the reference existed.
+        value = self.store_router.get_store(ref.store).pop(ref.key)
+        found = not isinstance(value, __fallback__)
+
+        # Publish the exact outcome before the function resumes.
+        effect_event = Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=LogEvents.EFFECT, cause=Cause(runtime.node_ready_event_id, str(ExecutorEvents.NODE_READY)), payload=EffectOccurrence(Effects.DELETE, (ref,), found, "runtime", True, (found,)), exec_id=runtime.exec_id)
+        self.event_router_route(effect_event)
+
+        # Only a successful deletion creates a State consequence.
+        if found:
+            self.event_router_route(Event(ocean_id=self.ocean_id, source="store_router", source_id=self.store_router.id, type=PipelineEvents.DEP_DELETED, cause=Cause.from_event(effect_event), target_runner_id=self.id, payload=Reference(ref), exec_id=runtime.exec_id))
+        runtime.effects.append(resolved_effect)
+        return found
+
+    def _handle_node_result(self, node, meta, result_event_id):
+        exec_id = meta.id
+        result = node.result
         emitted_occurrences = []
-        returned_nodes = []
+        reference_available = {}
 
-        def _record_effect_output(output, origin):
-            if not isinstance(output, __TIDE_TEMPLATE_VALUE__):
-                emitted_occurrences.extend(
-                    (emitted_node, origin)
-                    for emitted_node in (
-                        self.node_processor._extract_nodes_from_result(
-                            output
-                        )
-                    )
-                )
-            
+        # A returned Effect may supply the node's normal result.
+        returned_effect = result() if isinstance(result, type) and result in {END, DELETE} else result
+        if isinstance(returned_effect, Effect):
+            if not isinstance(returned_effect.output, __fallback__):
+                written_refs = self._store_node_result(node, exec_id, result_event_id, returned_effect.output)
+                reference_available.update((ref, True) for ref in written_refs)
+        else:
+            written_refs = self._store_node_result(node, exec_id, result_event_id)
+            reference_available.update((ref, True) for ref in written_refs)
 
+        # Declared Effects always follow the normal result write.
+        for effect in node.effects:
+            emitted_occurrences.extend(self._handle_effect(effect, origin="declared", cause=Cause(result_event_id, str(PipelineEvents.RESULT_READY)), node=node, exec_id=exec_id, reference_available=reference_available))
 
-        
-        to_handle = [
-            (effect, "declared")
-            for effect in node.effects
-        ] if effects is None else [
-            (effect, "runtime")
-            for effect in effects
-        ]
-        if store_result:
-            node_result = (
-                node.resolved_output
-                if node.resolve_output
-                else node.result
-            )
+        # A controlled RAISE is one runtime occurrence before its fall-through.
+        if meta.handled_raise:
+            immediate_count = meta.runtime_immediate_effect_count
+            raise_effect = RAISE(meta.error, effects=meta.runtime_effects[immediate_count:], output=meta.result)
+            emitted_occurrences.extend(self._handle_effect(raise_effect, origin="runtime", cause=Cause(result_event_id, str(PipelineEvents.RESULT_READY)), node=node, exec_id=exec_id, reference_available=reference_available))
 
-            if (
-                isinstance(node_result, type)
-                and issubclass(node_result, Effect)
-            ) or isinstance(node_result, Effect):
-                to_handle.append((node_result, "runtime"))
-                # A returned effect can supply the execution's normal result.
-                # Route that result before any post-result declared or runtime
-                # effects so intentional target collisions have one explicit
-                # version order: normal, declared, then returned runtime.
-                if (
-                    not isinstance(node_result, type)
-                    and preserve_effect_output_to_node_targets
-                    and not isinstance(
-                        node_result.preserve_output,
-                        __TIDE_TEMPLATE_VALUE__,
-                    )
-                ):
-                    self._store_node_result(
-                        node,
-                        exec_id,
-                        node_result.preserve_output,
-                    )
-            else:
-                self._store_node_result(node, exec_id)
-                returned_nodes = list(
-                    self.node_processor._extract_nodes_from_result(
-                        node.result
-                    )
-                )
+        # Otherwise handle the Effect or Nodes returned by the function.
+        elif isinstance(returned_effect, Effect):
+            emitted_occurrences.extend(self._handle_effect(returned_effect, origin="runtime", cause=Cause(result_event_id, str(PipelineEvents.RESULT_READY)), node=node, exec_id=exec_id, reference_available=reference_available))
+        else:
+            returned_nodes = tuple(self.node_processor._extract_nodes_from_result(node.result))
+            if returned_nodes:
+                emitted_occurrences.extend(self._handle_effect(EMIT(returned_nodes), origin="runtime", cause=Cause(result_event_id, str(PipelineEvents.RESULT_READY)), node=node, exec_id=exec_id, reference_available=reference_available))
 
-        if not to_handle:
-            return [
-                (emitted_node, "runtime")
-                for emitted_node in returned_nodes
-            ]
-        for effect, origin in to_handle:
-            if origin == "runtime":
-                node.runtime_effects.append(effect)
-            if isinstance(effect, type):
-                if effect == END:
-                    self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, [self.id], __TIDE_TEMPLATE_VALUE__(), {"origin": origin}), exec_id=exec_id))
-                    self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=OceanEvents.KILL_PIPELINE, exec_id=exec_id)) # make EFFECT handler for DELETE and END etc
-                    
-                # delete node.target 
-                elif effect == DELETE:
-                    
-                    if node.targets: # TODO-NOTE: support target DedupedLists [X]
-                        unscoped_targets = [self._unscope_data_ref(target) for target in node.targets]
-                        for unscoped_target in unscoped_targets:
-                            self._emit_delete_occurrence(
-                                node,
-                                exec_id,
-                                unscoped_target,
-                                __TIDE_TEMPLATE_VALUE__(),
-                                origin,
-                            )
-                # delete specified target | default node.target
-            elif isinstance(effect, DELETE): # TODO-NOTE: WRAP IN ISINSTANCE Effect
-
-                targets = effect.targets if effect.targets else node.targets  
-                unscoped_targets = []
-                
-        
-                for target in targets:
-                    unscoped_targets.append(self._unscope_data_ref(target))
-            
-                
-                for unscoped_target in unscoped_targets:
-                    self._emit_delete_occurrence(
-                        node,
-                        exec_id,
-                        unscoped_target,
-                        effect.preserve_output,
-                        origin,
-                    )
-
-                # TODO-NOTE: add end.targets = [runner_id], for runner_id, end.
-
-                _record_effect_output(effect.preserve_output, origin)
-            
-            elif isinstance(effect, END): # if an instance of delete, check preserve_output and save it to the store if preserve has a value
-                
-                
-                _record_effect_output(effect.preserve_output, origin)
-                
-
-                targets = effect.targets
-                if isinstance(targets, __TIDE_TEMPLATE_VALUE__):
-                    targets = [self.id]
-
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, targets, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
-                
-                for target_id in targets:
-                    self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=target_id, event_type=OceanEvents.KILL_PIPELINE, exec_id=exec_id)) # make EFFECT handler for DELETE and EN
-
-        
-            elif isinstance(effect, WRITE):   
-                to_write = []
-
-                effect_output: Any = __TIDE_TEMPLATE_VALUE__()
-
-                if not isinstance(effect.preserve_output, __TIDE_TEMPLATE_VALUE__):
-                    effect_output = effect.preserve_output
-                    _record_effect_output(effect.preserve_output, origin)
-
-                targets = effect.targets if effect.targets else node.targets
-
-                if isinstance(targets, dict):
-                    for target, value in targets.items():
-                        to_write.append((self._unscope_data_ref(target), value))
-                else:
-                    for target in targets:
-                        to_write.append((self._unscope_data_ref(target), effect_output))
-                        
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.WRITE, exec_id, to_write, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
-
-                for unscoped_target, value in to_write:
-                    node.runtime_targets.append(unscoped_target)
-                    self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=None, event_type=RouterEvents.STORE_WRITE, payload=(unscoped_target.store, unscoped_target.key, value, node.id, Effects.WRITE, tide_snapshot_value(value, boundary="write")), exec_id=exec_id))
-            elif isinstance(effect, RUN):
-
-                if isinstance(effect.targets, __TIDE_TEMPLATE_VALUE__):
-                    raise ValueError(
-                        "RUN requires at least one registered pipeline id"
-                    )
-
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.RUN, exec_id, effect.targets, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
-
-                _record_effect_output(effect.preserve_output, origin)
-                
-                for pipeline_id in effect.targets:
-                    self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=None, payload=(pipeline_id, effect.mode, effect.templates, effect.stay_alive, None), event_type=OceanEvents.RUN_PIPELINE, exec_id=exec_id))
-
-                
-            elif isinstance(effect, EMIT):
-                for emitted_node in effect.nodes:
-                    emitted_occurrences.append((emitted_node, origin))
-
-        emitted_occurrences.extend(
-            (emitted_node, "runtime")
-            for emitted_node in returned_nodes
-        )
         return emitted_occurrences
 
+    def _store_node_result(self, node, exec_id, result_event_id, result_override=__fallback__()):
+        # Select the value and final write type.
+        result = node.result
+        if not isinstance(result_override, __fallback__):
+            result = result_override
 
+        event_type = RouterEvents.FORCE_WRITE if node.force_update else RouterEvents.STORE_WRITE
 
+        # Align one result with every target or unpack positional results.
+        if not node.targets:
+            return ()
 
-    def _on_node_completion(self, event): # take 'event' instead
+        if node.unpack:
+            if not isinstance(result, (list, tuple)):
+                raise NodeDefinitionError(f"Node {node.node_name} uses unpack=True but returned {type(result).__name__}, not a list or tuple")
+            if len(result) != len(node.targets):
+                raise NodeDefinitionError(f"Node {node.node_name} uses unpack=True with {len(node.targets)} targets but returned {len(result)} values")
+            target_values = zip(node.targets, result, strict=True)
+        else:
+            target_values = ((target, result) for target in node.targets)
+
+        # Queue each write and return its exact reference for Effect ordering.
+        written_refs = []
+        for target, value in target_values:
+            ref = self._unscope_data_ref(target)
+            snapshot = tide_snapshot_value(value, boundary="write")
+            written_refs.append(ref)
+            self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=event_type, cause=Cause(result_event_id, str(PipelineEvents.RESULT_READY)), target_runner_id=self.id, payload=State(ref, value, snapshot, value_type=type(value)), exec_id=exec_id))
+
+        return tuple(written_refs)
+
+    def _handle_effect(self, effect, *, origin, cause, node, exec_id, reference_available):
+        # Normalize only bare Effects that need no arguments.
+        if isinstance(effect, type):
+            if effect in {END, DELETE}:
+                effect = effect()
+            else:
+                raise TypeError(f"{effect.__name__} requires constructor arguments")
+
+        if not isinstance(effect, Effect):
+            raise TypeError(f"Expected Effect, got {type(effect).__name__}")
+
+        found = None
+
+        # Resolve the immutable occurrence operands.
+        if isinstance(effect, DELETE):
+            supplied_targets = effect.targets or node.targets
+            if not supplied_targets:
+                raise ValueError("DELETE requires at least one target")
+
+            targets = tuple(dict.fromkeys(self._unscope_data_ref(target) for target in supplied_targets))
+            found = tuple(
+                reference_available[target]
+                if target in reference_available
+                else self.store_router.exists(target.store, target.key)
+                for target in targets
+            )
+            reference_available.update(
+                (target, False)
+                for target in targets
+            )
+
+        elif isinstance(effect, WRITE):
+            resolved_writes = []
+            for supplied_target, value in effect.targets:
+                target = self._unscope_data_ref(supplied_target)
+                if any(existing_target == target for existing_target, _ in resolved_writes):
+                    raise ValueError(f"WRITE targets resolve to the same reference: {target}")
+                resolved_writes.append((target, value))
+
+            targets = tuple(resolved_writes)
+
+            found = tuple(
+                self.store_router.exists(target.store)
+                for target, _ in targets
+            )
+
+            reference_available.update(
+                (target, target_found)
+                for (target, _), target_found
+                in zip(targets, found)
+            )
+
+        elif isinstance(effect, END):
+            targets = (self.id,) if effect.targets is None else effect.targets
+        elif isinstance(effect, RUN):
+            targets = effect.targets
+        elif isinstance(effect, EMIT):
+            targets = tuple(emitted_node.content_id for emitted_node in effect.nodes)
+        elif isinstance(effect, RAISE):
+            targets = ()
+        else:
+            raise TypeError(f"Unsupported Effect: {type(effect).__name__}")
+
+        # Freeze the Effect occurrence before its consequences.
+        output = tide_snapshot_value(effect.output, boundary="effect") if isinstance(effect, RAISE) else effect.output
+        effect_event = Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=LogEvents.EFFECT, cause=cause, payload=EffectOccurrence(effect.kind, targets, output, origin, False, found), exec_id=exec_id)
+        self.event_emitter(effect_event)
+        emitted_occurrences = []
+
+        # Emit concrete consequences from the Effect occurrence.
+        if isinstance(effect, WRITE):
+            event_type = RouterEvents.FORCE_WRITE if node.force_update else RouterEvents.STORE_WRITE
+            for target, value in targets:
+                snapshot = tide_snapshot_value(value, boundary="write")
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=event_type, cause=Cause.from_event(effect_event), target_runner_id=self.id, payload=State(target, value, snapshot, value_type=type(value)), exec_id=exec_id))
+
+        elif isinstance(effect, DELETE):
+            for target in targets:
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=RouterEvents.DELETE, cause=Cause.from_event(effect_event), target_runner_id=self.id, payload=Reference(target), exec_id=exec_id))
+
+        elif isinstance(effect, END):
+            if self.id in targets:
+                self._end_requested = True
+            for runner_id in targets:
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=OceanEvents.KILL_RUNNER, cause=Cause.from_event(effect_event), target_runner_id=runner_id, exec_id=exec_id))
+
+        elif isinstance(effect, RUN):
+            for pipeline_id in targets:
+                pipeline, _ = self.pipeline_lookup(pipeline_id)
+                payload = PipelineRun(
+                    pipeline_id,
+                    pipeline.name,
+                    effect.mode,
+                    effect.local_store_templates,
+                    effect.stay_alive,
+                    effect.runner_name,
+                    effect.dynamic_ref_plan,
+                )
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=OceanEvents.RUN_PIPELINE, cause=Cause.from_event(effect_event), payload=payload, exec_id=exec_id))
+
+        elif isinstance(effect, EMIT):
+            emitted_occurrences.append((effect.nodes, effect_event))
+
+        elif isinstance(effect, RAISE):
+            for fallthrough_effect in effect.effects:
+                emitted_occurrences.extend(self._handle_effect(fallthrough_effect, origin="runtime", cause=Cause.from_event(effect_event), node=node, exec_id=exec_id, reference_available=reference_available))
+
+        # An Effect output containing Nodes becomes a causal EMIT.
+        if not isinstance(effect.output, __fallback__) and not isinstance(effect, EMIT):
+            output_nodes = tuple(self.node_processor._extract_nodes_from_result(effect.output))
+            if output_nodes:
+                emitted_occurrences.extend(self._handle_effect(EMIT(output_nodes), origin=origin, cause=Cause.from_event(effect_event), node=node, exec_id=exec_id, reference_available=reference_available))
+
+        return emitted_occurrences
+
+    def _on_node_completion(self, event):
+        meta = event.payload.exec_meta
+        node = self.running_nodes.get(meta.node_id)
+        if node is None:
+            return
+
         try:
+            # Raw failures preserve immediate Effects but perform no result work.
+            if meta.status == "failed" and not meta.handled_raise:
+                self.failure = meta.error or NodeFailed(node.id, "execution", RuntimeError(f"Node {node.node_name} failed"))
+                self.complete = True
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=OceanEvents.KILL_RUNNER, cause=Cause.from_event(event), target_runner_id=self.id, exec_id=event.exec_id))
+                return node
 
-            exec_id = event.exec_id
-            node_id, result, meta = event.payload
-            
-            node: RunnerNode = self.running_nodes.get(node_id) 
-            if not node:
-                return
-            print(f"[{node.id}] {node.node_name} Worker returned:", type(result))
+            if node.evaluated:
+                return node
 
-            if meta.status == "failed" or meta.error is not None:
-                if getattr(meta, "handled_raise", False):
-                    pass
-                else:
-                    self.failure = meta.error or NodeFailed(
-                        node.id,
-                        "execution",
-                        RuntimeError(f"Node {node.node_name} failed"),
-                    )
-                    node.state.executing = False
-                    self.running_nodes.pop(node_id, None)
-                    self.complete = True
-                    self.event_emitter(
-                        Event(
-                            source="runner",
-                            source_id=self.id,
-                            target_runner_id=self.id,
-                            event_type=OceanEvents.KILL_PIPELINE,
-                            exec_id=exec_id,
-                        )
-                    )
-                    return node
+            # Retain the completed result.
+            self.node_processor._fill_cache(node, meta.result)
 
-            
-            if not node.state.evaluated:
-                
-                resolved_result = None
-                try:
-                    if node.resolve_output: resolved_result = self.dep_tools.in_place_dependency_resolver(self._unscope_data_ref, node, result) 
-                except Exception as e:
-                    print("Could not resolve output!")
-                    raise e
-                
-                self.node_processor._fill_cache(node, result, resolved_result)        
+            # Apply normal-result, declared, and returned/RAISE phases.
+            try:
+                emitted_occurrences = self._handle_node_result(node, meta, event.event_id)
+            except Exception as handling_error:
+                if not meta.handled_raise:
+                    raise
+                raise RaiseHandlingError(node.id, meta.error, handling_error) from handling_error
 
-                runtime_effects = (
-                    getattr(meta, "runtime_effects", ()) or ()
-                )
-                self._emit_in_function_effects(
-                    node,
-                    exec_id,
-                    runtime_effects,
-                )
+            self._register_emitted_nodes(emitted_occurrences, event.exec_id)
+            self.node_processor._satisfy(node)
+            self.completed_node_ids.add(node.id)
 
-                if getattr(meta, "handled_raise", False):
-                    handled_effects = [
-                        effect
-                        for effect in runtime_effects
-                        if not (
-                            isinstance(effect, dict)
-                            and effect.get("effect") in {
-                                Effects.READ,
-                                Effects.DELETE,
-                            }
-                        )
-                    ]
-                    try:
-                        for effect in handled_effects:
-                            if not (
-                                isinstance(effect, Effect)
-                                or (
-                                    isinstance(effect, type)
-                                    and issubclass(effect, Effect)
-                                )
-                            ):
-                                raise TypeError(
-                                    "RAISE effects must be TIDE Effect "
-                                    f"objects or classes, got "
-                                    f"{type(effect).__name__}"
-                                )
-                        emitted_occurrences = self._handle_node_result(
-                            node,
-                            exec_id,
-                            effects=handled_effects,
-                            store_result=True,
-                            preserve_effect_output_to_node_targets=False,
-                        )
-                    except Exception as handling_error:
-                        raise RaiseHandlingError(
-                            node.id,
-                            meta.error,
-                            handling_error,
-                        ) from handling_error
-                else:
-                    emitted_occurrences = self._handle_node_result(
-                        node,
-                        exec_id,
-                    )
+            # A completed one-shot node has no possible future execution.
+            if node.one_shot:
+                node.status = "exhausted"
+                node._pending_deleted_dependencies.clear()
+                node._pending_updated_dependencies.clear()
+                return node
 
-                self._register_emitted_nodes(
-                    node.id,
-                    emitted_occurrences,
-                    exec_id,
-                )
+            # The execution has finished, so pending dependency changes may now apply.
+            node.executing = False
+            deleted_dependencies = tuple(node._pending_deleted_dependencies)
+            updated_dependencies = tuple(node._pending_updated_dependencies)
+            pending_dependencies = DedupedList(deleted_dependencies)
+            pending_dependencies.extend(updated_dependencies)
 
+            # Unsatisfy every dependency changed during execution.
+            for dependency in pending_dependencies:
+                self.runtime_dag.unsatisfy_dependency(node.id, dependency)
 
-                self.node_processor._satisfy(node)  
+                # Unresolve the inputs mapped to that dependency.
+                for _, node_input in node.dep_to_input_map[dependency]:
+                    node._unresolve_input(node_input)
 
-                # DedupedList node as evaluated
-                if node._pending_unresolve_inputs:
-                    
-                    for cause, pending in dict(node._pending_unresolve_inputs.items()):
-                        exec_id, data_ref, cause_effect = cause
-                        affected_inputs = pending
-                        
-                        for input in affected_inputs:
-                            node._unresolve_input(input)
-                        del node._pending_unresolve_inputs[cause]
-                        self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.NODE_BLOCKED, payload=(node_id, data_ref, node.dep_to_input_map[data_ref], cause_effect), exec_id =exec_id ))
-                    
-                
-            # remove from running nodes queue                                   
-            
-            
-            
-            node.state.executing = False
-            self.running_nodes.pop(node_id) 
+            # Updated dependencies become satisfied again only if still available.
+            for dependency in updated_dependencies:
+                if not self.dep_tools.is_available(self._unscope_data_ref(dependency)):
+                    continue
+
+                released = self.runtime_dag.satisfy_dependency(dependency)
+                self._remember_node_ready_cause(released, event)
+
+            node._pending_deleted_dependencies.clear()
+            node._pending_updated_dependencies.clear()
 
             return node
-        except Exception as e:
-            raise e
 
-    def on_dep_available(self, event): # propogate dependencies and possibly ready node for execution
-        # get store and key
-        store, key, producer_node, *_= event.payload
-        producer_context = f"from:{producer_node}" if producer_node else "?"
-        store = self._scope_store_reference(store)
-        # convert store and target into a DataRef
-        available_dep_ref = self.dep_tools._create_data_ref(store, key)      
+        finally:
+            # Completion and failure both clear live execution state.
+            node.executing = False
+            self.running_nodes.pop(node.id, None)
 
-        # static deps
-        self.runtime_dag.satisfy_downstream_deps(available_dep_ref)
-        if available_dep_ref in self.runtime_dag.waiting_static_deps:
-            del self.runtime_dag.waiting_static_deps[available_dep_ref]
-            
-        # dynamic deps
-        for dep, node_ids in dict(self.runtime_dag.waiting_dynamic_deps).items():
-            # if available dep matches a pattern in dynamic dep
-            if self.dep_tools._pattern_match(available_dep_ref.key, dep.key):
-                for node_id in DedupedList(node_ids):
-                    # Get dependent nodes
-                    node: RunnerNode = self.index.node_index.node_by_id[node_id]
-                    # Link available_dep to dynamic_dep 
-                    node.dynamic_to_static_deps[dep].append(available_dep_ref)
-                    # Link dynamic_dep to available_dep
-                    node.static_to_dynamic_deps[available_dep_ref].append(dep)
-                    # Add available_dep to reverse_map[node_id]
-                    self.runtime_dag.reverse_map[available_dep_ref].append(node_id)
+    def _register_emitted_nodes(self, emitted_occurrences, exec_id):
+        for emitted_nodes, effect_event in emitted_occurrences:
+            emitted_snapshots = []
+            existing_states = []
 
-                    print(f"[RNTIME_CONCRETISER][{self.id}][Node[{node_id}]] DynamicDep[{dep}] count:[{dep.count}] touched by {available_dep_ref} {producer_context}")
+            for emitted_node in emitted_nodes:
+                # Reuse an equivalent registered definition or index the new one.
+                existing = self.index.node_index.node_by_content_id.get(emitted_node.content_id)
+                if existing is not None:
+                    emitted_node = existing
+                else:
+                    emitted_node = self.index.node_index.index_node(
+                        emitted_node,
+                        emitted_by_exec_id=exec_id,
+                    )
+                    self.node_processor.compile_all_inputs(emitted_node)
 
-                    for input_name, input in node.dep_to_input_map[dep]:
-                        scoped_ref = self._scope_data_ref(available_dep_ref)
-                        if [input_name, input] in node.dep_to_input_map[scoped_ref]:
-                            continue
-                        node.dep_to_input_map[scoped_ref].append([input_name, input])
+                # Register new runtime work and preserve its readiness cause.
+                registered = self.runtime_dag.register_node(emitted_node)
+                if registered and emitted_node.id in self.runtime_dag.ready_nodes_queue:
+                    self._remember_node_ready_cause(
+                        (emitted_node.id,),
+                        effect_event,
+                    )
 
-                    
-                    # get dynamic_dep's count predicate
-                    count = 0 if not dep.count else dep.count
+                # Observe pre-existing values required by a newly registered node.
+                if registered:
+                    for dep in emitted_node.deps:
+                        ref = self._unscope_data_ref(dep)
+                        existing_refs = self.dep_tools.matching_refs(ref)
+                        for existing_ref in existing_refs:
+                            value = self.dep_tools.resolve_exact(existing_ref)
+                            snapshot = tide_snapshot_value(value, boundary="write")
+                            existing_states.append(State(
+                                existing_ref,
+                                value,
+                                snapshot,
+                                state_occurrence=False,
+                                value_type=type(value),
+                            ))
 
-                    # Check if dynamic_dep count is satisfied
-                    if len(node.dynamic_to_static_deps[dep]) >= count: 
-                        for input_name, input in node.dep_to_input_map[dep]:
-                            self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=LogEvents.DEP_CONCRETISED, payload=(node_id, input_name, dep, node.dynamic_to_static_deps[dep])))
-                        # satisfy deps on dependent nodes in forward_map
-                        self.runtime_dag.satisfy_downstream_deps(dep)
-                        # remove node from dynamic_dep waiting DedupedList
-                        self.runtime_dag.waiting_dynamic_deps[dep].remove(node_id) 
-                        # if no waiting nodes, remove dynamic_dep from waiting_deps
-                        if not self.runtime_dag.waiting_dynamic_deps[dep]:    
-                            del self.runtime_dag.waiting_dynamic_deps[dep]
-                    
-                        print(f"[RNTIME_CONCRETISER][{self.id}][Node[{node_id}]] satisfied DynamicDep[{dep}] count:[{dep.count}] ready! got {available_dep_ref} {producer_context}")     
-                    print(f"[{self.id}] Dependency {available_dep_ref} satisfied Dep:{dep} on Node[{node_id}]")   
-        return
-    
-    def on_dep_delete(self, event): # block node execution/invalidate ready deps on nodes
-        # get store, and key to delete
-        exec_id = event.exec_id
-        unscoped_store, key, _, cause = event.payload
-        store = self._scope_store_reference(unscoped_store)
-        # convert to DataRef
-        data_ref = self.dep_tools._create_data_ref(store, key)
-        deleting_node_id = self.exec_id_to_node_id.get(exec_id)
-        
-        # if dep in reverse_map
-        if self.runtime_dag.reverse_map[data_ref]:
-            
-            print(f"[DEP_DELETED][{self.id}]: {key} has been deleted, adding back to nodes")
-            # for node_id dependent on ref
-            for node_id in DedupedList(self.runtime_dag.reverse_map[data_ref]):
+                # Snapshot every occurrence, including reused definitions.
+                emitted_snapshots.append(
+                    self._snapshot_node_definition(emitted_node)
+                )
 
-                
-                # if ref not in forward_map[node_id]
-                if data_ref not in self.runtime_dag.forward_map[node_id]:
-                    # get node object
-                    node: RunnerNode = self.index.node_index.node_by_id[node_id]
+            # Record the complete emission before releasing its dependencies.
+            emitted_event = Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=LogEvents.NODE_EMITTED, cause=Cause.from_event(effect_event), payload=EmittedNodes(tuple(emitted_snapshots)), exec_id=exec_id)
+            self.event_emitter(emitted_event)
 
-                    # A completed occurrence keeps the State it consumed.
-                    if (
-                        cause == Effects.DELETE
-                        and node_id == deleting_node_id
-                        and node.state.evaluated
-                    ):
-                        continue
-                    
-                    if node.one_shot and node.state.evaluated:
-                        print("[DELETE] Node is one shot and already evaluated, not re-evaluating")
-                        continue
-                           
-                    # remove node from ready queue
-                    if node_id in self.runtime_dag.ready_nodes_queue:
-                        self.runtime_dag.ready_nodes_queue.remove(node_id)
-                    
-                    print(f"[DEP_DELETED][{self.id}]: {key} has been added back to node [{node_id}] {node.node_name}")
-                    
+            for state in existing_states:
+                self.event_emitter(Event(ocean_id=self.ocean_id, source="runner", source_id=self.id, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(emitted_event), target_runner_id=self.id, payload=state))
 
-                    # unlink dependency from dynamic dependencies
-                    if data_ref in node.static_to_dynamic_deps:
-                        # Remove link between ref and node if not a declared node dep || reason: a node depends on the dynamic dep - not its dynamic deps produced refs  
-                        if data_ref not in node.deps:
-                            self.runtime_dag.reverse_map[data_ref].remove(node.id)
-
-                        # If dep is linked to a dynamic dep - remove links between them
-                        for dy_dep in DedupedList(node.static_to_dynamic_deps[data_ref]):
-                            # Remove ref from dynamic_dep satisfaction register
-                            node.dynamic_to_static_deps[dy_dep].remove(data_ref)
-                            # Remove link between ref and dynamic_dep
-                            node.static_to_dynamic_deps[data_ref].remove(dy_dep)
-                            
-                            print(f"[DEP_DELETED][{self.id}] Static dep {data_ref} removed from dynamic {dy_dep} aggregation DedupedList" )
-                            
-                            # if dy_dep's count is now unsatisfied
-                            concretised_ref_count =  len(node.dynamic_to_static_deps[dy_dep])
-                            required_count = dy_dep.count if dy_dep.count is not None else 1
-
-                            if concretised_ref_count < required_count:
-                                # Add the dynamic dep back to forward_map
-                                self.runtime_dag.forward_map[node_id].append(dy_dep)
-                                # Add dynamic dep back to waiting_deps
-                                self.runtime_dag.waiting_dynamic_deps[dy_dep].append(node_id)
-                                print(f"[DEP_DELETED][{self.id}] Dynamic dep {dy_dep} count of :{dy_dep.count}: now unsatisfied. Current count: {concretised_ref_count} " )
-
-                    # if ref in node's declared deps 
-                    if data_ref in node.deps:
-                        # add it back
-                        self.runtime_dag.forward_map[node_id].append(data_ref)
-                        # register back as waiting_dep
-                        self.runtime_dag.waiting_static_deps[data_ref].append(node_id)
-                    
-                    # Unresolve node inputs dependent on ref (partial-recomputation)
-                    
-                    for input_name, input in node.dep_to_input_map[data_ref]:
-                        print(f"[DEP_DELETED][{self.id}] Un-resolved input {input_name} on Node[{node.id}]")
-                        if node.state.executing:
-                            node._pending_unresolve_inputs[exec_id, self._unscope_data_ref(data_ref), Effects.DELETE].append(input)
-                        else:
-                            node._unresolve_input(input)    
-                    if not node.state.executing:
-                        self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.NODE_BLOCKED, payload=(node_id, self._unscope_data_ref(data_ref), node.dep_to_input_map[data_ref], cause), exec_id=exec_id))
-        return
-
-    def on_dep_update(self, event): # recompute nodes that depend on this dependency (re-run, or make waiting dep available) 
-        try:
-            exec_id = event.exec_id
-            store, key, producer_node, _, cause = event.payload
-            store = self._scope_store_reference(store)
-            
-            # create ref and collect nodes dependenct on ref
-            data_ref = self.dep_tools._create_data_ref(store, key)
-            dirty_nodes = self._collect_dirty_nodes(data_ref)
-            # for affected_nodes - unsatisfy (invalidate and unresolve) node 
-            for node_id in dirty_nodes:
-                
-                # Unresolve inputs dependent on ref (invalidates)
-                node: RunnerNode = self.index.node_index.node_by_id[node_id]    
-
-                # remove node from ready queue
-                if node_id in self.runtime_dag.ready_nodes_queue:
-                    self.runtime_dag.ready_nodes_queue.remove(node_id)
-                
-                if node.one_shot and node.state.evaluated:
-                    print("[UPDATE] Node is one shot and already evaluated, not re-evaluating")
-                    continue
-
-                # add ref back to forward_map and re-register ref as waiting 
-                self.runtime_dag.forward_map[node_id].append(data_ref)
-                self.runtime_dag.waiting_static_deps[data_ref].append(node_id)
-
-                for input_name, input in node.dep_to_input_map[data_ref]:
-                    print(f"[DEP_DELETED][{self.id}] Un-resolved input {input_name} on Node[{node.id}]")
-                    if node.state.executing:
-                        node._pending_unresolve_inputs[exec_id, self._unscope_data_ref(data_ref), PipelineEvents.DEP_UPDATED].append(input)
-                    else:
-                        node._unresolve_input(input)  
-                # if not node.state.executing:
-                #     self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.NODE_BLOCKED, payload=(node_id, self._unscope_data_ref(data_ref),  node.dep_to_input_map[data_ref], cause), exec_id =exec_id ))
-                    
-                
-            # re-satisfy nodes dependent on ref 
-            self.runtime_dag.satisfy_downstream_deps(data_ref)  
-            return
-        except Exception as e:
-            raise e
-
-    
-    
-    def on_build(self, event):
-        
-        def __are_deps_available(node: RunnerNode, available_deps: DedupedList = None):
-            unavailable = []
-            for dep in node.deps:
-                # unscope for store checks
-                unscoped_dep = self._unscope_data_ref(dep)
-                
-                # dynamic 
-                if dep.dynamic:
-                    req_count = dep.count if dep.count is not None else 1
-                    if req_count <= len(node.dynamic_to_static_deps[dep]):
-                        available = DedupedList(self._scope_data_ref(static_ref) for static_ref in node.dynamic_to_static_deps[dep])
-                        available_deps.extend(available)
-                        continue          
-                    elif self.dep_tools.exists(unscoped_dep):
-                        available_deps.append(dep) 
-                        continue
-                    else:  
-                        unavailable.append(dep)
-                        continue
-                
-                # static
-                if self.dep_tools.exists(unscoped_dep):
-                    available_deps.append(dep)
-                    continue
-                elif dep in available_deps:
-                    available_deps.append(dep)
-                    continue
-                else:  
-                    unavailable.append(dep)
-
-                
-            return available_deps, unavailable
-        
-        rerun = True
-        store, key = event.payload
-        store = self._scope_store_reference(store)
-
-        data_ref = self.dep_tools._create_data_ref(store, key)
-        needed_nodes = self._collect_needed_nodes(data_ref)
-
-        available_nodes = DedupedList()
-        blocked_nodes = DedupedList()
-        available_deps = DedupedList()
-        progress = True
-
-        for node_id in needed_nodes: # TODO-NOTE: Calculate which node to use if 
-            
-            node = self.index.node_index.node_by_id[node_id]
-            available_deps.extend(node.targets)
-            
-            available_deps, unavailable = __are_deps_available(node, available_deps)
-            if unavailable: 
-                print(f"[BUILD] Node[{node_id}] WAITING on {unavailable} ")
-                blocked_nodes.extend(node_id)
-                progress = False
-                continue
-            else: 
-                available_nodes.append(node_id)
-                print(f"[BUILD] Node[{node_id}] ready!")
-                continue
-        
-        if not progress:
-            print(f"[BUILD] Build WAITING ON [{blocked_nodes}]")
-            return
-
-        if progress: # leaving like this for now, end cases shouldnt hit now 
-            for node_id in available_nodes:
-                node = self.index.node_index.node_by_id[node_id]
-                if node.state.evaluated:
-                    for target in node.targets:
-                        if not self.dep_tools.exists(target): # nd no waiting deps
-                            node._invalidate()
-                            print(f"[BUILD] Invalidated Node[{node_id}] as evaluated but its target is not available, re-evaluating!")
-                            self._on_node_ready(node)
-                            break
-                    pass
-                
-                if node.state.evaluated and rerun:
-                    node._invalidate()
-                    print(f"[BUILD] Invalidated Node[{node_id}] as evaluated but and rerun is True!, re-evaluating!")
-                    self._on_node_ready(node)
-                    
-                    continue
-                elif not node.state.evaluated and self.build_mode and not self.runtime_dag.forward_map[node_id]:
-                    print(f"[BUILD_MODE] Node[{node_id}] ready!")
-
-                    self._on_node_ready(node)
-                    continue
-                elif not node.state.evaluated and self.build_mode and self.runtime_dag.forward_map[node_id]:
-                    print(f"[BUILD_MODE] Node[{node_id}] WAITING on {self.runtime_dag.forward_map[node_id]}")
-                    continue
-        return
-    
     def on_register_node(self, event):
-        payload = event.payload
+        if not isinstance(event.payload, Nodes):
+            raise EventHandlerError(f"REGISTER_NODE requires a Nodes payload, got {type(event.payload).__name__}")
 
-        if isinstance(payload, Node):
-            nodes = [payload]
-        elif isinstance(payload, (list, set, tuple)) and all(
-            isinstance(node, Node)
-            for node in payload
-        ):
-            nodes = list(payload)
-        else:
-            raise EventHandlerError(
-                "RegisterNodes payload must be a Node or an iterable "
-                f"containing only Nodes, got {type(payload).__name__}"
-            )
-
-        for definition in nodes:
+        for definition in event.payload.nodes:
             try:
-                print(f"[{self.id}] registering node")
-                runner_node = self.index.node_index._index_node(definition)
-
+                # Convert the definition into registered runtime work.
+                runner_node = self.index.node_index.index_node(definition)
                 self.node_processor.compile_all_inputs(runner_node)
-                self.runtime_dag.register_node(
-                    runner_node,
-                    runner_node.deps,
-                )
-            except Exception as e:
-                raise NodeToDagRegistrationError(
-                    f"[{self.id}] Failed to register node "
-                    f"{definition.node_name}: {e}"
-                ) from e
+                registered = self.runtime_dag.register_node(runner_node)
 
-    ####################
-    # NODE INP MANAGER #
-    ####################    
-    def _compile_node_inputs(self, node: Node) -> None:
-        if not node:
-            raise PipelineRuntimeError("Ready_task [node] in runner was None!") 
+                # A dependency-free node was readied by this command.
+                if registered and runner_node.id in self.runtime_dag.ready_nodes_queue:
+                    self._remember_node_ready_cause(
+                        (runner_node.id,),
+                        event,
+                    )
 
-        if not node.state.compiled:
-            try:
-                self.node_processor.compile_all_inputs(node) 
-                node.state.compiled = True
-            except Exception as e:
-                raise PipelineRuntimeError(f"[{node.id}] Node failed to compile at runtime!: {e}") from e
+            except Exception as error:
+                raise NodeToDagRegistrationError(f"Runner {self.id!r} failed to register node {definition.node_name!r}: {error}") from error
 
-    def _emit_read_events_from_reads(self, reads: dict, exec_id: str):
-        for input_name, read in reads.items():
-            if read:
-                read_event = Event(source="runner", source_id=self.id, event_type=LogEvents.READ, payload=(input_name, read), exec_id=exec_id)
-                self.event_emitter(read_event)
+    def on_node_run(self, event):
+        if not isinstance(event.payload, NodeSnapshot):
+            raise EventHandlerError(f"RUN_NODE requires a NodeSnapshot payload, got {type(event.payload).__name__}")
 
-    def _represent_unnamed_inputs(
-        self,
-        node,
-        exec_id,
-        reads,
-        unrepresented,
-    ):
-        """Represent plain runtime inputs as ordinary versioned TIDE states."""
-        exec_token = exec_id.split(":", 1)[-1]
-        node_name = "".join(
-            character
-            if character.isalnum() or character in "-_."
-            else "_"
-            for character in str(node.node_name)
-        )
+        # Explicit node execution belongs only to build mode.
+        if not self.build_mode:
+            return
 
-        for input_name, occurrences in unrepresented.items():
-            for occurrence, (value, snapshot, input_path) in enumerate(
-                occurrences
-            ):
-                # The observer is a distinct execution occurrence, but its
-                # identity must be assigned when the observation happens.
-                # Causal reconstruction may replay this event log more than
-                # once (notably across consecutive direct TIDE.exec calls),
-                # so assigning an ID during reconstruction would invent a new
-                # observer execution and State version on every replay.
-                observer_exec_id = create_tide_exec_uuid()
-                key = (
-                    f"{node_name}.{input_name}.{occurrence}.{exec_token}"
-                )
-                ref = self._unscope_data_ref(
-                    DataRef(key, "__unnamed__")
-                )
-                write_snapshot = snapshot.at_boundary("write")
-                read_snapshot = snapshot.at_boundary("read")
+        node_id = event.payload.node_id
+        if node_id not in self.index.node_index.node_by_id:
+            return
 
-                self.event_emitter(Event(
-                    source="TIDE_OBSERVER",
-                    source_id="TIDE_OBSERVER",
-                    target_runner_id=self.id,
-                    event_type=RouterEvents.STORE_WRITE,
-                    payload=(
-                        ref.store,
-                        ref.key,
-                        write_snapshot.materialise(),
-                        ref.key,
-                        "observed unrepresented value",
-                        write_snapshot,
-                    ),
-                    exec_id=observer_exec_id,
-                ))
-                reads[input_name].append((
-                    ref,
-                    value,
-                    read_snapshot,
-                    None,
-                    input_path,
-                ))
-        
-    
-    def _resolve_node_inputs(self, node: Node) -> None:
-        print(f"[{node.id} {node.node_name} starting evalutation!]")
+        node = self.index.node_index.node_by_id[node_id]
 
-        if not node:
-            raise PipelineRuntimeError("Ready_task [node] in runner was None!")
+        if node.status == "exhausted":
+            return
 
-        if not node.state.resolved:
-            try:
-                read_deps = self.node_processor.resolve_all_inputs(
-                    self._unscope_data_ref,
-                    node,
-                    track_unrepresented=self.track_unrepresented,
-                )
-                node.state.resolved = True
-                return read_deps
+        # Do not duplicate work or bypass unresolved dependencies.
+        if node.executing or self.runtime_dag.forward_map.get(node_id, ()):
+            return
 
-                
-                
-            except (MissingRefDuringResolutionError, DynamicRefCountLessThanAvailableKeysError) as e:
-                raise e
-            except Exception as e:
-                raise PipelineRuntimeError(f"[{node.id}] Node failed to resolve at runtime!: {e}") from e
-        
-    ######################
-    #    NODE MANAGER    #
-    ######################
-    def _get_ready_node(self):
-        ready_node_id = self.runtime_dag.ready_nodes_queue.popleft()
-        return self.index.node_index.node_by_id[ready_node_id]
-    
-    def _process_ready_nodes(self):
-        while self.runtime_dag.ready_nodes_queue:
-            node: Node = self._get_ready_node()
-            if node.state.evaluated:
+        # Direct dispatch consumes any readiness already queued for this node.
+        try:
+            self.runtime_dag.ready_nodes_queue.remove(node_id)
+        except ValueError:
+            pass
+        self.ready_node_causes.pop(node_id, None)
+
+        # RUN_NODE means the requested execution must be observable.
+        if node.evaluated:
+            node._invalidate()
+
+        self._on_node_ready(node, Cause.from_event(event))
+
+    def on_build(self, event):
+        if not isinstance(event.payload, Reference):
+            raise EventHandlerError(f"BUILD requires a Reference payload, got {type(event.payload).__name__}")
+
+        # BUILD addresses the producer of one exact Runner-scoped reference.
+        target = self._scope_data_ref(event.payload.ref)
+        producers = self.index.node_index.node_by_target.get(target, ())
+
+        for node in producers:
+            if node.id not in self.index.node_index.node_by_id:
                 continue
 
-            self._on_node_ready(node)
-    
-    def _on_build_mode(self, node):
-        self.ready_build_nodes.append(node)
-
-    def _store_node_result(self, node, exec_id=None, result_override:Any=__TIDE_TEMPLATE_VALUE__()):
-        event_type = RouterEvents.STORE_WRITE if not node.recompute else RouterEvents.FORCE_WRITE 
-
-        result_to_store = (node.resolved_result if node.resolve_output else node.result) if isinstance(result_override, __TIDE_TEMPLATE_VALUE__) else result_override 
-
-        cause = "TIDE: node write" if isinstance(result_override, __TIDE_TEMPLATE_VALUE__) else "TIDE: effect"        
-   
-
-        if node.targets: # TODO-NOTE: support target lists [x]
-            if node.unpack:
-                if not isinstance(result_to_store, (list, tuple)):
-                    raise NodeDefinitionError(
-                        f"Node {node.node_name} uses unpack=True but returned "
-                        f"{type(result_to_store).__name__}, not a list or tuple"
-                    )
-                if len(result_to_store) != len(node.targets):
-                    raise NodeDefinitionError(
-                        f"Node {node.node_name} uses unpack=True with "
-                        f"{len(node.targets)} targets but returned "
-                        f"{len(result_to_store)} values"
-                    )
-                target_values = zip(node.targets, result_to_store, strict=True)
-            else:
-                target_values = ((target, result_to_store) for target in node.targets)
-
-            for target, target_value in target_values:        
-                store_write_event = Event(source="runner", source_id=self.id, target_runner_id=None, event_type=event_type, payload=(target.store, target.key, target_value, node.id, cause, tide_snapshot_value(target_value, boundary="write")), exec_id=exec_id)
-                self.event_emitter(store_write_event)
-                print(f"Emitting store write event! rnr: {self.id} [{target.store}].set[{target.key}]") 
-                
-            
-    
-    def _register_emitted_nodes(
-        self,
-        emitter_id,
-        emitted_occurrences,
-        exec_id,
-    ):
-        emitted = []
-        emitted_evidence = []
-        emitted_origins = []
-        for emitted_node, origin in emitted_occurrences:
-            
-            # index node
-            if emitted_node.content_id in self.index.node_index.node_by_content_id:
-                emitted_node = self.index.node_index.node_by_content_id[emitted_node.content_id]
-
-            else:
-                emitted_node = self.index.node_index._index_node(emitted_node)
-
-                # extract deps
-                self.node_processor.compile_all_inputs(emitted_node)
-
-                # register node to dag with deps and release if no deps
-            registered = self.runtime_dag.register_node(
-                emitted_node,
-                emitted_node.deps,
-            )
-
-            if registered:
-                # Resolve dependencies only when the node first enters the
-                # DAG. Repeated emissions remain distinct evidence without
-                # queueing the same node twice.
-                for dep in emitted_node.deps:
-                    if dep in self.runtime_dag.waiting_static_deps:
-                        continue
-                    if dep in self.runtime_dag.waiting_dynamic_deps:
-                        continue
-
-                    unscoped_dep = self._unscope_data_ref(dep)
-                    if self.dep_tools.exists(unscoped_dep):
-                        refs = self.dep_tools.get_key_refs(unscoped_dep)
-                        if dep.dynamic: emitted_node.dynamic_to_static_deps[dep].extend(refs)
-                        for ref in refs:
-                            value = self.dep_tools.get(ref)
-                            self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_AVAILABLE, payload=(ref.store, ref.key, "TIDE: Polling", value, "TIDE: Emitted Node Polling")))
-
-                        # self.runtime_dag.satisfy_downstream_deps(scoped_expanded_ref)
-            emitted.append(emitted_node.id)
-            emitted_evidence.append(
-                self._snapshot_execution_evidence(emitted_node)
-            )
-            emitted_origins.append(origin)
-
-        emitted_node_meta = (
-            emitter_id,
-            tuple(emitted),
-            tuple(emitted_evidence),
-            tuple(emitted_origins),
-        )
-        if emitted:
-            self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.NODE_EMITTED, payload=emitted_node_meta, exec_id=exec_id))
-
-    def _record_node_in_history(self, node: Node):
-        self.history.append({"id": node.id, "node_name": node.node_name, "required_func_deps" : node.deps ,"args_deps" : node.args.deps, "kwargs_deps" : node.cache.kwargs_input_dependencies, "k_args_deps": node.cache.k_args_input_dependencies,"k_kwargs_deps": node.cache.k_kwargs_input_dependencies, "p_args_deps": node.cache.p_args_input_dependencies, "p_kwargs_deps": node.cache.p_kwargs_input_dependencies,"result_type": type(node.cache.func_cache), "emitted_nodes": [node.id for node in node.cache.func_emitted_nodes],"runtime" : time.time()-self._start_time, "touched_nodes": node.touched_nodes, "released_nodes" : node.released_nodes} ) 
-        print(f"--- [{self.history[-1]['id']}] {self.index.node_index.node_by_id[self.history[-1]['id']].node_name} finished in [{self.history[-1]['runtime']:.3f}]s ---\n")      
-        print("LOOP", "ready=", DedupedList(self.runtime_dag.ready_nodes_queue), "running=", [n.id for n in self.running_nodes.values()])   
-
-    def _collect_dirty_nodes(self, data_ref: DataRef): # who is affected by dep_change
-
-        dirty_nodes = DedupedList()
-        for node_id in self.runtime_dag.reverse_map[data_ref]:
-            dirty_nodes.append(node_id)
-        
-        for node_id in self.runtime_dag.forward_map.keys():
-            node: RunnerNode = self.index.node_index.node_by_id[node_id]
-            if data_ref in node.static_to_dynamic_deps:
-                dirty_nodes.append(node_id)
+            if node.status == "exhausted":
                 continue
 
-        return dirty_nodes
-    
-    def _collect_needed_nodes(self, data_ref: DataRef, visited=None): # who is needed to build dep
-        if visited is None:
-            visited = DedupedList()
-        if data_ref in visited:
-            visited.append(data_ref)
+            # RuntimeDag remains the authority for whether work can run now.
+            if node.executing or self.runtime_dag.forward_map.get(node.id, ()):
+                continue
 
-        visited.append(data_ref)
-        
+            # Direct dispatch consumes any readiness already queued for this node.
+            try:
+                self.runtime_dag.ready_nodes_queue.remove(node.id)
+            except ValueError:
+                pass
+            self.ready_node_causes.pop(node.id, None)
 
-        needed_nodes = DedupedList()
-        if data_ref in self.index.node_index.node_by_target: # BUG-NOTE: TEST
-            for node in self.index.node_index.node_by_target[data_ref]: 
-                needed_nodes.append(node.id)
-                for dep in node.deps:
-                    needed_nodes.extend(self._collect_needed_nodes(dep, visited))
-        else:
-            if len(visited) == 1: print(f"Build target {data_ref} relies on an external producer! No node produces this target. Build returning.")
-        return needed_nodes
+            # BUILD always makes an observable new execution when ready.
+            if node.evaluated:
+                node._invalidate()
 
-    ######################
-    # RUNNER STATE MNGMT #
-    ######################
-    # def log(self, log_str:str):
+            self._on_node_ready(node, Cause.from_event(event))
 
-    #!!!!!!!
-    def _poll_waiting_deps(self):
-        seen = DedupedList()
-        print("Pre-runtime poll of available deps!")
-        for dep in DedupedList(self.runtime_dag.waiting_static_deps.keys()):
-            unscoped_store_reference = self._unscope_store_reference(dep.store)
-            unscoped_ref = self._unscope_data_ref(dep)
-            if self.dep_tools.exists(unscoped_ref):
-                del self.runtime_dag.waiting_static_deps[dep]
-                value = self.dep_tools.get(unscoped_ref)
-                
-                if (unscoped_store_reference, dep.key) not in seen:
-                    seen.extend((unscoped_store_reference, dep.key))
-                    self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_AVAILABLE, payload=(unscoped_store_reference, dep.key, "TIDE: Polling", value, "TIDE: Pre-runtime Polling")))
-                # self.runtime_dag.satisfy_downstream_deps(dep)
-        
-        # dynamic dep handling
-        for dep, node_ids in dict(self.runtime_dag.waiting_dynamic_deps).items(): # for waiting dyn dep
-            unscoped_ref = self._unscope_data_ref(dep)
-            if self.dep_tools.exists(unscoped_ref): # if min count is reached    
-                got_key_refs = self.dep_tools.get_key_refs(unscoped_ref) # get all key refs that match the pattern
-                waiting_node_ids = DedupedList(node_ids)
-                
-                for ref in DedupedList(got_key_refs): # for each unscoped_ref
-                    static_value = self.dep_tools.get(ref) 
-                    if (ref.store, ref.key) not in seen:
-                        seen.extend((ref.store, ref.key))
-                        self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_AVAILABLE, payload=(ref.store, ref.key, "TIDE: Polling", static_value, "TIDE: Pre-runtime Polling")))
-                    
-                    got_scoped_ref = self._scope_data_ref(ref)
-                    for node_id in waiting_node_ids: # for each dependent node
-                        
-                        node: RunnerNode = self.index.node_index.node_by_id[node_id] # get the node
-                        node.dynamic_to_static_deps[dep].append(got_scoped_ref) # register reference in nodes dep maps
-                        node.static_to_dynamic_deps[got_scoped_ref].append(dep) 
-                        self.runtime_dag.forward_map[node_id].append(got_scoped_ref)
-                        self.runtime_dag.reverse_map[got_scoped_ref].append(node_id) # register in reverse_map
-                        
-                       # for each dependent input of dynamic dep, add got_ref to input
-                        for input_name, input in node.dep_to_input_map[dep]:
-                            if got_scoped_ref in node.dep_to_input_map and (input_name, input) in node.dep_to_input_map[got_scoped_ref]:
-                                continue
-                            node.dep_to_input_map[got_scoped_ref].append((input_name, input))
-
-                # Release only after every selected pre-existing match has
-                # been concretised.  MIN controls readiness; MAX controls the
-                # selected values and may be unbounded.
-                required_count = dep.count if dep.count is not None else 1
-                for node_id in waiting_node_ids:
-                    node = self.index.node_index.node_by_id[node_id]
-                    curr_count = len(node.dynamic_to_static_deps[dep])
-                    print(f"[RNTIME_DEP_POLL][{self.id}][Node[{node_id}]] DynamicDep[{dep}] curr_count:[{curr_count}]")
-                    if curr_count < required_count:
-                        continue
-
-                    for input_name, input in node.dep_to_input_map[dep]:
-                        self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=LogEvents.DEP_CONCRETISED, payload=(node_id, input_name, dep, node.dynamic_to_static_deps[dep])))
-
-                    if node_id in self.runtime_dag.waiting_dynamic_deps.get(dep, []):
-                        self.runtime_dag.waiting_dynamic_deps[dep].remove(node_id)
-                    self.runtime_dag.satisfy_downstream_deps(dep)
-                    if not self.runtime_dag.waiting_dynamic_deps.get(dep):
-                        self.runtime_dag.waiting_dynamic_deps.pop(dep, None)
-
-                    print(f"[RNTIME_DEP_POLL][{self.id}][Node[{node_id}]] satisfied DynamicDep[{dep}] count:[{dep.count}] ready! got {unscoped_ref}")
-        self.poll = False
-        return
-       
-    ###### ##############
-    # STATE MANAGEMENT #
-    ####################
     def _is_idle(self):
-        if not self.running_nodes and self.event_queue.empty() and not self.runtime_dag.ready_nodes_queue and not self.store_router.event_queue:
-            return True
-        else:
-            return False
-
-    def deadlock(self) -> bool:
-        if not self.runtime_dag.ready_nodes_queue and any(self.runtime_dag.forward_map.values()):
-            return True
-        return False
-
-    
-    def purgatory_check(self):
-        inactive = (
-            not self.runtime_dag.ready_nodes_queue
-            and not self.running_nodes
+        # Check whether this Runner has work to process.
+        return (
+            not self.running_nodes
             and self.event_queue.empty()
+            and not self.runtime_dag.ready_nodes_queue
         )
 
-        if inactive:
-            self.purgatory = True
-            return True
+    def purgatory_check(self):
+        # Retain local inactivity for Ocean's scheduling decisions.
+        self.purgatory = self._is_idle()
 
-        self.attempt_count = 0
-        self.purgatory = False
-        return False
-                    
-     
-    def _print_waiting_and_done_nodes(self):
-        if debug_enabled():
-            warn(("Purgatory State - either done or deadlock"))
-        print("\nwaiting=")
-        for nid, deps in self.runtime_dag.forward_map.items():
-            waiting_node = self.index.node_index.node_by_id[nid]                       
-            if deps:    
-                print(f"{nid} - {waiting_node.node_name}: {tuple(DataRef.to_string(dep, strip_leading=True) for dep in deps)}") 
-        print("\ndone=")
-        for nid, deps in self.runtime_dag.forward_map.items():  
-            done_node = self.index.node_index.node_by_id[nid] 
-            evaluated = done_node.state.evaluated                    
-            if evaluated:
-                print(f"{nid}: {self.index.node_index.node_by_id[nid].node_name}")
+        if not self.purgatory:
+            self.complete = False
 
-    ####################
-    # LOG   MANAGEMENT #
-    ####################
-    def _log_stale_nodes_to_history(self):
-        for node_id in self.runtime_dag.forward_map.keys():
-            stale_node = self.index.node_index.node_by_id[node_id]
-            if not stale_node.resolved_flag:
-                self.history.append({"stale_node_id" : stale_node.id, 'node_name': stale_node.node_name, "needed": stale_node.cache.func_input_dependencies})
-                print(f"STALE_NODE_ID : {stale_node.id} | {stale_node.node_name} \n" + f"    waiting_on: {self.runtime_dag.forward_map[stale_node.id]} | {DedupedList(self.index.node_index.node_by_target[dep].id if dep in self.index.node_index.node_by_target else 'unknown_dep_producer' for dep in self.runtime_dag.forward_map[stale_node.id])}")
-        
-        with open('runtime_trace.txt', 'w') as file:
-            file.write('DAG deadlock: unresolved tasks remain!:')
-            for item in self.history:
-                file.write(f"{item}\n")
+        return self.purgatory
 
-    def _save_runtime_trace(self):
-        with open('runtime_trace.txt', 'w') as file:
-            for item in self.history:
-                file.write(f"{item}\n")
-   
-    ################
-    # RUN PIPELINE #
-    ################
+    def _deadlock_waiting(self):
+        # Describe every definition still waiting at global settlement.
+        unresolved = defaultdict(DedupedList)
+        for node_id, deps in self.runtime_dag.forward_map.items():
+            if not deps or node_id in self.completed_node_ids:
+                continue
+            node_definition_id = self.index.node_index.node_by_id[
+                node_id
+            ].node.id
+            unresolved[node_definition_id].extend(
+                self._unscope_data_ref(dep)
+                for dep in deps
+            )
+        return {
+            node_definition_id: tuple(dependencies)
+            for node_definition_id, dependencies in unresolved.items()
+        }
+
+    def _deadlock_error(self):
+        # Dependency state classifies a settled outcome; it does not decide settlement.
+        unresolved = {
+            str(node_definition_id): tuple(
+                DataRef.to_string(dep, prefix=False)
+                for dep in deps
+            )
+            for node_definition_id, deps in self._deadlock_waiting().items()
+        }
+
+        if not unresolved:
+            return None
+
+        return PipelineDeadlockError(
+            f"Pipeline [{self.id}] cannot make progress; unresolved dependencies: {unresolved}"
+        )
+
     def tick(self):
         try:
-            # Apply already-routed dependency updates/deletions before
-            # submitting work from the ready queue. Otherwise a node can be
-            # launched with a dependency that was invalidated before this
-            # runner tick began.
+            # Apply routed State changes before starting ready work.
             self._process_event_queue()
 
             if not self.build_mode:
                 self._process_ready_nodes()
 
+            self.purgatory_check()
 
-            if self.purgatory_check():
-                self.attempt_count += 1
-                waiting_nodes_set = self.runtime_dag.forward_map.values()
-                no_waiting_nodes = all(not waiting_node_set for waiting_node_set in waiting_nodes_set)
-                no_waiting_refs = (not self.runtime_dag.waiting_dynamic_deps and not self.runtime_dag.waiting_static_deps)
+        except RaiseHandlingError:
+            raise
+        except Exception as error:
+            raise PipelineRuntimeError(f"Pipeline [{self.id}] failed: {error}") from error
 
-                if self.attempt_count == 10:
-                    self._print_waiting_and_done_nodes()
-                    return
-                
-                attempt_limit_reached = (self.attempt_count > self.max_attempts)
-                if no_waiting_nodes and no_waiting_refs and self.event_queue.empty() and (self.attempt_count > 1000): #event delay buffer:
-                    self._print_waiting_and_done_nodes()
-                    self.complete = True
-                    return
-
-                if attempt_limit_reached and not self.stay_alive:
-                    self._print_waiting_and_done_nodes()
-                    unresolved = {
-                        self.index.node_index.node_by_id[node_id].node_name: [
-                            DataRef.to_string(dep, strip_leading=True)
-                            for dep in deps
-                        ]
-                        for node_id, deps in self.runtime_dag.forward_map.items()
-                        if (
-                            deps
-                            and not self.index.node_index
-                            .node_by_id[node_id].state.evaluated
-                        )
-                    }
-                    if not unresolved:
-                        self.complete = True
-                        return
-                    raise PipelineDeadlockError(
-                        f"Pipeline [{self.id}] cannot make progress; "
-                        f"unresolved dependencies: {unresolved}"
-                    )
-
-        except (
-            MissingRefDuringResolutionError,
-            DynamicRefCountLessThanAvailableKeysError,
-            PipelineDeadlockError,
-            RaiseHandlingError,
-        ) as e:
-            raise e
-        except Exception as e:
-            raise PipelineRuntimeError(f"Pipeline [{self.id}] failed: {e}") from e
-            
-    def run_pipeline(self, dag_to_run): # add parallel?
-        dag_to_run = dag_to_run if dag_to_run else self.dag_to_run
-        # print("[PipelineRunner] - PIPELINE RUNNING")
-
-    def run(self, stay_alive: bool = True):
+    def run(self, stay_alive=True):
         self.stay_alive = stay_alive
 
-        self._start_time = time.time()
-        print("[PipelineRunner] - PIPELINE ALIVE")
-        #Maybe allow config to list up store state here
-
-        # Poll waiting deps for availability 
+        # Represent Store values that predate this Runner.
         if self.poll:
             self._poll_waiting_deps()
-        # index expanded dag 
-        self.index.dag_index.expanded_dag = copy.deepcopy(self.runtime_dag)
+
+    def on_kill(self, event):
+        # Preserve the final runtime structure for inspection.
+        self.index.post_runtime_dag = copy.deepcopy(self.runtime_dag)
+        self.stay_alive = False

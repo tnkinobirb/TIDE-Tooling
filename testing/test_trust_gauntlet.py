@@ -13,7 +13,8 @@ from tide_tooling.tooling_core.engine.events import (
     PipelineEvents,
     RouterEvents,
 )
-from tide_tooling import DELETE_NOW, Ocean, TIDE, comparator, node, pipeline
+from tide_tooling import DELETE_NOW, Ocean, TIDE, node, pipeline
+from tide_tooling.tooling_core.engine.index import _project_pipeline_index_to_tide_plan
 
 
 DYNAMIC_SELECTOR = "mem:csv_*:2:2"
@@ -38,11 +39,8 @@ def _carriers(model):
 
 def _model(trace):
     return trace.to_model(
-        include_metadata=True,
-        include_values=True,
-        include_hashes=False,
+        enrich=True,
         incidence_format="pairs",
-        assign_unknown=True,
     )
 
 
@@ -69,11 +67,13 @@ def _state_id(model, reference, version=0):
         store, key = value.rsplit(":", 1)
         return f"mem:{key}" if store.startswith("mem_") else value
 
+    suffix = f"[v{version}]"
     matches = [
         state_id
-        for state_id, metadata in model["states"].items()
-        if public_name(metadata.get("reference")) == reference
-        and metadata.get("version") == version
+        for state_id in model["S"]
+        if isinstance(state_id, str)
+        and state_id.endswith(suffix)
+        and public_name(state_id[:-len(suffix)]) == reference
     ]
     assert len(matches) == 1, ((reference, version), matches)
     return matches[0]
@@ -173,7 +173,7 @@ def _run_gauntlet(mode="sequential", *, ocean=None):
     trace = ocean.run_pipeline(
         _gauntlet_pipeline(observed),
         mode=mode,
-        intent_dynamic_refs={
+        dynamic_ref_plan={
             DYNAMIC_SELECTOR: ["mem:csv_a", "mem:csv_b"],
         },
     )
@@ -192,39 +192,31 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
     model = _model(trace)
     executions, states = _carriers(model)
 
-    # Intent and realised dynamic parentage agree.
-    assert trace.intent.concretisations == {
-        DYNAMIC_SELECTOR: DYNAMIC_STATES,
-    }
-    assert trace.concretisations == {
-        DYNAMIC_SELECTOR: DYNAMIC_STATES,
-    }
+    # The executed selector is evidenced by its exact expanded reads below.
     assert len(observed["dynamic_values"]) == 2
-    assert trace.intent.map.plan_only == {"executions": (), "states": ()}
-    assert trace.intent.map.actual_only == {"executions": (), "states": ()}
-    assert trace.intent.map.compare()["intent_equal"] is True
 
     # Every State has one producer and ancestry is acyclic.
     producers = Counter(state for _, state in _relation(model, "O"))
     assert set(producers) == states
     assert set(producers.values()) == {1}
-    validation = TIDE.validate_model(model)
+    validation = TIDE.report_model_validity(model)
     assert validation["semantically_valid"] is True
 
     execution_map, state_map = _identity_maps(model)
-    self_report = comparator(
+    self_report = TIDE.from_model(model).compare(
         model,
-        model,
+        mapping="supplied",
         execution_map=execution_map,
         state_map=state_map,
     )
-    assert self_report["validity"]["K1"]["valid"] is True
-    assert self_report["judgments"]["K1"]["reachability"]
+    source_report = self_report["models"]["source"]
+    assert source_report["semantically_valid"] is True
+    assert source_report["judgments"]["reachability"]
     assert not any(
-        source == target
-        for source, target in self_report["judgments"]["K1"]["reachability"]
+        relation["source_exec_id"] == relation["target_exec_id"]
+        for relation in source_report["judgments"]["reachability"]
     )
-    assert self_report["validity"]["K1"]["counts"] == {
+    assert source_report["counts"] == {
         "executions": 8,
         "states": 10,
         "inputs": 10,
@@ -234,7 +226,10 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
     }
 
     # Reads name the exact version and dynamic reads name only expansions.
-    merge_record = next(record for record in trace.exec_log if record.func_name == "merge")
+    merge_record = next(
+        record for record in trace.execs.values()
+        if record.func_name == "merge"
+    )
     dynamic = merge_record.deps[0]
     assert dynamic.type == "dynamic"
     assert {
@@ -242,7 +237,8 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
         for expanded in dynamic.expanded_to
     } == {("csv_a", 0), ("csv_b", 0)}
     repeat_record = next(
-        record for record in trace.exec_log if record.func_name == "repeat_equal"
+        record for record in trace.execs.values()
+        if record.func_name == "repeat_equal"
     )
     assert [
         (dependency.unscoped_reference.rsplit(":", 1)[-1], dependency.resolved_version)
@@ -255,7 +251,7 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
             write.stored_version,
             write.stored_result,
         )
-        for record in trace.exec_log
+        for record in trace.execs.values()
         for write in record.writes
         if write.stored_target.endswith(":merged")
     )
@@ -268,27 +264,29 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
     # Successful writes occur once in both evidence layers.
     writes = [
         (record.exec_id, write.stored_target, write.stored_version)
-        for record in trace.exec_log
+        for record in trace.execs.values()
         for write in record.writes
     ]
     assert len(writes) == len(set(writes)) == 10
     assert len(_relation(model, "O")) == 10
-    event_counts = Counter(entry["event_type"] for entry in trace.events)
+    event_counts = Counter(entry.type for entry in trace.events)
     assert event_counts[ExecutorEvents.NODE_READY] == 8
     assert event_counts[PipelineEvents.RESULT_READY] == 8
     assert event_counts[RouterEvents.STORE_WRITE] == 10
 
     # Deletion changes availability without inventing a State.
-    runner_store = trace.runner.store_router
-    assert runner_store.exists("mem", "temporary") is False
-    assert runner_store.exists("mem", "never") is False
+    runner = ocean.runners[trace.runs[0]]
+    runner_store = runner.store_router
+    actual_mem = runner_store.registry.resolve_runner_store(runner.id, "mem")
+    assert runner_store.exists(actual_mem, "temporary") is False
+    assert runner_store.exists(actual_mem, "never") is False
     assert not any(
         metadata.get("reference") == "mem:never"
         for metadata in model["states"].values()
     )
     delete_effects = [
         effect
-        for record in trace.exec_log
+        for record in trace.execs.values()
         for effect in record.effects
         if effect.effect == Effects.DELETE
     ]
@@ -300,11 +298,11 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
         "missing": False,
     }
 
-    # Every model carrier is represented in the total alignment.
-    assert len(executions) == len(trace.intent.map.execution_map)
-    assert len(states) == len(trace.intent.map.state_map)
+    # Both model carriers are backed by this run's recorded occurrences.
+    assert len(executions) == len(trace.execs)
+    assert len(states) == len(writes)
     assert trace.diff(trace).same is True
-    assert ocean.runner_to_trace[trace.run] is trace
+    assert ocean.last_trace is trace
 
 
 def test_gauntlet_model_and_bundle_round_trips_preserve_answers(gauntlet_run):
@@ -315,56 +313,57 @@ def test_gauntlet_model_and_bundle_round_trips_preserve_answers(gauntlet_run):
     from_model = TIDE.from_model(model)
     rebuilt_model = _model(from_model)
     execution_map, state_map = _identity_maps(model)
-    model_report = comparator(
-        model,
+    model_report = TIDE.from_model(model).compare(
         rebuilt_model,
+        mapping="supplied",
         execution_map=execution_map,
         state_map=state_map,
     )
     assert model_report.complete_agreement is True
-    assert model_report["judgments"]["mapped_correspond"] is True
+    assert model_report.judgments_correspond is True
 
     # Bundle keeps values, aliases, metadata, and structure.
     restored = TIDE.from_bundle(trace.to_bundle(), trusted=True)
     restored_model = _model(restored)
-    bundle_report = comparator(
-        model,
+    bundle_report = TIDE.from_model(model).compare(
         restored_model,
+        mapping="supplied",
         execution_map=execution_map,
         state_map=state_map,
     )
     assert bundle_report.complete_agreement is True
     seed = restored.value_of("csv_a")[0]
     assert seed["left"] is seed["right"]
-    assert [record.status for record in restored.exec_log] == [
-        record.status for record in trace.exec_log
+    assert [record.status for record in restored.execs.values()] == [
+        record.status for record in trace.execs.values()
     ]
-    assert [record.node_options for record in restored.exec_log] == [
-        record.node_options for record in trace.exec_log
+    assert [record.node_options for record in restored.execs.values()] == [
+        record.node_options for record in trace.execs.values()
     ]
 
 
 def test_gauntlet_reconstructing_the_same_events_is_idempotent(gauntlet_run):
     ocean, trace, _ = gauntlet_run
 
-    first = ocean.log_tools.create_trace(trace.runner, trace.events)
-    second = ocean.log_tools.create_trace(trace.runner, trace.events)
+    runner = ocean.runners[trace.runs[0]]
+    first = ocean._trace_from_runner(runner)
+    second = ocean._trace_from_runner(runner)
 
     first_model = _model(first)
     second_model = _model(second)
     execution_map, state_map = _identity_maps(first_model)
-    report = comparator(
-        first_model,
+    report = TIDE.from_model(first_model).compare(
         second_model,
+        mapping="supplied",
         execution_map=execution_map,
         state_map=state_map,
     )
 
     assert report.complete_agreement is True
-    assert [record.exec_id for record in first.exec_log] == [
-        record.exec_id for record in second.exec_log
+    assert [record.exec_id for record in first.execs.values()] == [
+        record.exec_id for record in second.execs.values()
     ]
-    assert first.concretisations == second.concretisations
+    assert first_model == second_model
 
 
 def test_gauntlet_repeated_runs_do_not_reimport_prior_occurrences():
@@ -373,13 +372,11 @@ def test_gauntlet_repeated_runs_do_not_reimport_prior_occurrences():
         _, first, _ = _run_gauntlet(ocean=ocean)
         _, second, _ = _run_gauntlet(ocean=ocean)
 
-        assert len(first.exec_log) == 8
-        assert len(second.exec_log) == 8
-        assert {record.exec_id for record in first.exec_log}.isdisjoint(
-            record.exec_id for record in second.exec_log
+        assert len(first.execs) == 8
+        assert len(second.execs) == 8
+        assert {record.exec_id for record in first.execs.values()}.isdisjoint(
+            record.exec_id for record in second.execs.values()
         )
-        assert first.intent.map.compare()["intent_equal"] is True
-        assert second.intent.map.compare()["intent_equal"] is True
     finally:
         ocean.close()
 
@@ -389,13 +386,12 @@ def test_gauntlet_executor_metadata_reports_the_mode_that_ran(mode):
     ocean, trace, _ = _run_gauntlet(mode=mode)
     try:
         completed = [
-            entry["payload"][2]
+            entry.payload.exec_meta
             for entry in trace.events
-            if entry["event_type"] == PipelineEvents.RESULT_READY
+            if entry.type == PipelineEvents.RESULT_READY
         ]
         assert len(completed) == 8
         assert {metadata.execution_mode for metadata in completed} == {mode}
-        assert trace.intent.map.compare()["intent_equal"] is True
     finally:
         ocean.close()
 
@@ -417,13 +413,13 @@ def test_gauntlet_failed_write_creates_no_actual_state():
         trace = caught.value.tide_trace
         model = _model(trace)
 
-        assert not any(record.writes for record in trace.exec_log)
+        assert not any(record.writes for record in trace.execs.values())
         assert _relation(model, "O") == set()
-        assert trace.intent.map.states.plan_only == (("mem:never_written", 0),)
-        assert trace.intent.map.states.actual_only == ()
-        assert trace.intent.map.compare()["intent_equal"] is False
+        runner = ocean.runners[trace.runs[0]]
+        plan = _project_pipeline_index_to_tide_plan(runner.index)
+        assert any(state.key == "never_written" for _, state in plan["O"])
         assert not any(
-            entry["event_type"] == RouterEvents.STORE_WRITE
+            entry.type == RouterEvents.STORE_WRITE
             for entry in trace.events
         )
     finally:
@@ -440,9 +436,9 @@ def _mutation_fixture(trace):
 def _mutation_report(trace, mutate):
     source, target, execution_map, state_map = _mutation_fixture(trace)
     mutate(target, execution_map, state_map)
-    return comparator(
-        source,
+    return TIDE.from_model(source).compare(
         target,
+        mapping="supplied",
         execution_map=execution_map,
         state_map=state_map,
     )
@@ -455,7 +451,7 @@ def test_gauntlet_mutation_remove_input_is_one_preservation_failure(gauntlet_run
         target["I"].pop(0)
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report["preservation"] == {"I": False, "O": True}
     assert len(report["deltas"]["I_minus"]) == 1
     assert report.conformant is False
@@ -471,7 +467,7 @@ def test_gauntlet_mutation_add_input_is_one_reflection_failure(gauntlet_run):
         ])
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report["reflection"] == {"I": False, "O": True}
     assert len(report["deltas"]["I_plus"]) == 1
     assert report.conformant is False
@@ -493,7 +489,7 @@ def test_gauntlet_mutation_redirect_producer_is_exact_output_delta(gauntlet_run)
         ]
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert len(report["deltas"]["O_minus"]) == 1
     assert len(report["deltas"]["O_plus"]) == 1
     assert report.conformant is False
@@ -509,8 +505,8 @@ def test_gauntlet_mutation_collapse_equal_states_is_invalid(gauntlet_run):
         target["states"].pop(second)
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is False
-    assert report["validity"]["K2"]["unique_creation"] is False
+    assert report["models"]["target"]["semantically_valid"] is False
+    assert report["models"]["target"]["unique_creation"] is False
     assert report.conformant is False
 
 
@@ -525,8 +521,8 @@ def test_gauntlet_mutation_merge_executions_reports_absent_identity(gauntlet_run
 
     report = _mutation_report(trace, mutate)
     assert report.assessable is True
-    assert report["validity"]["K2"]["valid"] is True
-    assert len(report["mapped_identities_absent"]["K2"]["Executions"]) == 1
+    assert report["models"]["target"]["semantically_valid"] is True
+    assert len(report["mapped_identities_absent"]["target"]["executions"]) == 1
     assert report.complete_agreement is False
 
 
@@ -540,8 +536,8 @@ def test_gauntlet_mutation_reuse_state_id_breaks_unique_creation(gauntlet_run):
         ])
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is False
-    assert report["validity"]["K2"]["unique_creation"] is False
+    assert report["models"]["target"]["semantically_valid"] is False
+    assert report["models"]["target"]["unique_creation"] is False
     assert len(report["deltas"]["O_plus"]) == 1
 
 
@@ -555,8 +551,8 @@ def test_gauntlet_mutation_cycle_breaks_acyclicity(gauntlet_run):
         ])
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is False
-    assert report["validity"]["K2"]["acyclic_ancestry"] is False
+    assert report["models"]["target"]["semantically_valid"] is False
+    assert report["models"]["target"]["acyclic_ancestry"] is False
     assert len(report["deltas"]["I_plus"]) == 1
 
 
@@ -572,8 +568,8 @@ def test_gauntlet_mutation_remove_producer_is_invalid_and_missing(gauntlet_run):
         ]
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is False
-    assert len(report["validity"]["K2"]["producer_count_errors"]) == 1
+    assert report["models"]["target"]["semantically_valid"] is False
+    assert len(report["models"]["target"]["producer_count_errors"]) == 1
     assert len(report["deltas"]["O_minus"]) == 1
 
 
@@ -587,7 +583,7 @@ def test_gauntlet_mutation_swap_versions_is_valid_but_nonconforming(gauntlet_run
 
     report = _mutation_report(trace, mutate)
     assert report.assessable is True
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report.conformant is False
     assert report["deltas"]["I_minus"]
     assert report["deltas"]["I_plus"]
@@ -600,7 +596,7 @@ def test_gauntlet_mutation_duplicate_incidence_is_setwise_equal(gauntlet_run):
         target["I"].append(copy.deepcopy(target["I"][0]))
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report.conformant is True
     assert report.complete_agreement is True
 
@@ -615,7 +611,7 @@ def test_gauntlet_mutation_metadata_is_outside_the_kernel(gauntlet_run):
         next(iter(target["states"].values()))["value"] = "changed"
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report.conformant is True
     assert report.complete_agreement is True
 
@@ -630,13 +626,15 @@ def test_gauntlet_mutation_unmapped_path_is_visible_outside_scope(gauntlet_run):
         target["I"].append(["extra-consumer", "extra-state"])
 
     report = _mutation_report(trace, mutate)
-    assert report["validity"]["K2"]["valid"] is True
+    assert report["models"]["target"]["semantically_valid"] is True
     assert report.conformant is True
-    assert report["identity_coverage"] == {"K1": True, "K2": False}
+    assert report["identity_coverage"] == {"source": True, "target": False}
     assert report.complete_agreement is False
-    assert report["outside"]["K2"] == {
-        "I": (("extra-consumer", "extra-state"),),
-        "O": (("extra-producer", "extra-state"),),
+    assert report["outside"]["target"] == {
+        "executions": ["extra-consumer", "extra-producer"],
+        "states": ["extra-state"],
+        "I": [["extra-consumer", "extra-state"]],
+        "O": [["extra-producer", "extra-state"]],
     }
 
 
@@ -650,9 +648,9 @@ def test_gauntlet_mutation_absent_mapped_target_is_reported(gauntlet_run):
     report = _mutation_report(trace, mutate)
     assert report.assessable is True
     assert report.conformant is False
-    assert report["mapped_identities_absent"]["K2"]["States"] == (
-        "absent-target-state",
-    )
+    assert report["mapped_identities_absent"]["target"]["states"] == [
+        "absent-target-state"
+    ]
     assert report["deltas"]["I_minus"] or report["deltas"]["O_minus"]
 
 

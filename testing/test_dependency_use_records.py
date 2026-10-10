@@ -3,7 +3,7 @@ import pytest
 from types import SimpleNamespace
 
 from tide_tooling import TIDE
-from tide_tooling.tooling_core.engine.tide_logging import DependencyUseRecord, ExpandedDepRecord
+from tide_tooling.tooling_core.engine.tide_logging import DependencyUseRecord, ExpandedDepRecord, InputUseRecord
 from tide_tooling.tooling_core.engine.classes import DataRef
 # logging_module = pytest.importorskip("tide_tooling.tooling_core.engine.tide_logging")
 # references_module = pytest.importorskip("tide_tooling.tooling_core.engine.classes")
@@ -136,6 +136,24 @@ def test_duplicate_static_args_preserve_distinct_input_indexes(duplicate_static_
     ]
 
 
+def test_mixed_duplicate_inputs_keep_original_occurrence_order():
+    def UseMixed(first, second, third):
+        return first, second, third
+
+    tide = TIDE()
+    tide.event("ProducerA", writes={"@A": "A"})
+    tide.event("ProducerB", writes={"@B": "B"})
+    tide.exec(UseMixed, args=["@@A", "@@A", "@@B"])
+
+    use_exec = exec_for_actor(tide.trace(), "UseMixed", grouped=False)
+
+    assert input_uses_from_reads(use_exec) == [
+        ("global:@A", 0, "args", 0, "static"),
+        ("global:@A", 0, "args", 1, "static"),
+        ("global:@B", 0, "args", 2, "static"),
+    ]
+
+
 def test_duplicate_static_args_input_record_dependencies_preserve_occurrences(duplicate_static_input_trace):
     use_exec = exec_for_actor(duplicate_static_input_trace, "UseTwice", grouped=False)
     input_record = args_input_record(use_exec)
@@ -215,6 +233,47 @@ def test_static_dependency_use_record_equality_includes_input_index():
         producer_exec_id="producer-exec",
         input_index=1,
     )
+
+    assert left != right
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("resolved_ver", 1), ("producer_exec_id", "another-producer")],
+)
+def test_input_use_equality_includes_dependency_provenance(changed_field, changed_value):
+    evidence = dict(
+        associated_input=associated_input(index_count=1),
+        dep=data_ref("@A", "global"),
+        type="static",
+        unscoped_ref="global:@A",
+        resolved_val="A-v0",
+        resolved_ver=0,
+        producer_exec_id="producer-exec",
+    )
+    left_dep = DependencyUseRecord(**evidence)
+    right_dep = DependencyUseRecord(**(evidence | {changed_field: changed_value}))
+    value = ("A-v0",)
+    left = InputUseRecord("args", value, value, value, value, [left_dep])
+    right = InputUseRecord("args", value, value, value, value, [right_dep])
+
+    assert left != right
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("snapshot_lineage", [{"boundary": "read"}]), ("observed_mutable", True)],
+)
+def test_dynamic_dependency_equality_includes_capture_evidence(changed_field, changed_value):
+    evidence = dict(
+        associated_input=associated_input(index_count=1),
+        dep=data_ref("@A*", "global"),
+        type="dynamic",
+        unscoped_ref="global:@A*",
+        expanded_to=[expanded_record()],
+    )
+    left = DependencyUseRecord(**evidence)
+    right = DependencyUseRecord(**(evidence | {changed_field: changed_value}))
 
     assert left != right
 

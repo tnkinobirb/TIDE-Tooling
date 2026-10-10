@@ -14,7 +14,6 @@ def match(identifier, version=None):
 
 def test_searched_show_filters_to_nearby_results_for_one_type():
     searched = Searched(
-        inspect=None,
         subject="@B",
         execs=[],
         actors=[],
@@ -28,7 +27,7 @@ def test_searched_show_filters_to_nearby_results_for_one_type():
     )
 
     shown = searched.show(
-        type="reference",
+        kind="reference",
         exact=False,
         nearby=True,
     )
@@ -42,7 +41,6 @@ def test_searched_show_filters_to_nearby_results_for_one_type():
 
 def test_searched_show_filters_to_exact_results_for_one_type():
     searched = Searched(
-        inspect=None,
         subject="global:@B",
         execs=[],
         actors=[],
@@ -53,7 +51,7 @@ def test_searched_show_filters_to_exact_results_for_one_type():
     )
 
     shown = searched.show(
-        type="reference",
+        kind="reference",
         exact=True,
         nearby=False,
     )

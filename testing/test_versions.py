@@ -132,10 +132,11 @@ def test_exact_version_inspect_does_not_fallback_to_latest(versioned_trace):
     # NOTE:
     # Explicit scoped inspect, e.g. inspect("global:@A", version=1),
     # returns the exact inspected ref/version while history remains the
-    # version history UP TO the inspected version for that ref identity.
-    # So this should not assert history == [1].
+    # complete version history for that ref identity. The selected version
+    # constrains relations, not the history projection.
     assert a_v0.history == [
-        0
+        0,
+        1,
     ]
     assert a_v1.history == [
         0,

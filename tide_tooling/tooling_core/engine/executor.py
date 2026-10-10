@@ -1,23 +1,19 @@
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
-from .classes import FakeFuture, Event, RAISE, __TIDE_TEMPLATE_VALUE__
-from pickle import PickleError
+from .classes import FakeFuture, Event, RAISE, __fallback__
+from dataclasses import replace
+import time
 from queue import Queue
 from tide_tooling.tooling_core.engine.utils import (
     _is_tide_exec_uuid,
-    create_tide_exec_uuid,
     tide_snapshot_value,
 )
-from .events import ExecutorEvents, PipelineEvents
-from .errors import (
-    MissingExecutionEvidenceError,
-    ReadInsideProcessPoolError,
-)
-from functools import partial
+from .events import Cause, ExecutorEvents, PipelineEvents
+from .event_payloads import Result
+from .errors import MissingExecutionEvidenceError
 from multiprocessing import get_context
-from tide_tooling.tooling_core import debug_print as print
-from .utils import _unwrap_node_worker_result
+from .utils import _node_worker
 
-_EXECUTION_TEMPLATE_VALUE = __TIDE_TEMPLATE_VALUE__()
+_EXECUTION_TEMPLATE_VALUE = __fallback__()
 
 
 class ExecMeta:
@@ -31,10 +27,10 @@ class ExecMeta:
         status="unknown",
         error=None,
         runtime_effects=None,
-        input_snapshot_before=None,
-        input_snapshot_after=None,
+        runtime_immediate_effect_count=0,
+        post_read_snapshots=None,
         execution_mode=None,
-        execution_evidence=None,
+        node_snapshot=None,
         handled_raise=False,
     ):
         if not _is_tide_exec_uuid(assigned_id):
@@ -46,353 +42,269 @@ class ExecMeta:
         self.end_time = end_time
         self.duration = duration
         self.result = result
+        self.value_type = type(result)
         self.snapshot = tide_snapshot_value(result, boundary="result")
         self.status = status
         self.error = error
-        self.runtime_effects_snapshot = tide_snapshot_value(
-            list(runtime_effects or ()),
-            boundary="runtime_effects",
+        # Runtime Effects are typed execution evidence owned by RESULT_READY's
+        # Event graph.  They are not a runtime value and must not cross a
+        # second, generic value-serialisation boundary.
+        self.runtime_effects = tuple(runtime_effects or ())
+        self.runtime_immediate_effect_count = int(
+            runtime_immediate_effect_count
         )
-        self.runtime_effects = self.runtime_effects_snapshot.materialise()
-        self.input_snapshot_before = input_snapshot_before
-        self.input_snapshot_after = input_snapshot_after
+        self.post_read_snapshots = tuple(post_read_snapshots or ())
         self.execution_mode = execution_mode
-        self.execution_evidence = execution_evidence
+        self.node_snapshot = node_snapshot
+        self.node_id = node_snapshot["node_id"] if node_snapshot is not None else None
         self.handled_raise = handled_raise
 
 
-def _execute_with_timing(func, assigned_id, *args, **kwargs):
-    """Execute a node and return its value with portable execution metadata.
-
-    This function intentionally lives at module scope so explicit process-pool
-    execution can pickle it.  The previous nested closure could never be sent
-    reliably to a ProcessPoolExecutor.
-    """
-    import time
-
-    status = "succeeded"
-    exception = None
-    handled_raise = False
-    start_time_utc = time.time()
-    runtime_effects = []
+def _execute_with_timing(
+    assigned_id,
+    node_func,
+    resolved_args,
+    resolved_kwargs,
+    runtime,
+    node_snapshot=None,
+):
+    # Retain the live inputs whose mutation this execution can cause.
     observed_inputs = {
-        "args": args[1] if len(args) > 1 else args,
-        "kwargs": args[2] if len(args) > 2 else kwargs,
+        "args": resolved_args,
+        "kwargs": resolved_kwargs,
     }
-    input_snapshot_before = tide_snapshot_value(
-        observed_inputs,
-        boundary="input_before",
-    )
+
+    # Execute once and retain its elapsed time and default outcome.
+    started_at = time.time()
+    status = "succeeded"
+    error = None
+    handled_raise = False
+    runtime_effects = []
+    runtime_immediate_effect_count = 0
 
     try:
-        result = func(*args, **kwargs)
-        result, runtime_effects = _unwrap_node_worker_result(result)
+        result, runtime_effects = _node_worker(
+            node_func,
+            resolved_args,
+            resolved_kwargs,
+            runtime,
+        )
+
+        # A returned RAISE is a handled result with fall-through Effects.
         if isinstance(result, RAISE):
             signal = result
-            handled_raise = True
             status = "handled_raise"
-            exception = signal.exception
-            result = (
-                signal.exception
-                if isinstance(
-                    signal.preserve_output,
-                    __TIDE_TEMPLATE_VALUE__,
-                )
-                else signal.preserve_output
-            )
-            runtime_effects = [
-                *runtime_effects,
-                *signal.effects,
-            ]
-    except RAISE as signal:
-        handled_raise = True
-        status = "handled_raise"
-        exception = signal.exception
-        result = (
-            signal.exception
-            if isinstance(
-                signal.preserve_output,
-                __TIDE_TEMPLATE_VALUE__,
-            )
-            else signal.preserve_output
-        )
-        runtime_effects = list(
-            getattr(signal, "_tide_runtime_effects", signal.effects)
-        )
-    except Exception as error:
-        result = _EXECUTION_TEMPLATE_VALUE
-        runtime_effects = []
-        status = "failed"
-        exception = error
+            error = signal.exception
+            handled_raise = True
+            result = signal.exception if isinstance(signal.output, __fallback__) else signal.output
+            runtime_immediate_effect_count = len(runtime_effects)
+            runtime_effects.extend(signal.effects)
 
-    input_snapshot_after = tide_snapshot_value(
-        observed_inputs,
-        boundary="input_after",
-    )
-    end_time_utc = time.time()
-    duration = end_time_utc - start_time_utc
-    meta = ExecMeta(
+    except RAISE as signal:
+        # A raised RAISE is also a handled result and retains worker evidence.
+        status = "handled_raise"
+        error = signal.exception
+        handled_raise = True
+        result = signal.exception if isinstance(signal.output, __fallback__) else signal.output
+        runtime_immediate_effect_count = len(runtime.effects)
+        runtime_effects = [
+            *runtime.effects,
+            *signal.effects,
+        ]
+
+    except Exception as signal:
+        # An ordinary failure returns evidence instead of escaping its Future.
+        status = "failed"
+        error = signal
+        result = _EXECUTION_TEMPLATE_VALUE
+        runtime_effects = list(runtime.effects)
+        runtime_immediate_effect_count = len(runtime_effects)
+
+    # Capture each realised read at its post-execution boundary. RESULT_READY
+    # carries these exact snapshots; reconstruction never restores and
+    # serialises the runtime value again.
+    finished_at = time.time()
+    post_read_snapshots = []
+    snapshots_by_identity = {}
+    for receipt in (node_snapshot or {}).get("reads", ()):
+        input_name = receipt["input_name"]
+        if input_name not in observed_inputs:
+            continue
+        try:
+            value = observed_inputs[input_name]
+            for part in receipt.get("input_path", ()):
+                value = value[part]
+        except (KeyError, IndexError, TypeError):
+            continue
+
+        identity = id(value)
+        cached = snapshots_by_identity.get(identity)
+        if cached is None:
+            captured = tide_snapshot_value(
+                value,
+                boundary="post_execution",
+            )
+            snapshots_by_identity[identity] = (value, captured)
+        else:
+            original, captured = cached
+            if original is not value:
+                raise RuntimeError("Snapshot identity collision")
+
+        post_read_snapshots.append({
+            "input_name": input_name,
+            "reference": receipt["reference"],
+            "input_path": tuple(receipt.get("input_path", ())),
+            "snapshot": captured,
+        })
+
+    return ExecMeta(
         assigned_id,
-        start_time_utc,
-        end_time_utc,
-        duration,
+        started_at,
+        finished_at,
+        (finished_at - started_at) * 1000,
         result,
         status,
-        exception,
+        error,
         runtime_effects,
-        input_snapshot_before,
-        input_snapshot_after,
+        runtime_immediate_effect_count,
+        post_read_snapshots,
         handled_raise=handled_raise,
     )
-    return result, meta
 
 
 class Executor:
-    _VALID_EVENT_TYPES = ['node_ready']
     _VALID_EXECUTION_MODES = {"auto", "thread", "process", "sequential"}
-    __TIDE_TEMPLATE_VALUE = _EXECUTION_TEMPLATE_VALUE
 
-    def __init__(self, event_interface, deep_copy=True):
+    def __init__(self, event_interface):
         self.id = 0
         self.event_emitter = event_interface.emit_event_to_ocean
-        #subscribe to events
         self.event_queue = Queue()
         event_interface.event_subscriber(ExecutorEvents, self.event_queue.put)
-        self.snapshot = deep_copy
-        self.waiting_tasks = Queue()
-        self.running_tasks = {} #future: node_id
-        self.done_tasks = [] #payload: result
+        self.running_tasks = {}
         self.thread_pool_executor = ThreadPoolExecutor(max_workers=4)
         self.process_pool_executor = None
-        self.opaque_value_snapshot_by_last_exec_id = {}
         self._closed = False
 
-        self.event_handlers = {
-            ExecutorEvents.NODE_READY: self.on_ready_node
-        }
-
     def idle(self):
-        if self.event_queue.empty() and not self.running_tasks.values() and self.waiting_tasks.empty() and not self.done_tasks:
-            return True
-        return False
+        return self.event_queue.empty() and not self.running_tasks
 
-    ############## 
-    #   EVENTS   #
-    ##############
-    def handle_event(self, event):
-        self.event_handlers[event.event_type](event)
-
-    def _requeue_on_thread(self, future, reason, *, runtime_read=False):
-        node_ready_event = self.running_tasks.pop(future)
-        print(f"process execution unavailable; falling back to thread pool: {reason}")
-        _, payload = node_ready_event.payload
-        worker, args, _ = payload
-
-        if runtime_read:
-            args = list(args)
-            effect_runtime = getattr(
-                node_ready_event,
-                "thread_effect_runtime",
-                None,
-            )
-            if effect_runtime is None:
-                effect_runtime = dict(args[3] or {})
-            effect_runtime["inside_process_pool"] = False
-            effect_runtime["effects"] = []
-            args[3] = effect_runtime
-            args = tuple(args)
-
-        future = self.route_task_to_executor(
-            worker=worker,
-            assigned_id=node_ready_event.exec_id,
-            payload=args,
-            mode="thread",
-        )
-        node_id, _ = node_ready_event.payload
-        node_ready_event.payload = (
-            node_id,
-            (worker, args, "thread"),
-        )
-        self.running_tasks[future] = node_ready_event
-
-    def _handle_pickling_error(self, future, error):
-        self._requeue_on_thread(future, error)
-
-    ############### 
-    # EXC WRAPPER #
-    ###############
-    @staticmethod
-    def timed_execution(func, assigned_id):
-        return partial(_execute_with_timing, func, assigned_id)
-
-
-    ############### 
-    #  EXECUTION  #
-    ###############
-
-    def submit(
-        self,
-        worker,
-        payload: tuple = (),
-        mode="auto",
-        assigned_id=None,
-    ):
-        future = self.route_task_to_executor(
-            worker,
-            assigned_id or create_tide_exec_uuid(),
-            payload,
-            mode=mode,
-        )
-        return future
-
-    def on_ready_node(self, node_ready_event):
-        _, payload = node_ready_event.payload
-        assigned_exec_id = node_ready_event.exec_id
-        worker, args, mode = payload 
-        future = self.route_task_to_executor(worker=worker, assigned_id=assigned_exec_id, payload=args, mode=mode) 
-        self.running_tasks[future] = node_ready_event
-
-    def route_task_to_executor(self, worker, assigned_id:str, payload:tuple=(), mode='auto'):
+    def _submit(self, node_ready_event):
+        # Submit exactly the node execution carried by NODE_READY.
         if self._closed:
             raise RuntimeError("Executor is closed")
-        if mode not in self._VALID_EXECUTION_MODES:
+        work = node_ready_event.payload
+        requested_mode = work.mode
+        if requested_mode not in self._VALID_EXECUTION_MODES:
             raise ValueError(
                 f"execution mode must be one of "
-                f"{sorted(self._VALID_EXECUTION_MODES)}, got {mode!r}"
+                f"{sorted(self._VALID_EXECUTION_MODES)}, got {requested_mode!r}"
             )
-        _WORKER = self.timed_execution(func=worker, assigned_id=assigned_id)
-        _PAYLOAD = payload
-        if mode == 'auto':
-            # Arbitrary user callables (closures, lambdas, notebook functions,
-            # decorated functions) are often not process-pickleable.  Auto mode
-            # therefore uses threads; callers can still request ``process``
-            # explicitly when their worker and payload satisfy multiprocessing
-            # requirements.
-            future = self.thread_pool_executor.submit(_WORKER, *_PAYLOAD)
-            print("submitted task to thread pool")
-        elif mode == 'thread':
-            future = self.thread_pool_executor.submit(_WORKER, *_PAYLOAD)
-            print("submitted task to thread pool")
-        elif mode == 'process':
+        mode = "thread" if requested_mode == "auto" else requested_mode
+
+        # Process workers cannot carry live Store handlers.
+        runtime = work.effect_runtime
+        if mode == "process":
+            runtime = replace(
+                runtime,
+                effects=[],
+                inside_process_pool=True,
+                read_handler=None,
+                write_handler=None,
+                delete_handler=None,
+            )
+
+        payload = (
+            node_ready_event.exec_id,
+            work.function,
+            work.args,
+            work.kwargs,
+            runtime,
+            work.node_snapshot,
+        )
+
+        # Route the one execution through its requested mode.
+        if mode == "thread":
+            future = self.thread_pool_executor.submit(
+                _execute_with_timing,
+                *payload,
+            )
+        elif mode == "process":
             if self.process_pool_executor is None:
                 self.process_pool_executor = ProcessPoolExecutor(
                     max_workers=4,
                     mp_context=get_context("spawn"),
                 )
-            future = self.process_pool_executor.submit(_WORKER, *_PAYLOAD)
-            print("submitted task to process pool")
-        elif mode == 'sequential':
-            try:
-                result = _WORKER(*_PAYLOAD)
-                future = FakeFuture(result)
-            except Exception as e:
-                raise e
-            print("submitted (executed) task sequentially!")
-        return future
+            future = self.process_pool_executor.submit(
+                _execute_with_timing,
+                *payload,
+            )
+        else:
+            future = FakeFuture(_execute_with_timing(*payload))
 
-
-    ################ 
-    #  COLLECTION  #
-    ################
-
-    def get_result_from_future(self, future):
-        return future.result()
+        self.running_tasks[future] = (node_ready_event, mode)
     
-    def collect_results(self):
-        """Collect results that are ready without blocking the Ocean loop.
-
-        Worker completion is polled by successive scheduling turns.  Waiting
-        here previously prevented Ocean from routing kill, quit, and store
-        events for the entire duration of a long-running worker.
-        """
+    def _collect_results(self):
+        # Collect only completed work without blocking Ocean.
         done, _ = wait(
-            self.running_tasks.keys(),
+            self.running_tasks,
             timeout=0,
             return_when=FIRST_COMPLETED,
         )
 
         for future in done:
-            node_ready_event = self.running_tasks.get(future)
-            runner_id = node_ready_event.source_id
-            node_id, _ = node_ready_event.payload
-            meta = None
+            node_ready_event, mode = self.running_tasks[future]
+            work = node_ready_event.payload
+
             try:
-                result, meta = self.get_result_from_future(future)
-                meta: ExecMeta
-                _, task_payload = node_ready_event.payload
-                _, _, execution_mode = task_payload
-                meta.execution_mode = execution_mode
-                meta.execution_evidence = getattr(
-                    node_ready_event,
-                    "execution_evidence",
-                    None,
+                meta = future.result()
+            except Exception:
+                # Explicit process and infrastructure failures remain explicit.
+                self.running_tasks.pop(future)
+                raise
+
+            # RESULT_READY must retain the immutable NODE_READY evidence.
+            if work.node_snapshot is None:
+                self.running_tasks.pop(future)
+                raise MissingExecutionEvidenceError(
+                    f"Execution {meta.id} completed without its immutable "
+                    "NODE_READY evidence"
                 )
-                if meta.execution_evidence is None:
-                    raise MissingExecutionEvidenceError(
-                        f"Execution {meta.id} completed without its immutable "
-                        "NODE_READY evidence"
-                    )
-                if (
-                    isinstance(meta.error, ReadInsideProcessPoolError)
-                    and not meta.handled_raise
-                ):
-                    self._requeue_on_thread(
-                        future,
-                        meta.error,
-                        runtime_read=True,
-                    )
-                    continue
-            except PickleError as e:
-                self._handle_pickling_error(future, e)
-                continue
-            except ReadInsideProcessPoolError as e:
-                self._requeue_on_thread(future, e, runtime_read=True)
-                continue
-            except Exception as e:
-                self.running_tasks.pop(future, None)
-                raise e
+            meta.execution_mode = mode
+            meta.node_snapshot = work.node_snapshot
+            meta.node_id = work.node_snapshot["node_id"]
+            self.running_tasks.pop(future)
 
-                        
-            del self.running_tasks[future]
-
-            payload = (node_id, result, meta)        
-
-                    
-            
-            completed_node_event = Event(source="executor", source_id=self.id, target_runner_id=runner_id, event_type=PipelineEvents.RESULT_READY, payload=payload, exec_id=meta.id)
-            
-            self.done_tasks.append(completed_node_event)
+            # Return the completed execution to its PipelineRunner.
+            self.event_emitter(Event(
+                ocean_id=node_ready_event.ocean_id,
+                source="executor",
+                source_id=self.id,
+                type=PipelineEvents.RESULT_READY,
+                cause=Cause.from_event(node_ready_event),
+                target_runner_id=node_ready_event.source_id,
+                payload=Result(meta),
+                exec_id=meta.id,
+            ))
 
     def cancel_runner(self, runner_id):
-        """Discard pending executor work belonging to one failed runner."""
-        for future, ready_event in list(self.running_tasks.items()):
+        # Remove pending work belonging to exactly this runner.
+        for future, (ready_event, mode) in list(self.running_tasks.items()):
             if ready_event.source_id != runner_id:
                 continue
-            cancel = getattr(future, "cancel", None)
-            if callable(cancel):
-                cancel()
-            self.running_tasks.pop(future, None)
-
-        self.done_tasks = [
-            event
-            for event in self.done_tasks
-            if event.target_runner_id != runner_id
-        ]
+            if mode != "sequential":
+                future.cancel()
+            self.running_tasks.pop(future)
 
     def shutdown(self, wait=True, cancel_futures=True):
-        """Release thread/process pools. Safe to call more than once."""
+        # Close each allocated pool once.
         if self._closed:
             return
         self._closed = True
-
         if cancel_futures:
-            for future in list(self.running_tasks):
-                cancel = getattr(future, "cancel", None)
-                if callable(cancel):
-                    cancel()
+            for future, (_, mode) in self.running_tasks.items():
+                if mode != "sequential":
+                    future.cancel()
             self.running_tasks.clear()
-            self.done_tasks.clear()
-
         self.thread_pool_executor.shutdown(
             wait=wait,
             cancel_futures=cancel_futures,
@@ -402,19 +314,10 @@ class Executor:
                 wait=wait,
                 cancel_futures=cancel_futures,
             )
-            
-    def emit_results(self):
-        for event in list(self.done_tasks):
-            self.done_tasks.remove(event)
-            self.event_emitter(event)
 
     def tick(self):
+        # Submit queued NODE_READY Events, then collect completed work.
         while not self.event_queue.empty():
-            event = self.event_queue.get_nowait()
-            self.handle_event(event)
-
+            self._submit(self.event_queue.get_nowait())
         if self.running_tasks:
-            self.collect_results()
-        
-        if self.done_tasks:
-            self.emit_results()
+            self._collect_results()

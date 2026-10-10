@@ -32,7 +32,7 @@ def main():
     ocean.register_store(name="data_store", scope="local")
     ocean.run_pipeline(
         seeded_pipeline,
-        mem_store_templates={
+        local_store_templates={
             "data_store": {
                 "stored_data": "DATA",
             },

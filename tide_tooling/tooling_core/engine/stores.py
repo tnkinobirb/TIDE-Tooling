@@ -1,107 +1,78 @@
 from threading import RLock
-from typing import Callable, Any
 
-##Data-Stores
+from .classes import __TEMPLATE_VAL__
+from .utils import tide_value_hasher
+
+
 class StoreTemplate:
-    reference: str="store_template"
-    default_store_init: Callable = dict
+    reference = "store_template"
+    store_template = dict
 
-    def __init__(self, parent_runner_id=None):
-        self.store = self.default_store_init()
-        self.scope = "global"
+    def __init__(self, name=None, store_template=None, scope="global", parent_runner_id=None):
+        # Retain the Store identity and ownership required by TIDE.
+        self.name = name or self.reference
         self.parent_runner_id = parent_runner_id
-    def dump(self) -> dict[str, Any]:
-        raise NotImplementedError
-    
-    def get(self, key) -> Any:
-        raise NotImplementedError
-        
-    def set(self, key, value) -> None:
-        raise NotImplementedError
-    
-    def exists(self, key) -> bool:
-        raise NotImplementedError
 
-    def keys(self) -> list[str]:
-        raise NotImplementedError
-    
-    def delete(self, key) -> None:
-        raise NotImplementedError
+        # Accept only the two Store ownership scopes understood by TIDE.
+        if scope not in {"local", "global"}:
+            raise ValueError("StoreTemplate.scope must be 'local' or 'global'")
+        self.scope = scope
 
-    def pop(self, key):
-        """Remove and return one value.
+        # Instantiate the Store class's authoritative backing type.
+        default_store = self.store_template()
+        if store_template is not None and not isinstance(store_template, type(default_store)):
+            raise TypeError(
+                f"{self.__class__.__name__}.store_template requires "
+                f"{type(default_store).__name__}, got {type(store_template).__name__}"
+            )
 
-        Store implementations may override this to make the operation atomic.
-        """
-        value = self.get(key)
-        self.delete(key)
-        return value
+        # Own the backing container while preserving the supplied runtime
+        # values themselves. Caller mutation of the seed mapping must never
+        # bypass Ocean, Store locking, or Event publication.
+        self._store = (
+            type(default_store)(store_template)
+            if store_template is not None
+            else default_store
+        )
+        self._lock = RLock()
 
-    def pop_if_present(self, key):
-        """Return ``(found, value)`` while removing ``key`` when present."""
-        if not self.exists(key):
-            return False, None
-        return True, self.pop(key)
-    
+    def dump(self):
+        # Return a snapshot rather than the live mapping.
+        with self._lock:
+            return dict(self._store)
 
+    def get(self, key, default=__TEMPLATE_VAL__):
+        # Read one value using ordinary mapping semantics.
+        with self._lock:
+            return self._store.get(key, default)
+
+    def set(self, key, value, force=False):
+        with self._lock:
+            # A new reference becomes available.
+            if key not in self._store:
+                self._store[key] = value
+                return False
+
+            # An existing changed or forced reference is updated.
+            updated = force or tide_value_hasher(self._store[key]) != tide_value_hasher(value)
+            self._store[key] = value
+            return updated
+
+    def exists(self, key):
+        with self._lock:
+            return key in self._store
+
+    def keys(self):
+        # Return a snapshot rather than the live key view.
+        with self._lock:
+            return list(self._store)
+
+    def pop(self, key, default=__TEMPLATE_VAL__):
+        # Observe and remove one value as one operation.
+        with self._lock:
+            return self._store.pop(key, default)
 
 
 class MemoryKVStore(StoreTemplate):
-    """In-memory key/value store with atomic mapping operations.
-
-    ``get``, ``set``, ``exists``, ``keys``, ``delete``, and ``dump`` are
-    serialized per store instance.  The lock protects the mapping operation;
-    it does not make a mutable value returned by ``get`` immutable or protect
-    direct mutation through a caller-supplied ``store_template`` reference.
-    """
-
     reference = "mem"
-    default_store_init: Callable = dict
-    def __init__(self, name:str=None, store_template: dict=None, scope="global", parent_runner_id=None, verbose=False) -> None:
-        self.name = name or MemoryKVStore.reference
-        self.parent_runner_id = parent_runner_id
-        self._lock = RLock()
-        if store_template is not None:
-            self.store = store_template
-        else:
-            self.store = MemoryKVStore.default_store_init()
-        self.scope = scope
-
-        if verbose:
-            print("STORE", name, store_template, id(self.store))
-        pass
-
-    def dump(self) -> dict[str, Any]:
-        with self._lock:
-            return dict(self.store)
-
-    def exists(self, name) -> bool:
-        with self._lock:
-            return name in self.store
-
-    def get(self, key) -> Any:
-        with self._lock:
-            return self.store[key]
-
-    def set(self, key, value) -> None:
-        with self._lock:
-            self.store[key] = value
-        return
-
-    def keys(self) -> list[str]:
-        with self._lock:
-            return list(self.store.keys())
-    
-    def delete(self, key) -> None:
-        with self._lock:
-            del self.store[key]
-
-    def pop(self, key):
-        with self._lock:
-            return self.store.pop(key)
-
-    def pop_if_present(self, key):
-        with self._lock:
-            if key not in self.store:
-                return False, None
-            return True, self.store.pop(key)
+    store_template = dict

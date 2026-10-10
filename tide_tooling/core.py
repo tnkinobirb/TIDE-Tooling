@@ -1,4 +1,3 @@
-# tide_tooling/core.py
 from tide_tooling.tooling_core.engine.classes import (
     DataRef,
     DELETE,
@@ -9,21 +8,32 @@ from tide_tooling.tooling_core.engine.classes import (
     Node,
     NodeInput as NodeInput,
     Pipeline as Pipeline,
+    RAISE,
     RUN,
     RunnerNodeInput,
     WRITE,
-    __TIDE_TEMPLATE_VALUE__,
+    WRITE_NOW,
+    __fallback__,
 )
 from tide_tooling.tooling_core.engine.events import (
+    Cause,
     Effects,
+    ExecutorEvents,
     LogEvents,
+    PipelineEvents,
     RouterEvents as RouterEvents,
 )
+from tide_tooling.tooling_core.engine.event_payloads import (
+    EffectOccurrence,
+    State,
+)
 # from tide_tooling.tooling_core.engine.decorators import pipeline, node
-from tide_tooling.tooling_core.engine.ocean import Ocean 
+from tide_tooling.tooling_core.engine.ocean import Ocean
+from tide_tooling.tooling_core.engine.tide_runtime_logging import trace_from_event_log
 from tide_tooling.tooling_core.engine.tide_links import (
-    ReadWriteLink as ReadWriteLink,
-    StackLink as StackLink,
+    ReadEdge as ReadEdge,
+    EffectEdge as EffectEdge,
+    EmissionEdge as EmissionEdge,
 )
 from tide_tooling.tooling_core.engine.tide_query_results import (
     Compared as Compared,
@@ -32,274 +42,379 @@ from tide_tooling.tooling_core.engine.tide_query_results import (
     Object as Object,
 )
 from tide_tooling.tooling_core.engine.tide_logging import Trace
+from tide_tooling.tooling_core.engine.tide_model import (
+    TIDEModel,
+    TIDEModelValidityReport,
+)
 from tide_tooling.tooling_core.engine.tide_records import (
     Actor,
+    ActorOccurrence,
     DependencyUseRecord,
-    EffectRecord,
     ExecRecord,
     InputUseRecord,
     Inputs,
     WriteRecord,
 )
 from tide_tooling.tooling_core.engine.tide_rendering import (
-    SHOW_BOLD,
-    SHOW_CYAN,
-    SHOW_DIM,
-    SHOW_GREEN,
-    SHOW_RED,
-    SHOW_RESET,
-    SHOW_SECTION_WIDTH,
-    SHOW_WHITE,
-    SHOW_YELLOW,
-    _show_options,
-    _show_render,
     strip_ansi as strip_ansi,
 )
-from tide_tooling.tooling_core.engine.events import ExecEvent
-from collections import defaultdict
-from contextlib import contextmanager
 from functools import update_wrapper
 from os import PathLike
 from tide_tooling.tooling_core.engine.utils import (
-    snapshot_json_dict,
+    create_tide_exec_uuid,
     tide_snapshot_value,
-    tide_value_hasher,
+    tide_value_hasher
 )
 from typing import Any, Callable
 from tide_tooling.tooling_core.engine.errors import (
+    MissingStoreError,
     NoExecRecordError,
     PipelineDeadlockError,
 )
 from tide_tooling.tooling_core.engine.stores import MemoryKVStore
 from tide_tooling.tooling_core.engine.decorators import current_pipeline_build
-from tide_tooling.tooling_core import debug_print
+
 import copy
-import warnings
-
-
-class TIDEModelReport(dict):
-    """A mapping-compatible validity report for ``K = (E, S, I, O)``."""
-
-    @property
-    def direct_handoffs(self):
-        return tuple(
-            (
-                judgment["producer_exec_id"],
-                judgment["state_id"],
-                judgment["consumer_exec_id"],
-            )
-            for judgment in self.get("judgments", {}).get(
-                "direct_handoffs",
-                (),
-            )
-        )
-
-    @property
-    def reachability(self):
-        return tuple(
-            (
-                judgment["source_exec_id"],
-                judgment["target_exec_id"],
-            )
-            for judgment in self.get("judgments", {}).get(
-                "reachability",
-                (),
-            )
-        )
-
-    def to_dict(self):
-        return {
-            key: value
-            for key, value in self.items()
-        }
-
-    def show(self, color=True, simple=False, colour=None):
-        color, simple = _show_options(
-            color=color,
-            simple=simple,
-            colour=colour,
-        )
-        valid = bool(self.get("semantically_valid"))
-        status = "VALID" if valid else "INVALID"
-        status_color = SHOW_GREEN if valid else SHOW_RED
-        counts = self.get("counts", {})
-        host = self.get("host") or "unspecified"
-
-        lines = [
-            "",
-            f"{SHOW_CYAN}{'=' * SHOW_SECTION_WIDTH}{SHOW_RESET}",
-            f"{SHOW_CYAN}{SHOW_BOLD}TIDE MODEL{SHOW_RESET} | "
-            f"{status_color}{status}{SHOW_RESET} | "
-            f"{counts.get('executions', 0)} executions | "
-            f"{counts.get('states', 0)} states",
-            f"{SHOW_DIM}Host: {host} | "
-            f"Schema: {self.get('schema', 'TIDE-Model')} "
-            f"v{self.get('schema_version', 1)}{SHOW_RESET}",
-            f"{SHOW_CYAN}{'=' * SHOW_SECTION_WIDTH}{SHOW_RESET}",
-        ]
-
-        if not simple:
-            lines.append(f"{SHOW_DIM}VALIDITY:{SHOW_RESET}")
-            for check, passed in self.get("checks", {}).items():
-                label = check.replace("_", " ")
-                if passed:
-                    result = f"{SHOW_GREEN}pass{SHOW_RESET}"
-                else:
-                    result = (
-                        f"{SHOW_YELLOW}not established{SHOW_RESET}"
-                    )
-                lines.append(f"  {label}: {result}")
-
-            direct_handoffs = self.direct_handoffs
-            reachability = self.reachability
-            lines.extend([
-                f"{SHOW_DIM}JUDGMENTS:{SHOW_RESET}",
-                f"  Direct handoffs: {len(direct_handoffs)}",
-            ])
-            if direct_handoffs:
-                for producer, state, consumer in direct_handoffs:
-                    lines.append(
-                        f"    {SHOW_WHITE}{producer}{SHOW_RESET} "
-                        f"--{SHOW_CYAN}{state}{SHOW_RESET}--> "
-                        f"{SHOW_WHITE}{consumer}{SHOW_RESET}"
-                    )
-            else:
-                lines.append(f"    {SHOW_DIM}none{SHOW_RESET}")
-
-            lines.append(f"  Reachability: {len(reachability)}")
-            if reachability:
-                for source, target in reachability:
-                    lines.append(
-                        f"    {SHOW_WHITE}{source}{SHOW_RESET} "
-                        f"\u2192 {SHOW_WHITE}{target}{SHOW_RESET}"
-                    )
-            else:
-                lines.append(f"    {SHOW_DIM}none{SHOW_RESET}")
-
-            lines.append(f"{SHOW_DIM}ERRORS:{SHOW_RESET}")
-            errors = self.get("errors", ())
-            if errors:
-                for error in errors:
-                    lines.append(f"  {SHOW_RED}{error}{SHOW_RESET}")
-            else:
-                lines.append(f"  {SHOW_DIM}none{SHOW_RESET}")
-
-        return _show_render(lines, color=color)
-
-
+import threading
 class _TIDEExecFacade:
     """Keep ``tide.exec(...)`` callable while also supporting ``with`` builds."""
-
     def __init__(self, tide, execute):
         self._tide = tide
         self._execute = execute
         self._context_tokens = []
         update_wrapper(self, execute)
-
     def __call__(self, *args, **kwargs):
         return self._execute(*args, **kwargs)
-
     def __enter__(self):
         token = current_pipeline_build.set([])
         self._context_tokens.append(token)
         return self
-
     def __exit__(self, exc_type, exc_value, traceback):
         token = self._context_tokens.pop()
         current_pipeline_build.reset(token)
         return False
-
-
 class TIDE:
     seq_id = -1
-    
+    event_seq_id = -1
+
+    @staticmethod
+    def generate_signing_keys():
+        """Generate an explicit Ed25519 Bundle signing key pair."""
+        from tide_tooling.tooling_core.bundling.TIDESigning import (
+            generate_signing_keys,
+        )
+
+        return generate_signing_keys()
+
     def __init__(
         self,
         default_store="global",
         timeout=None,
-        max_idle_attempts=400000,
-        track_unrepresented=True,
     ):
-        self.ocean = Ocean(
-            timeout=timeout,
-            max_idle_attempts=max_idle_attempts,
-            track_unrepresented=track_unrepresented,
-        )
+        self.ocean = Ocean(default_store=default_store, timeout=timeout)
         self._default_store = None
-        self.tide_exec_log = ExecutionLog(self.ocean.id)
-        self._event_capture = EventCapture(self.ocean, self.tide_exec_log)
-        self.event = self._event_capture.event
         self.set_default_store(default_store)
         # The facade preserves the existing call API and adds:
         # ``with tide.exec as execute: execute(node_graph)``.
         self.exec = _TIDEExecFacade(self, self.exec)
-
-    def close(self, wait=True):
-        """Release resources owned by this TIDE instance."""
-        self.ocean.close(wait=wait)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
-        return False
-
-    @staticmethod
-    def _validate_store_name(store):
-        if not isinstance(store, str) or not store.strip():
-            raise ValueError("default_store must be a non-empty string")
-        return store
-
-    def _ensure_store(self, store):
-        store = self._validate_store_name(store)
-        if not self.ocean.store_registry.exists(store):
-            self.ocean.register_store(
-                name=store,
-                store_class=MemoryKVStore,
-                scope="global",
-            )
-        return store
-
     @property
     def default_store(self):
         return self._default_store
-
     def set_default_store(self, store):
-        """Select and prepare the store used by unscoped TIDE references."""
-        store = self._ensure_store(store)
+        """Select the existing store used by unscoped TIDE references."""
+        if not isinstance(store, str) or not store.strip():
+            raise ValueError("Store name must be a non-empty string")
+        if not self.ocean.store_registry.exists(store, True) and not self.ocean.store_registry.exists(store):
+            raise MissingStoreError(f"Store {store!r} is not registered")
         self._default_store = store
-        self._event_capture.set_default_store(store)
-        self.tide_exec_log.fallback_store = store
+        self.ocean.default_store = store
         return self
-
-    @contextmanager
-    def _store_context(self, store=None):
-        selected_store = self._validate_store_name(store or self._default_store)
-        token = DataRef.set_default_store(selected_store)
-        try:
-            yield selected_store
-        finally:
-            DataRef.reset_default_store(token)
-        
-
     def _next_exec_record_seq_id(self):
         self.seq_id += 1
         return self.seq_id
-
-    def _is_preruntime_polling_record(self, record):
-        if record.producer_id.source_actor == "TIDE: Polling":
-            return True
-
-        for write in record.writes:
-            if write.cause == "TIDE: Pre-runtime Polling":
-                return True
-
-        return False
-    
+    @staticmethod
+    def _normalise_event_ref(reference):
+        # Event State identity uses the complete semantic reference.
+        reference = DataRef.from_string(reference, prefix=False)
+        return DataRef(
+            reference.key,
+            reference.store,
+            reference.count,
+            reference.max,
+            literal=reference.literal,
+        )
+    @staticmethod
+    def _event_effect_kind(effect):
+        if isinstance(effect, WRITE):
+            return Effects.WRITE
+        if isinstance(effect, DELETE):
+            return Effects.DELETE
+        if isinstance(effect, END):
+            return Effects.END
+        if isinstance(effect, RUN):
+            return Effects.RUN
+        raise TypeError(f"Unsupported TIDE event effect: {effect!r}")
+    @staticmethod
+    def _capture_event_effect(effect):
+        """Freeze Effect structure while retaining runtime value objects."""
+        captured = copy.copy(effect)
+        if isinstance(effect, WRITE):
+            captured.targets = tuple(
+                (copy.copy(reference), value)
+                for reference, value in effect.targets
+            )
+        elif hasattr(effect, "targets"):
+            targets = effect.targets
+            captured.targets = (
+                None
+                if targets is None
+                else tuple(copy.copy(target) for target in targets)
+            )
+        if isinstance(effect, RUN):
+            captured.local_store_templates = dict(
+                effect.local_store_templates
+            )
+        return captured
+    def _event_target_runner(self, reference):
+        store = self.ocean.store_router.get_store(reference.store)
+        return "*" if store.scope == "global" else store.parent_runner_id
+    def _event_exec_record(self, seq_id, actor, raw_reads, reads, writes, source, effects):
+        # Represent the exact values observed by this event.
+        raw = tuple(raw_reads)
+        normalised = tuple(reads)
+        resolved = tuple(reads.values())
+        input_record = InputUseRecord("args", raw, raw, normalised, resolved, [])
+        associated_input = ("args", input_record)
+        dependencies = []
+        for input_index, (reference, value) in enumerate(reads.items()):
+            ref_string = DataRef.to_string(reference, prefix=False)
+            read_snapshot = tide_snapshot_value(value, boundary="read")
+            dependencies.append(DependencyUseRecord(
+                associated_input=associated_input,
+                dep=reference,
+                type="static",
+                unscoped_ref=ref_string,
+                resolved_val=read_snapshot,
+                input_index=input_index,
+                input_path=(input_index,),
+                snapshot_lineage=[read_snapshot.to_dict()],
+            ))
+        input_record.dependencies = dependencies
+        actor_name = actor if isinstance(actor, str) else actor.__name__
+        func = "unknown" if isinstance(actor, str) else actor
+        record = ExecRecord(
+            seq_id=-1,
+            exec_id=create_tide_exec_uuid(),
+            ocean_id=self.ocean.id,
+            runner_id=source,
+            pipeline_id=f"TIDE: .event({actor_name}[{seq_id}])",
+            node_id="unknown",
+            func=func,
+            func_name=actor_name,
+            inputs=Inputs({"args": input_record}),
+            deps=dependencies,
+            effects=[],
+            declared_deps=list(reads),
+            declared_effects=list(effects),
+            declared_targets=list(writes),
+            runtime_effects=[],
+            runtime_targets=[],
+            unscoped_store_refs=[reference.store for reference in writes],
+            status=None,
+            started_at=None,
+            finished_at=None,
+            duration_ms=None,
+            error=None,
+            output_value=None,
+            writes=[],
+            emitted_nodes=[],
+            base_node_id=None,
+            base_node_content_id=None,
+            content_id=None,
+            node_options={},
+        )
+        return record
+    def event(
+        self,
+        actor: str | Callable,
+        reads: dict | list | str | None = None,
+        writes: dict | None = None,
+        source: str | None = None,
+        cause: str | None = None,
+        effects=None,
+        return_id: bool = False,
+    ):
+        """Record one observed occurrence in this Ocean's Event stream."""
+        reads = {} if reads is None else reads
+        supplied_reads = isinstance(reads, dict)
+        if not isinstance(reads, (list, dict)):
+            reads = [reads]
+        reads = dict(reads) if supplied_reads else tuple(reads)
+        writes = {} if writes is None else writes
+        if not isinstance(writes, dict):
+            raise TypeError(
+                "tide.event writes must be a dict mapping references to "
+                f"values, got {type(writes).__name__}"
+            )
+        writes = dict(writes)
+        source = "TIDE: .event()" if source is None else source
+        cause = "unknown" if cause is None else cause
+        if effects is None:
+            effects = []
+        elif isinstance(effects, Effect):
+            effects = [effects]
+        elif isinstance(effects, (list, tuple, set)):
+            effects = list(effects)
+        else:
+            raise TypeError(
+                "tide.event effects must be an Effect or an iterable of Effects"
+            )
+        if any(not isinstance(effect, Effect) for effect in effects):
+            raise TypeError("tide.event effects must contain only Effect objects")
+        if any(isinstance(effect, RAISE) for effect in effects):
+            raise TypeError(
+                "RAISE is execution control and cannot be a declared event Effect"
+            )
+        for effect in effects:
+            self._event_effect_kind(effect)
+        effects = tuple(effects)
+        default_store = self._default_store
+        return self.ocean._coordinate_tide_event(lambda: self._apply_event_request(
+            actor=actor,
+            reads=reads,
+            supplied_reads=supplied_reads,
+            writes=writes,
+            source=source,
+            cause=cause,
+            effects=effects,
+            return_id=return_id,
+            default_store=default_store,
+        ))
+    def _apply_event_request(
+        self,
+        *,
+        actor,
+        reads,
+        supplied_reads,
+        writes,
+        source,
+        cause,
+        effects,
+        return_id,
+        default_store,
+    ):
+        """Apply one complete public Event operation under scheduler ownership."""
+        seq_id = self.event_seq_id + 1
+        self.event_seq_id = seq_id
+        raw_reads = tuple(reads)
+        effects = tuple(
+            self._capture_event_effect(effect)
+            for effect in effects
+        )
+        writes = dict(writes)
+        for effect in effects:
+            if isinstance(effect, WRITE):
+                for target, value in effect.targets:
+                    writes.setdefault(target, value)
+        token = DataRef.set_default_store(default_store)
+        try:
+            # Resolve existing reads or accept explicitly observed values.
+            if not supplied_reads:
+                observed_reads = {}
+                for reference in reads:
+                    reference = self._normalise_event_ref(reference)
+                    if not self.ocean.store_router.exists(reference.store, reference.key):
+                        raise RuntimeError(
+                            f"[ERROR] ref {reference} from .event({actor}) was not available"
+                        )
+                    observed_reads[reference] = self.ocean.store_router.get(reference.store, reference.key)
+            else:
+                observed_reads = {
+                    self._normalise_event_ref(reference): value
+                    for reference, value in reads.items()
+                }
+            normalised_writes = {
+                self._normalise_event_ref(reference): value
+                for reference, value in writes.items()
+            }
+            if (
+                threading.get_ident()
+                == self.ocean._scheduler_owner_thread_id
+            ):
+                # Record the event execution before its effects and writes.
+                exec_record = self._event_exec_record(seq_id, actor, raw_reads, observed_reads, normalised_writes, source, effects)
+                exec_event = Event(
+                    ocean_id=self.ocean.id,
+                    source="TIDE: .event()",
+                    source_id=str(actor),
+                    type=LogEvents.EVENT_EXEC,
+                    cause=Cause(description=cause),
+                    payload=exec_record,
+                    exec_id=exec_record.exec_id,
+                )
+                self.ocean._route_scheduler_consequence(exec_event)
+                # Preserve declared Effect occurrences exactly as observed.
+                for effect in effects:
+                    kind = self._event_effect_kind(effect)
+                    raw_targets = getattr(effect, "targets", None)
+                    targets = (raw_targets,) if raw_targets is None or not isinstance(raw_targets, (list, tuple, set)) else tuple(raw_targets)
+                    found = None
+                    if kind == Effects.DELETE:
+                        outcomes = []
+                        for target in targets:
+                            if target is None:
+                                outcomes.append(False)
+                                continue
+                            reference = self._normalise_event_ref(target)
+                            removed = self.ocean.store_router.get_store(reference.store).pop(reference.key)
+                            outcomes.append(not isinstance(removed, __fallback__))
+                        found = tuple(outcomes)
+                    self.ocean._route_scheduler_consequence(Event(
+                        ocean_id=self.ocean.id,
+                        source="TIDE: .event()",
+                        source_id=str(actor),
+                        type=LogEvents.EFFECT,
+                        cause=Cause.from_event(exec_event),
+                        payload=EffectOccurrence(kind, targets, getattr(effect, "output", __fallback__()), "declared", False, found),
+                        exec_id=exec_record.exec_id,
+                    ))
+                # Write the observed values and record their State consequences.
+                for reference, value in normalised_writes.items():
+                    if (
+                        not self.ocean.store_registry.exists(reference.store)
+                        and not self.ocean.store_registry.exists(
+                            reference.store,
+                            template=True,
+                        )
+                    ):
+                        self.ocean._register_store(reference.store)
+                    update = self.ocean.store_router.set(reference.store, reference.key, value, force=True)
+                    self.ocean._route_scheduler_consequence(Event(
+                        ocean_id=self.ocean.id,
+                        source="store_router",
+                        source_id=self.ocean.store_router.id,
+                        type=PipelineEvents.DEP_UPDATED if update else PipelineEvents.DEP_AVAILABLE,
+                        cause=Cause.from_event(exec_event),
+                        target_runner_id=self._event_target_runner(reference),
+                        payload=State(
+                            reference,
+                            value,
+                            tide_snapshot_value(value, boundary="write"),
+                            value_type=type(value),
+                        ),
+                        exec_id=exec_record.exec_id,
+                    ))
+                self.ocean._wake_event.set()
+            else:
+                raise RuntimeError(
+                    "TIDE Event requests require Ocean scheduler ownership"
+                )
+        finally:
+            DataRef.reset_default_store(token)
+        if return_id:
+            return seq_id
     def register_store(self, name:str=None, store_class=MemoryKVStore, scope:str="global", store_template:Any=None):
         return self.ocean.register_store(name=name, store_class=store_class, scope=scope, store_template=store_template)
-
     def exec(
         self,
         func: Callable | Node,
@@ -314,17 +429,21 @@ class TIDE:
         k_kwargs: dict | None = None,
         effects=None,
         return_id: bool = False,
+        return_trace: bool = False
     ):
         """Execute one callable and optionally write its returned outputs.
-
         ``writes`` names the reference or ordered references that receive the
         callable's returned output. It does not accept a reference-to-value
         dictionary. Pass supplied values to ``TIDE.event(..., writes={...})``;
         use a ``WRITE`` effect for an additional write emitted while the
         callable runs.
         """
-        selected_store = self._ensure_store(default_store or self._default_store)
-        with self._store_context(selected_store):
+        selected_store = default_store or self._default_store
+        if not isinstance(selected_store, str) or not selected_store.strip():
+            raise ValueError("Store name must be a non-empty string")
+        self.ocean.store_router.get_store(selected_store)
+        token = DataRef.set_default_store(selected_store)
+        try:
             return self._exec(
                 func,
                 args=args,
@@ -338,8 +457,10 @@ class TIDE:
                 k_kwargs=k_kwargs,
                 effects=effects,
                 return_id=return_id,
+                return_trace=return_trace
             )
-
+        finally:
+            DataRef.reset_default_store(token)
     def _exec(
         self,
         func: Callable | Node,
@@ -354,9 +475,18 @@ class TIDE:
         k_kwargs: dict | None = None,
         effects=None,
         return_id: bool = False,
+        return_trace: bool = False
     ):
+        node_options = {}
         if isinstance(func, Node):
             node_definition = func
+            node_options = {
+                "node_name": node_definition.node_name,
+                "force_update": node_definition.force_update,
+                "one_shot": True, # node_definition.one_shot,
+                "unpack": node_definition.unpack,
+                "share_implicit_target": node_definition.share_implicit_target,
+            }
             func = node_definition.func
             if reads is None:
                 args = node_definition.args.raw if args is None else args
@@ -367,21 +497,17 @@ class TIDE:
             k_kwargs = node_definition.k_kwargs.raw if k_kwargs is None else k_kwargs
             effects = node_definition.effects if effects is None else effects
             if writes is None:
-                writes = [DataRef.to_string(target, strip_leading=True) for target in node_definition.targets]
+                writes = [DataRef.to_string(target, prefix=False) for target in node_definition.targets]
         elif getattr(func, "__tide_node_wrapper__", False):
             if effects is None:
                 effects = getattr(func, "__tide_node_effects__", None)
             func = func.__tide_node_func__
-
         if reads is not None and args is not None or reads is not None and kwargs is not None:
             raise AttributeError("Cannot use both reads and args/kwargs for one object")
-        
         if reads is not None and not isinstance(reads, (list, tuple)):
             reads = [reads]
-
         if reads is not None:
             args = ["@" + ref for ref in reads]
-
         if not isinstance(func, Callable):
             raise RuntimeError(f"tide.exec() was called with a non callable func! the suspect - {type(func)}")
         seq_id = self._next_exec_record_seq_id() # tick event seq_id
@@ -397,7 +523,6 @@ class TIDE:
         if not isinstance(writes, (list, tuple)):
             writes = [writes]
         writes_with_store = []
-
         if not isinstance(args, (list, tuple)):
             args = (args, )
         # for arg in args :
@@ -419,113 +544,20 @@ class TIDE:
                 writes_with_store.append(f"{default_store}:{str_ref}")
             else:
                 writes_with_store.append(str_ref)
-            
-        tide_node = Node(func, args=args, kwargs=kwargs, p_args=p_args, p_kwargs=p_kwargs, k_args=k_args, k_kwargs=k_kwargs, targets=writes_with_store, effects=effects)
-        
-        try:
-            node_trace, exec_record, output = self.ocean.run_node(
-                tide_node,
-                pipeline_name=f"TIDE: .exec({tide_node.node_name}[{seq_id}])",
-                overload_runner_source=f"TIDE: .exec({seq_id})",
-                show=False
-                )
-        except PipelineDeadlockError as error:
-            failed_trace = getattr(error, "tide_trace", None)
-            if failed_trace is not None:
-                self._event_capture.events.extend(failed_trace.events)
-            wrapped_error = NoExecRecordError(
-                f"{func.__name__} did not execute because its dependencies "
-                "could not be resolved"
-            )
-            if failed_trace is not None:
-                wrapped_error.tide_trace = failed_trace
-            raise wrapped_error from error
-        
-        self._event_capture.events.extend(node_trace.events)
-
-        if not exec_record:
-            raise NoExecRecordError(
-                f"{func.__name__} did not execute or has no exec_record!"
-            )
-
-        if self.ocean.thread:
-            self.ocean.thread.join()
-
-        imported_records = [
-            record
-            for record in node_trace.exec_log
-            if record.exec_id not in self._event_capture.exec_log.exec_id_to_log
-        ]
-
-        polling_records = [
-            record
-            for record in imported_records
-            if self._is_preruntime_polling_record(record)
-        ]
-
-        normal_records = [
-            record
-            for record in imported_records
-            if not self._is_preruntime_polling_record(record)
-        ]
-        
-        debug_print("\n--- IMPORT PARTITION ---")
-
-        for imported_record in [*polling_records, *normal_records]:
-            # print(
-            #     "[BEFORE LOG]",
-            #     "actor=", imported_record.producer_id.source_actor,
-            #     "old_seq=", imported_record.seq_id,
-            #     "writes=", [(w.stored_target, w.cause) for w in imported_record.writes],
-            # )
-
-       
-            imported_record = self._event_capture.exec_log._log_exec_event(imported_record)
-
-            # print(
-            #     "[AFTER LOG]",
-            #     "actor=", imported_record.producer_id.source_actor,
-            #     "new_seq=", imported_record.seq_id,
-            #     "writes=", [(w.stored_target, w.cause) for w in imported_record.writes],
-            # )
-            
-            # print("[CAPTURE IDS]", [(
-            #     r.seq_id,
-            #     r.exec_id,
-            #     r.producer_id.source_actor,
-            #     [(w.stored_target, w.cause) for w in r.writes],
-            #     )
-            #     for r in self._event_capture.exec_log.exec_log
-            #     ])
-
-
-            self._event_capture.events.append(imported_record)
-            self._event_capture.exec_log.exec_log.append(imported_record)
-
-            
-            # print("[IMPORTED IDS]", [(
-            #     r.seq_id,
-            #     r.exec_id,
-            #     r.producer_id.source_actor,
-            #     [(w.stored_target, w.cause) for w in r.writes],
-            #     r.exec_id in self._event_capture.exec_log.exec_id_to_log,
-            #     )
-            #     for r in node_trace.exec_log
-            #     ])
-
-            # print(
-            #     "[CAPTURE STATE AFTER APPEND]",
-            #     "len=", len(self._event_capture.exec_log.exec_log),
-            #     "seqs=", [
-            #         (r.seq_id, r.producer_id.source_actor)
-            #         for r in self._event_capture.exec_log.exec_log
-            #     ],
-            # )
-
+        tide_node = Node(func, args=args, kwargs=kwargs, p_args=p_args, p_kwargs=p_kwargs, k_args=k_args, k_kwargs=k_kwargs, targets=writes_with_store, effects=effects, **node_options)
+        if return_trace:
+            return self.ocean.run_node(
+            tide_node,
+            mode="sequential",
+            return_trace=True,
+        )
+        output = self.ocean.run_node(
+            tide_node,
+            mode="sequential",
+        )
         if return_id:
             return (output, seq_id)
         return output
-
     def declare(self, ref, value, return_id=False):
         """Declare a user-owned value into the current default store."""
         return self.event(
@@ -534,14 +566,30 @@ class TIDE:
             cause="declared",
             return_id=return_id,
         )
+    def trace(self, name: str = None) -> Trace:
+        """Construct one Trace from this Ocean's frozen Event evidence."""
+        with self.ocean._tick_lock:
+            event_log = self.ocean.event_logger.freeze()
 
-
-
-    def trace(self, name:str=None) -> Trace:
-        if name is None:
-            name = "TIDE: .trace()"
-        return self._event_capture.trace(name)
-
+        return trace_from_event_log(
+            event_log,
+            ocean_id=self.ocean.id,
+            pipelines={
+                pipeline_id: pipeline
+                for pipeline_id, (pipeline, _) in self.ocean.pipelines.items()
+            },
+            name=name or "TIDE: .trace()",
+        )
+    @classmethod
+    def now(cls, script, *script_args, project_dir=None) -> Trace:
+        """Run a Python script under noWorkflow and return its TIDE projection."""
+        from tide_tooling.TIDEAdapters import NOWAdapter
+        return NOWAdapter.capture(script, *script_args, project_dir=project_dir)
+    @classmethod
+    def from_now(cls, project_dir, *, trial=None) -> Trace:
+        """Project an existing noWorkflow project or Trial."""
+        from tide_tooling.TIDEAdapters import NOWAdapter
+        return NOWAdapter(project_dir, trial=trial).to_trace()
     @classmethod
     def from_model(
         cls,
@@ -549,1058 +597,48 @@ class TIDE:
         *,
         host=None,
         name="TIDE: .from_model()",
-        identity_mode="host",
-        assign_unknown=False,
+        identity_mode="literal"
     ) -> Trace:
-        """Project a semantically valid ``K = (E, S, I, O)`` into a Trace.
-
-        By default, imported ExecRecords retain each host-supplied Execution
-        identifier exactly. ``identity_mode="structural"`` instead gives the
-        Trace deterministic occurrence aliases for local comparison; those
-        aliases are a view and do not assert cross-host correspondence.
-
-        ``state_id`` is the interoperable State identity. Internal TIDE
-        references use that exact identifier beneath the ``__model__`` scope
-        so host identity remains visible and correlatable on the ordinary
-        Trace query surface. The scope is a tool projection and is not part of
-        the model contract. Producerless States are invalid by default.
-        ``assign_unknown=True`` warns and creates a tool-side ``unknown``
-        producer without asserting that the host supplied that provenance.
-        """
-        if identity_mode == "canonical":
-            identity_mode = "structural"
-        if identity_mode not in {"host", "structural"}:
-            raise ValueError(
-                "identity_mode must be 'host' or 'structural'"
-            )
-        if not isinstance(assign_unknown, bool):
-            raise TypeError("assign_unknown must be a bool")
-        if not isinstance(model, dict):
-            received = type(model).__name__
-            trace_guidance = (
-                ". Call trace.to_model(...) if a model document is required"
-                if isinstance(model, Trace)
-                else ""
-            )
-            raise TypeError(
-                "TIDE.from_model() requires a dict containing E, S, I and O; "
-                f"received {received}{trace_guidance}"
-            )
-
-        model_document = model
-        normalised, report = cls._normalise_model_document(
-            model_document,
+        """Project a structurally valid TIDE Model into a Trace."""
+        return TIDEModel.to_trace(
+            model,
             host=host,
+            name=name,
+            identity_mode=identity_mode,
         )
-        assigned_unknown_states = ()
-        if (
-            not report["semantically_valid"]
-            and assign_unknown
-            and any(
-                "has no represented producer" in error
-                for error in report["errors"]
-            )
-        ):
-            repaired_model, assigned_unknown_states = (
-                cls._model_assign_unknown_producer(model_document)
-            )
-            model_document = repaired_model
-            normalised, report = cls._normalise_model_document(
-                model_document,
-                host=host,
-            )
-            if report["semantically_valid"]:
-                warnings.warn(
-                    "TIDE Model States have no represented producer: "
-                    + ", ".join(repr(state) for state in assigned_unknown_states)
-                    + ". assign_unknown=True introduced the tool-side "
-                    "Execution 'unknown'; this does not establish host "
-                    "provenance or make the original model semantically valid.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        if not report["semantically_valid"]:
-            suggestion = (
-                "; pass assign_unknown=True only if a tool-side unknown "
-                "producer is acceptable"
-                if any(
-                    "has no represented producer" in error
-                    for error in report["errors"]
-                )
-                else ""
-            )
-            raise ValueError(
-                "TIDE Model semantic validity failed: "
-                + "; ".join(report["errors"])
-                + suggestion
-            )
-
-        if identity_mode == "structural":
-            from tide_tooling.tooling_core.engine.tide_model import _canonical_tide_structure
-
-            model_document, identity_maps = _canonical_tide_structure(
-                model_document,
-                return_identity_maps=True,
-            )
-            assigned_unknown_states = tuple(
-                identity_maps["states"][(type(state_id), state_id)]
-                for state_id in assigned_unknown_states
-            )
-            normalised, report = cls._normalise_model_document(
-                model_document,
-                host=host,
-            )
-            if not report["semantically_valid"]:
-                raise ValueError(
-                    "TIDE structural model semantic validity failed: "
-                    + "; ".join(report["errors"])
-                )
-
-        tide = cls()
-        try:
-            return tide._trace_from_model(
-                normalised,
-                name=name,
-                identity_mode=identity_mode,
-                assigned_unknown_states=assigned_unknown_states,
-            )
-        finally:
-            tide.close()
-
     @classmethod
-    def validate_model(cls, model, *, host=None):
-        """Return structural and semantic validity for a TIDE Model."""
-        _, report = cls._normalise_model_document(model, host=host)
-        return report
-
+    def from_openlineage(cls, events, **from_model_options) -> Trace:
+        """Project OpenLineage RunEvents through the TIDE Model boundary."""
+        from tide_tooling.TIDEAdapters import OpenLineageAdapter
+        return OpenLineageAdapter(events).to_trace(**from_model_options)
+    @classmethod
+    def from_opentelemetry(cls, spans) -> Trace:
+        """Project OpenTelemetry Spans through the TIDE Model boundary."""
+        from tide_tooling.TIDEAdapters import OpenTelemetryAdapter
+        return OpenTelemetryAdapter(spans).to_trace()
+    @classmethod
+    def from_openinference(cls, spans) -> Trace:
+        """Project OpenInference Spans through the TIDE Model boundary."""
+        from tide_tooling.TIDEAdapters import OpenInferenceAdapter
+        return OpenInferenceAdapter(spans).to_trace()
     def to_model(
         self,
         *,
-        host=None,
-        include_metadata=False,
-        include_values=False,
-        include_hashes=True,
+        override_host_as=None,
+        enrich=True,
         incidence_format="explicit",
-        identity_mode="host",
-        assign_unknown=False,
+        identity_mode="literal",
     ):
         """Export this instance's Trace as the interoperable TIDE Model."""
         return self.trace().to_model(
-            host=host,
-            include_metadata=include_metadata,
-            include_values=include_values,
-            include_hashes=include_hashes,
+            override_host_as=override_host_as,
+            enrich=enrich,
             incidence_format=incidence_format,
             identity_mode=identity_mode,
-            assign_unknown=assign_unknown,
         )
-
-    def comparator(self, target, *, execution_map, state_map):
-        """Compare this TIDE Trace under explicit identity maps."""
-        from tide_tooling.comparator import comparator
-
-        return comparator(
-            self.trace(),
-            target,
-            execution_map=execution_map,
-            state_map=state_map,
-        )
-
     @classmethod
-    def _model_assign_unknown_producer(cls, model):
-        """Return a copied model with missing producers assigned to ``unknown``."""
-        repaired = copy.deepcopy(model)
-        inputs = cls._model_list(repaired["I"], "I")
-        outputs = cls._model_list(repaired["O"], "O")
-
-        represented_states = {
-            (type(state_id), state_id): state_id
-            for state_id in cls._normalise_model_carrier(
-                repaired["S"],
-                "S",
-            )
-        }
-
-        produced_state_keys = set()
-        for index, entry in enumerate(outputs):
-            _, state_id = cls._model_incidence_pair(entry, "O", index)
-            state_id = cls._model_identifier(
-                state_id,
-                f"O[{index}].state",
-            )
-            produced_state_keys.add((type(state_id), state_id))
-
-        missing_states = tuple(
-            represented_states[key]
-            for key in sorted(
-                represented_states.keys() - produced_state_keys,
-                key=lambda item: cls._model_identity_sort_key(item[1]),
-            )
-        )
-        if not missing_states:
-            return repaired, ()
-
-        represented_executions = cls._normalise_model_carrier(
-            repaired["E"],
-            "E",
-        )
-        if any(
-            type(exec_id) is str and exec_id == "unknown"
-            for exec_id in represented_executions
-        ):
-            raise ValueError(
-                "assign_unknown cannot infer producers because the model "
-                "already represents an Execution with ID 'unknown'"
-            )
-        outputs.extend(
-            {"exec_id": "unknown", "state_id": state_id}
-            for state_id in missing_states
-        )
-        executions = cls._model_list(repaired["E"], "E")
-        executions.append("unknown")
-        repaired["E"] = executions
-        repaired["O"] = outputs
-        return repaired, missing_states
-
-    @staticmethod
-    def _model_identifier(value, location):
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"{location} must be a non-empty string")
-        return value
-
-    @staticmethod
-    def _model_list(value, location):
-        if not isinstance(value, (list, tuple)):
-            raise TypeError(f"{location} must be a list")
-        return list(value)
-
-    @staticmethod
-    def _model_identity_sort_key(value):
-        return type(value).__name__, repr(value)
-
-    @staticmethod
-    def _model_incidence_pair(entry, relation, index):
-        if isinstance(entry, dict):
-            has_explicit_key = (
-                "exec_id" in entry or "state_id" in entry
-            )
-            has_compact_key = "e" in entry or "s" in entry
-            if has_explicit_key and has_compact_key:
-                raise TypeError(
-                    f"{relation}[{index}] cannot mix compact "
-                    "{e, s} and explicit "
-                    "{exec_id, state_id} incidence keys"
-                )
-            if "exec_id" in entry and "state_id" in entry:
-                return entry["exec_id"], entry["state_id"]
-            if "e" in entry and "s" in entry:
-                return entry["e"], entry["s"]
-            raise TypeError(
-                f"{relation}[{index}] must contain either "
-                "{e, s} or {exec_id, state_id}"
-            )
-        if isinstance(entry, (list, tuple)) and len(entry) == 2:
-            return entry[0], entry[1]
-        raise TypeError(
-            f"{relation}[{index}] must be "
-            "{e, s}, {exec_id, state_id}, or [e, s]"
-        )
-
-    @classmethod
-    def _normalise_model_incidence(cls, entries, relation):
-        incidence_by_key = {}
-        for index, entry in enumerate(entries):
-            exec_id, state_id = cls._model_incidence_pair(
-                entry,
-                relation,
-                index,
-            )
-            exec_id = cls._model_identifier(
-                exec_id,
-                f"{relation}[{index}].execution",
-            )
-            state_id = cls._model_identifier(
-                state_id,
-                f"{relation}[{index}].state",
-            )
-            key = (
-                (type(exec_id), exec_id),
-                (type(state_id), state_id),
-            )
-            incidence_by_key.setdefault(key, (exec_id, state_id))
-
-        return sorted(
-            incidence_by_key.values(),
-            key=lambda edge: (
-                cls._model_identity_sort_key(edge[0]),
-                cls._model_identity_sort_key(edge[1]),
-            ),
-        )
-
-    @classmethod
-    def _normalise_model_carrier(cls, entries, field):
-        entries = cls._model_list(entries, field)
-        identities = {}
-        for index, entry in enumerate(entries):
-            identity = cls._model_identifier(entry, f"{field}[{index}]")
-            identities.setdefault((type(identity), identity), identity)
-        return sorted(
-            identities.values(),
-            key=cls._model_identity_sort_key,
-        )
-
-    @staticmethod
-    def _model_enrichments(value, location):
-        if value is None:
-            return {}
-        if not isinstance(value, dict):
-            raise TypeError(f"{location} must be a dict keyed by model ID")
-
-        enrichments = {}
-        for identity, enrichment in value.items():
-            if enrichment is None:
-                enrichment = {}
-            if not isinstance(enrichment, dict):
-                raise TypeError(
-                    f"{location}[{identity!r}] must be a dict"
-                )
-            enrichments[identity] = dict(enrichment)
-        return enrichments
-
-    @classmethod
-    def _normalise_model_document(cls, model, *, host=None):
-        report = TIDEModelReport({
-            "structurally_valid": False,
-            "semantically_valid": False,
-            "schema": "TIDE-Model",
-            "schema_version": 1,
-            "host": host,
-            "checks": {
-                "kernel_shape": False,
-                "identity": False,
-                "incidence": False,
-                "unique_creation": False,
-                "acyclic_ancestry": False,
-            },
-            "counts": {
-                "executions": 0,
-                "states": 0,
-                "inputs": 0,
-                "outputs": 0,
-                "direct_handoffs": 0,
-                "reachability": 0,
-            },
-            "judgments": {
-                "direct_handoffs": [],
-                "reachability": [],
-            },
-            "errors": [],
-        })
-
-        if not isinstance(model, dict):
-            report["errors"].append(
-                "model must be a dict containing E, S, I and O"
-            )
-            return None, report
-
-        missing_fields = [
-            field_name
-            for field_name in ("E", "S", "I", "O")
-            if field_name not in model
-        ]
-        if missing_fields:
-            report["errors"].append(
-                "kernel_shape: missing " + ", ".join(missing_fields)
-            )
-            return None, report
-
-        schema = model.get("schema", "TIDE-Model")
-        schema_version = model.get("schema_version", 1)
-        model_host = model.get("host")
-        if schema != "TIDE-Model":
-            report["errors"].append(
-                f"kernel_shape: unsupported schema {schema!r}"
-            )
-        if (
-            isinstance(schema_version, bool)
-            or not isinstance(schema_version, int)
-            or schema_version != 1
-        ):
-            report["errors"].append(
-                f"kernel_shape: unsupported schema_version {schema_version!r}"
-            )
-        if host is not None and model_host is not None and host != model_host:
-            report["errors"].append(
-                "kernel_shape: host argument conflicts with model host"
-            )
-        selected_host = host if host is not None else model_host
-        if selected_host is not None and (
-            not isinstance(selected_host, str) or not selected_host.strip()
-        ):
-            report["errors"].append(
-                "kernel_shape: host must be a non-empty string"
-            )
-        report["host"] = selected_host
-
-        host_record = model.get("host_record")
-        if host_record is not None:
-            try:
-                host_record = snapshot_json_dict(
-                    host_record,
-                    location="host_record",
-                )
-            except (TypeError, ValueError) as error:
-                report["errors"].append(f"kernel_shape: {error}")
-
-        try:
-            execution_ids = cls._normalise_model_carrier(model["E"], "E")
-            state_ids = cls._normalise_model_carrier(model["S"], "S")
-            raw_inputs = cls._model_list(model["I"], "I")
-            raw_outputs = cls._model_list(model["O"], "O")
-            execution_enrichments = cls._model_enrichments(
-                model.get("executions"),
-                "executions",
-            )
-            state_enrichments = cls._model_enrichments(
-                model.get("states"),
-                "states",
-            )
-        except (TypeError, ValueError) as error:
-            report["errors"].append(f"kernel_shape: {error}")
-            return None, report
-
-        if report["errors"]:
-            return None, report
-        report["checks"]["kernel_shape"] = True
-
-        try:
-            inputs = cls._normalise_model_incidence(raw_inputs, "I")
-            outputs = cls._normalise_model_incidence(raw_outputs, "O")
-        except (TypeError, ValueError) as error:
-            report["errors"].append(f"incidence: {error}")
-            return None, report
-
-        report["counts"]["inputs"] = len(inputs)
-        report["counts"]["outputs"] = len(outputs)
-
-        execution_keys = {
-            (type(exec_id), exec_id)
-            for exec_id in execution_ids
-        }
-        state_keys = {
-            (type(state_id), state_id)
-            for state_id in state_ids
-        }
-        for relation, incidence in (("I", inputs), ("O", outputs)):
-            for exec_id, state_id in incidence:
-                if (type(exec_id), exec_id) not in execution_keys:
-                    report["errors"].append(
-                        f"incidence: {relation} references Execution "
-                        f"{exec_id!r} outside E"
-                    )
-                if (type(state_id), state_id) not in state_keys:
-                    report["errors"].append(
-                        f"incidence: {relation} references State "
-                        f"{state_id!r} outside S"
-                    )
-        if report["errors"]:
-            return None, report
-        report["checks"]["incidence"] = True
-
-        executions = []
-        execution_by_id = {}
-        states = []
-        state_by_id = {}
-
-        try:
-            for index, exec_id in enumerate(execution_ids):
-                source = dict(execution_enrichments.get(exec_id, {}))
-                source["exec_id"] = exec_id
-                execution = {
-                    "exec_id": exec_id,
-                    "source": source,
-                    "occurrence": index,
-                }
-                actor = source.get("actor")
-                if isinstance(actor, dict):
-                    actor = actor.get("name", actor.get("actor"))
-                if actor is not None and (
-                    not isinstance(actor, str) or not actor
-                ):
-                    raise ValueError(
-                        f"executions[{exec_id!r}].actor must have a "
-                        "non-empty name"
-                    )
-                executions.append(execution)
-                execution_by_id[exec_id] = execution
-
-            for index, state_id in enumerate(state_ids):
-                source = dict(state_enrichments.get(state_id, {}))
-                source["state_id"] = state_id
-                value = source.get("value", __TIDE_TEMPLATE_VALUE__())
-                value_hash = source.get("value_hash")
-                if value_hash is not None:
-                    hash_prefix = "sha3_512_tide:"
-                    hash_body = (
-                        value_hash[len(hash_prefix):]
-                        if isinstance(value_hash, str)
-                        and value_hash.startswith(hash_prefix)
-                        else ""
-                    )
-                    if (
-                        len(hash_body) != 128
-                        or any(
-                            character not in "0123456789abcdef"
-                            for character in hash_body
-                        )
-                    ):
-                        raise ValueError(
-                            f"states[{state_id!r}].value_hash must be a "
-                            "SHA3-512 TIDE hash"
-                        )
-                if not isinstance(value, __TIDE_TEMPLATE_VALUE__):
-                    computed_hash = tide_value_hasher(value)
-                    if value_hash is not None and value_hash != computed_hash:
-                        raise ValueError(
-                            f"State {state_id!r} value does not match value_hash"
-                        )
-                    value_hash = computed_hash
-                state = {
-                    "state_id": state_id,
-                    "source": source,
-                    "occurrence": index,
-                    "value": value,
-                    "value_hash": value_hash,
-                }
-                states.append(state)
-                state_by_id[state_id] = state
-
-            unknown_exec_enrichments = [
-                exec_id
-                for exec_id in execution_enrichments
-                if exec_id not in execution_by_id
-            ]
-            if unknown_exec_enrichments:
-                raise ValueError(
-                    "executions enrichment references unknown exec_id "
-                    f"{unknown_exec_enrichments[0]!r}"
-                )
-
-            unknown_state_enrichments = [
-                state_id
-                for state_id in state_enrichments
-                if state_id not in state_by_id
-            ]
-            if unknown_state_enrichments:
-                raise ValueError(
-                    "states enrichment references unknown state_id "
-                    f"{unknown_state_enrichments[0]!r}"
-                )
-        except (TypeError, ValueError) as error:
-            report["errors"].append(f"identity: {error}")
-            return None, report
-
-        report["checks"]["identity"] = True
-        report["structurally_valid"] = True
-        report["counts"]["executions"] = len(executions)
-        report["counts"]["states"] = len(states)
-
-        producers_by_state = defaultdict(set)
-        for exec_id, state_id in outputs:
-            producers_by_state[state_id].add(exec_id)
-
-        for state_id in state_ids:
-            producers = sorted(
-                producers_by_state[state_id],
-                key=cls._model_identity_sort_key,
-            )
-            if not producers:
-                report["errors"].append(
-                    "unique_creation: State "
-                    f"{state_id!r} has no represented producer in O"
-                )
-            elif len(producers) > 1:
-                report["errors"].append(
-                    "unique_creation: State "
-                    f"{state_id!r} has multiple represented producers "
-                    f"{producers!r}"
-                )
-        report["checks"]["unique_creation"] = not any(
-            error.startswith("unique_creation:")
-            for error in report["errors"]
-        )
-
-        adjacency = {execution["exec_id"]: set() for execution in executions}
-        indegree = {execution["exec_id"]: 0 for execution in executions}
-        direct_handoffs = []
-        for consumer_exec_id, state_id in inputs:
-            for producer_exec_id in sorted(
-                producers_by_state[state_id],
-                key=cls._model_identity_sort_key,
-            ):
-                direct_handoffs.append({
-                    "producer_exec_id": producer_exec_id,
-                    "state_id": state_id,
-                    "consumer_exec_id": consumer_exec_id,
-                })
-                if consumer_exec_id not in adjacency[producer_exec_id]:
-                    adjacency[producer_exec_id].add(consumer_exec_id)
-                    indegree[consumer_exec_id] += 1
-
-        ready = [
-            execution["exec_id"]
-            for execution in executions
-            if indegree[execution["exec_id"]] == 0
-        ]
-        topological_execution_ids = []
-        while ready:
-            ready.sort(
-                key=cls._model_identity_sort_key,
-                reverse=True,
-            )
-            exec_id = ready.pop()
-            topological_execution_ids.append(exec_id)
-            for consumer_exec_id in sorted(
-                adjacency[exec_id],
-                key=cls._model_identity_sort_key,
-            ):
-                indegree[consumer_exec_id] -= 1
-                if indegree[consumer_exec_id] == 0:
-                    ready.append(consumer_exec_id)
-
-        reachability = []
-        execution_ids = [
-            execution["exec_id"]
-            for execution in executions
-        ]
-        for source_exec_id in execution_ids:
-            reachable = set()
-            pending = list(adjacency[source_exec_id])
-            while pending:
-                target_exec_id = pending.pop()
-                if target_exec_id in reachable:
-                    continue
-                reachable.add(target_exec_id)
-                pending.extend(adjacency[target_exec_id])
-
-            for target_exec_id in execution_ids:
-                if target_exec_id in reachable:
-                    reachability.append({
-                        "source_exec_id": source_exec_id,
-                        "target_exec_id": target_exec_id,
-                    })
-
-        cyclic_execution_ids = [
-            judgment["source_exec_id"]
-            for judgment in reachability
-            if judgment["source_exec_id"] == judgment["target_exec_id"]
-        ]
-        if cyclic_execution_ids:
-            report["errors"].append(
-                "acyclic_ancestry: Executions reach themselves "
-                f"{cyclic_execution_ids!r}"
-            )
-        report["checks"]["acyclic_ancestry"] = not cyclic_execution_ids
-        report["judgments"]["direct_handoffs"] = direct_handoffs
-        report["judgments"]["reachability"] = reachability
-        report["counts"]["direct_handoffs"] = len(direct_handoffs)
-        report["counts"]["reachability"] = len(reachability)
-        report["semantically_valid"] = (
-            report["checks"]["unique_creation"]
-            and report["checks"]["acyclic_ancestry"]
-        )
-
-        inputs_by_exec = defaultdict(list)
-        outputs_by_exec = defaultdict(list)
-        for exec_id, state_id in inputs:
-            inputs_by_exec[exec_id].append(state_id)
-        for exec_id, state_id in outputs:
-            outputs_by_exec[exec_id].append(state_id)
-
-        return {
-            "schema": "TIDE-Model",
-            "schema_version": 1,
-            "host": selected_host,
-            "executions": executions,
-            "execution_by_id": execution_by_id,
-            "states": states,
-            "state_by_id": state_by_id,
-            "inputs": inputs,
-            "outputs": outputs,
-            "inputs_by_exec": inputs_by_exec,
-            "outputs_by_exec": outputs_by_exec,
-            "producer_by_state": {
-                state_id: next(iter(producers))
-                for state_id, producers in producers_by_state.items()
-                if len(producers) == 1
-            },
-            "topological_execution_ids": topological_execution_ids,
-            "execution_enrichments": execution_enrichments,
-            "state_enrichments": state_enrichments,
-            "host_record": host_record,
-        }, report
-
-    def _trace_from_model(
-        self,
-        model,
-        *,
-        name,
-        identity_mode,
-        assigned_unknown_states=(),
-    ):
-        state_projection = {}
-        value_by_state = {}
-        state_id_by_reference = {}
-        for state in model["states"]:
-            state_id = state["state_id"]
-            data_ref = DataRef.literal(
-                key=state_id,
-                store="__model__",
-            )
-            reference = DataRef.to_string(
-                data_ref,
-                strip_leading=True,
-            )
-            prior_state_id = state_id_by_reference.get(reference)
-            if (
-                prior_state_id is not None
-                and (
-                    type(prior_state_id) is not type(state_id)
-                    or prior_state_id != state_id
-                )
-            ):
-                raise ValueError(
-                    "TIDE Model State identifiers "
-                    f"{prior_state_id!r} and {state_id!r} project to the same "
-                    f"Trace reference {reference!r}"
-                )
-            state_id_by_reference[reference] = state_id
-            state_projection[state_id] = {
-                "state_id": state_id,
-                "ref": data_ref,
-                "reference": reference,
-                "version": 0,
-            }
-            value_by_state[state_id] = self._materialise_model_state(
-                state_id,
-                state,
-            )
-
-        executions = []
-        assigned_unknown_state_keys = {
-            (type(state_id), state_id)
-            for state_id in assigned_unknown_states
-        }
-        ordered_source_executions = [
-            model["execution_by_id"][exec_id]
-            for exec_id in model["topological_execution_ids"]
-        ]
-        for seq_id, source_execution in enumerate(
-            ordered_source_executions
-        ):
-            source = source_execution["source"]
-            raw_exec_id = source_execution["exec_id"]
-            actor, ocean_id, runner_id, actor_supplied = (
-                self._model_actor_fields(
-                    source,
-                    seq_id,
-                    model["host"],
-                    raw_exec_id,
-                    identity_mode,
-            ))
-            trace_exec_id = (
-                raw_exec_id
-                if identity_mode == "host"
-                else f"exec_{seq_id}"
-            )
-            executions.append({
-                "source": source,
-                "seq_id": seq_id,
-                "raw_exec_id": raw_exec_id,
-                "exec_id": trace_exec_id,
-                "actor": actor,
-                "actor_supplied": actor_supplied,
-                "identity_mode": identity_mode,
-                "assigned_unknown": any(
-                    (type(state_id), state_id)
-                    in assigned_unknown_state_keys
-                    for state_id in model["outputs_by_exec"][raw_exec_id]
-                ),
-                "ocean_id": ocean_id,
-                "runner_id": runner_id,
-                "pipeline_id": source.get(
-                    "pipeline_id",
-                    "TIDE: .from_model()",
-                ),
-                "inputs": [
-                    state_projection[state_id]
-                    for state_id in model["inputs_by_exec"][raw_exec_id]
-                ],
-                "outputs": [
-                    state_projection[state_id]
-                    for state_id in model["outputs_by_exec"][raw_exec_id]
-                ],
-            })
-
-        execution_by_id = {
-            execution["raw_exec_id"]: execution
-            for execution in executions
-        }
-        producer_by_state = {
-            state_id: execution_by_id[exec_id]
-            for state_id, exec_id in model["producer_by_state"].items()
-        }
-        records = [
-            self._model_exec_record(
-                execution,
-                value_by_state,
-                producer_by_state,
-            )
-            for execution in executions
-        ]
-        source_context = [
-            {
-                "run": execution["runner_id"],
-                "pipeline_id": execution["pipeline_id"],
-                "pipeline": execution["source"].get(
-                    "pipeline",
-                    execution["pipeline_id"],
-                ),
-            }
-            for execution in executions
-        ]
-        model_context = {
-            "schema": model["schema"],
-            "schema_version": model["schema_version"],
-            "host": model["host"],
-            "identity_mode": identity_mode,
-            "assigned_unknown_states": list(assigned_unknown_states),
-            "execution_ids": [
-                execution["exec_id"]
-                for execution in ordered_source_executions
-            ],
-            "state_ids": [
-                state["state_id"]
-                for state in model["states"]
-            ],
-            "I": [
-                {"exec_id": exec_id, "state_id": state_id}
-                for exec_id, state_id in model["inputs"]
-            ],
-            "O": [
-                {"exec_id": exec_id, "state_id": state_id}
-                for exec_id, state_id in model["outputs"]
-            ],
-            "execution_enrichment": [
-                {
-                    "exec_id": execution["exec_id"],
-                    "metadata": {
-                        key: value
-                        for key, value in execution["source"].items()
-                        if key != "exec_id"
-                    },
-                }
-                for execution in ordered_source_executions
-                if len(execution["source"]) > 1
-            ],
-            "state_enrichment": [
-                {
-                    "state_id": state["state_id"],
-                    "value_hash": state["value_hash"],
-                }
-                for state in model["states"]
-                if state["value_hash"] is not None
-            ],
-            "state_projection": [
-                {
-                    "state_id": state_id,
-                    "reference": projection["reference"],
-                    "version": projection["version"],
-                }
-                for state_id, projection in state_projection.items()
-            ],
-        }
-
-        return Trace(
-            event_log=[],
-            exec_log=records,
-            runner="TIDE: .from_model()",
-            ocean_id=self.ocean.id,
-            name=name,
-            source_context=source_context,
-            model_context=model_context,
-            host=model["host"],
-            host_record=model.get("host_record"),
-        )
-
-    @staticmethod
-    def _materialise_model_state(state_id, evidence):
-        from tide_tooling.tooling_core.bundling.TIDEOpaqueValue import TIDEOpaqueValue
-
-        value = evidence["value"]
-        value_hash = evidence["value_hash"]
-        if not isinstance(value, __TIDE_TEMPLATE_VALUE__):
-            snapshot = tide_snapshot_value(value, boundary="model")
-            if value_hash is not None and snapshot.value_hash != value_hash:
-                raise ValueError(
-                    f"TIDE Model State {state_id!r} changed during capture"
-                )
-            return snapshot.materialise()
-
-        opaque = TIDEOpaqueValue(
-            type_name="TIDEModelState",
-            representation=f"<value unavailable for State {state_id!r}>",
-            reason="TIDE Model State supplied without an associated value",
-            value_hash=value_hash,
-        )
-        if opaque.value_hash is None:
-            opaque.value_hash = tide_value_hasher(opaque)
-        return opaque
-
-    def _model_actor_fields(
-        self,
-        execution,
-        occurrence,
-        host,
-        raw_exec_id,
-        identity_mode,
-    ):
-        actor = execution.get("actor")
-        actor_supplied = actor is not None
-        ocean_id = execution.get(
-            "ocean_id",
-            execution.get("ocean", self.ocean.id),
-        )
-        runner_id = execution.get(
-            "runner_id",
-            f"TIDE: .from_model({host or 'unknown'})",
-        )
-
-        if isinstance(actor, dict):
-            ocean_id = actor.get("ocean", actor.get("ocean_id", ocean_id))
-            runner_id = actor.get(
-                "source",
-                actor.get("runner_id", runner_id),
-            )
-            actor = actor.get("name", actor.get("actor"))
-
-        if actor is None:
-            actor = str(raw_exec_id)
-        if not isinstance(actor, str) or not actor:
-            raise ValueError(
-                "TIDE Model actor metadata must have a non-empty name"
-            )
-        return actor, ocean_id, runner_id, actor_supplied
-
-    @staticmethod
-    def _model_exec_record(
-        execution,
-        value_by_state,
-        producer_by_state,
-    ):
-        source = execution["source"]
-        input_record = InputUseRecord(
-            "args",
-            tuple(state["reference"] for state in execution["inputs"]),
-            tuple(state["reference"] for state in execution["inputs"]),
-            tuple(state["reference"] for state in execution["inputs"]),
-            tuple(
-                value_by_state[state["state_id"]]
-                for state in execution["inputs"]
-            ),
-            [],
-        )
-        dependencies = []
-
-        for input_index, state in enumerate(execution["inputs"]):
-            state_id = state["state_id"]
-            producer = producer_by_state[state_id]
-            producer_source = producer["runner_id"]
-            producer_actor = Actor(
-                producer["ocean_id"],
-                producer["runner_id"],
-                producer["actor"],
-            )
-            producer_exec_id = producer["exec_id"]
-
-            dependencies.append(DependencyUseRecord(
-                associated_input=("args", input_record),
-                dep=state["ref"],
-                type="static",
-                unscoped_ref=state["reference"],
-                resolved_val=value_by_state[state_id],
-                resolved_ver=state["version"],
-                producer_source=producer_source,
-                producer_actor=producer_actor,
-                producer_exec_id=producer_exec_id,
-                input_index=input_index,
-                input_path=[input_index],
-            ))
-
-        input_record.dependencies = dependencies
-        writes = [
-            WriteRecord(
-                cause="TIDE: model output",
-                stored_result=value_by_state[state["state_id"]],
-                stored_version=state["version"],
-                stored_target=state["reference"],
-            )
-            for state in execution["outputs"]
-        ]
-        output_value = (
-            writes[0].stored_result
-            if len(writes) == 1
-            else __TIDE_TEMPLATE_VALUE__()
-        )
-
-        return ExecRecord(
-            seq_id=execution["seq_id"],
-            exec_id=execution["exec_id"],
-            ocean_id=execution["ocean_id"],
-            runner_id=execution["runner_id"],
-            pipeline_id=execution["pipeline_id"],
-            node_id=source.get("node_id", str(execution["raw_exec_id"])),
-            func=None,
-            func_name=execution["actor"],
-            inputs=Inputs({"args": input_record}),
-            deps=dependencies,
-            effects=[],
-            declared_effects=[],
-            declared_targets=[
-                state["ref"] for state in execution["outputs"]
-            ],
-            runtime_effects=[],
-            runtime_targets=[],
-            declared_deps=[
-                state["ref"] for state in execution["inputs"]
-            ],
-            unscoped_store_refs=["__model__"],
-            status=source.get("status", "succeeded"),
-            started_at=source.get("started_at", source.get("start")),
-            finished_at=source.get("finished_at", source.get("end")),
-            duration_ms=source.get("duration_ms", source.get("time")),
-            error=source.get("error"),
-            node_options={
-                "source": "tide_model",
-                "model_exec_id": execution["raw_exec_id"],
-                "model_actor_supplied": execution["actor_supplied"],
-                "model_identity_mode": execution["identity_mode"],
-                "assigned_unknown": execution["assigned_unknown"],
-                "preserve_exec_id": True,
-                "model_input_state_ids": [
-                    state["state_id"] for state in execution["inputs"]
-                ],
-                "model_output_state_ids": [
-                    state["state_id"] for state in execution["outputs"]
-                ],
-            },
-            output_value=output_value,
-            resolve_output=False,
-            writes=writes,
-            emitted_nodes=[],
-            content_id=source.get("content_id"),
-        )
-
+    def report_model_validity(cls, model, *, host=None):
+        return TIDEModel.report_validity(model, host=host)
     def to_bundle(
         self,
         handle=None,
@@ -1608,6 +646,9 @@ class TIDE:
         type=None,
         kind=None,
         path=None,
+        serialise_events=False,
+        verify_events=True,
+        sign=None,
     ):
         """Create, and optionally export, this TIDE instance's bundle."""
         return self.trace().to_bundle(
@@ -1616,38 +657,43 @@ class TIDE:
             type=type,
             kind=kind,
             path=path,
+            serialise_events=serialise_events,
+            verify_events=verify_events,
+            sign=sign,
         )
-
     @classmethod
     def from_bundle(
         cls,
         bundle,
         *,
         trusted=False,
+        verify_events=True,
         resource_limits=None,
+        verify=None,
     ):
         """Load a bundle and return its inspectable :class:`Trace`.
-
         ``bundle`` may be a ``TIDEBundle``, its Python dict payload, or a
         path to a JSON export.  The classmethod form intentionally supports
         both ``TIDE.from_bundle(...)`` and ``TIDE().from_bundle(...)``.
-
         Object-state reconstruction is disabled by default. Pass
         ``trusted=True`` only for a bundle whose producer and contents are
         trusted, because trusted loading may import recorded Python types and
         invoke their state restoration hooks.
+        Bundle loading restores the native Trace representation. Retained
+        Events, when present, are optional source evidence and do not replace
+        the bundled Trace as its construction authority.
         """
         from tide_tooling.tooling_core.bundling.TIDEBundle import TIDEBundle
         from tide_tooling.tooling_core.bundling.TIDEBundler import TIDEBundler
-
         if not isinstance(trusted, bool):
             raise TypeError("trusted must be a bool")
-
+        if not isinstance(verify_events, bool):
+            raise TypeError("verify_events must be a bool")
         bundler = TIDEBundler(
             trusted=trusted,
+            verify_events=verify_events,
             resource_limits=resource_limits,
         )
-
         if isinstance(bundle, TIDEBundle):
             imported = TIDEBundle.from_dict(
                 bundle.to_dict(),
@@ -1667,556 +713,6 @@ class TIDE:
             raise TypeError(
                 "TIDE.from_bundle expects a TIDEBundle, dict, or JSON path"
             )
-
+        if verify is not None:
+            imported.verify(verify)
         return imported.trace()
-
-
-
-class ExecutionLog:
-    EXEC_ID_PREPEND = "TIDE_EXEC:"
-    _exec_count = 0
-    def __init__(self, ocean_id, event_log=None, pipeline_id:int|str="TIDE: .event()", fallback_store="global"):
-        if not event_log:
-            event_log = [] 
-        self.ocean_id = ocean_id
-        self.pipeline_id = pipeline_id
-        self.event_log = event_log
-        self.exec_log = []
-        self.exec_id_to_log = {}
-        self.ref_to_last_producer = {}
-        self.ref_to_last_value = {}
-        self.ref_to_last_snapshot = {}
-        self.versioned_refs = defaultdict(lambda: -1)
-        self.fallback_store = fallback_store
-        
-    
-    def next_seq_id(self):
-        id = self._exec_count
-        self._exec_count += 1
-        return id
-
-    def _build_exec_log(self):
-        # for event in self.event_log:
-        #     self.exec_log.append(self._log_exec_event(event)) 
-        # convert str to DataRef when the log is rebuilt by a caller.
-        pass
-    def _ensure_ref_declared(self, ref: DataRef, value) -> dict:
-        ref_str = DataRef.to_string(ref,strip_leading=True)
-
-        last = self.ref_to_last_producer.get(ref_str)
-        
-
-        if last is not None:
-            last_snapshot = self.ref_to_last_snapshot.get(ref_str)
-            new_snapshot = tide_snapshot_value(value, boundary="read")
-            last_hash = (
-                last_snapshot.value_hash
-                if last_snapshot is not None
-                else tide_value_hasher(
-                    self.ref_to_last_value.get(ref_str, (None, None))[0]
-                )
-            )
-            new_hash = new_snapshot.value_hash
-
-            if last_hash == new_hash:
-                return last
-
-            declare_event = ExecEvent(
-                actor="TIDE",
-                reads={},
-                writes={ref: value},
-                source="TIDE: External",
-                cause="TIDE: observed value",
-                status="succeeded",
-                metadata={},
-            )
-
-            declare_record = self._log_exec_event(declare_event)
-            self.exec_log.append(declare_record)
-
-            return self.ref_to_last_producer[ref_str]
-
-        
-        
-        
-        declare_event = ExecEvent(
-            actor="TIDE",
-            reads={},
-            writes={ref_str: value},
-            source="TIDE: External",
-            cause="TIDE: user declared value",
-            status="succeeded",
-            metadata={},
-        )
-
-
-
-        declare_record = self._log_exec_event(declare_event)
-        self.exec_log.append(declare_record)
-
-        return self.ref_to_last_producer[ref_str]
-
-    def _ensure_ref_data_ref(self, ref:str|DataRef, strip_leading=True):
-        if not isinstance(ref, DataRef):
-            if ":" not in ref:
-                ref = DataRef(ref, self.fallback_store)
-            else:
-                ref = DataRef.from_string(ref, strip_leading=strip_leading)
-        return ref
-
-    def _dep_records(self, record: DependencyUseRecord):
-        return record.expanded_to if record.type == "dynamic" else [record]
-
-    def _patch_imported_exec_reads(self, event: ExecRecord):
-
-        for dep_record in event.deps:
-            for record in self._dep_records(dep_record): 
-                ref = record.unscoped_reference
-                ver = record.resolved_version
-
-                last = self.ref_to_last_producer.get(ref)
-
-                if not last:
-                    continue
-
-                if last["version"] != ver:
-                    continue
-
-                record.producer_exec_id = last["exec_id"]
-                record.producer_actor = last["actor"]
-                record.producer_source = last["actor"].source_runner
-
-    def _should_skip_imported_external_seed_write(self, event: ExecRecord, write: WriteRecord) -> bool:
-        ref = write.stored_target
-        imported_ver = write.stored_version
-        imported_value = write.stored_result
-
-        if imported_ver != 0:
-            return False
-        
-        # if event.runner_id.startswith("TIDE: .exec"):
-        #     return False 
-        
-        
-        is_preruntime_polling_actor = event.producer_id.source_actor == "TIDE: Polling"
-        debug_print("BECAUSEEEE", event.producer_id.source_actor, write.cause)
-        is_preruntime_polling_write = write.cause == "TIDE: Pre-runtime Polling"
-        is_emitted_node_polling_write = write.cause == "TIDE: Emitted Node Polling"
-
-        if not (is_preruntime_polling_actor or is_preruntime_polling_write or is_emitted_node_polling_write):
-            return False
-
-        if ref not in self.ref_to_last_producer:
-            return False
-
-        if ref not in self.ref_to_last_value:
-            return False
-
-        last_value, last_ver = self.ref_to_last_value[ref]
-
-        if last_ver is None:
-            return False
-
-        if tide_value_hasher(last_value) != tide_value_hasher(imported_value):
-            return False
-
-        write.stored_version = last_ver
-
-        return True
-
-    @staticmethod
-    def _effect_kind(effect):
-        if isinstance(effect, WRITE):
-            return Effects.WRITE
-        if isinstance(effect, DELETE):
-            return Effects.DELETE
-        if isinstance(effect, END):
-            return Effects.END
-        if isinstance(effect, RUN):
-            return Effects.RUN
-        raise TypeError(f"Unsupported TIDE event effect: {effect!r}")
-
-    def _append_event_effect_records(self, record, effects):
-        for effect in effects:
-            kind = self._effect_kind(effect)
-            targets = getattr(effect, "targets", None)
-            if isinstance(targets, __TIDE_TEMPLATE_VALUE__):
-                targets = ["Runner"]
-            elif not isinstance(targets, (list, tuple, set)):
-                targets = [targets]
-
-            for target in targets:
-                if isinstance(target, DataRef):
-                    target = DataRef.to_string(target, strip_leading=True)
-                    version = self.versioned_refs.get(target, 0)
-                else:
-                    target = "Runner" if target is None else str(target)
-                    version = 0
-
-                effect_record = EffectRecord(
-                    kind,
-                    (target, version),
-                    origin="declared",
-                    output=getattr(effect, "preserve_output", __TIDE_TEMPLATE_VALUE__()),
-                )
-                record.effects.append(effect_record)
-
-
-    def _log_exec_event(self, event: ExecEvent | ExecRecord) -> ExecRecord:
-        if isinstance(event, ExecRecord):
-            self._patch_imported_exec_reads(event)
-            event.seq_id = self.next_seq_id()
-            self.exec_id_to_log[event.exec_id] = event
-            for write in event.writes:
-                if self._should_skip_imported_external_seed_write(event, write):
-                    continue
-                write: WriteRecord
-                ref = write.stored_target
-                ver = self.versioned_refs[ref] + 1 #if ref in self.versioned_refs else self.versioned_refs[ref]
-                write.stored_version = ver
-                val = write.stored_result
-                
-                self.ref_to_last_producer[ref] = {
-                    "exec_id": event.exec_id,
-                    "actor": event.producer_id,
-                    "version": ver,
-                }
-                self.ref_to_last_value[ref] = (val, ver)
-                self.ref_to_last_snapshot[ref] = tide_snapshot_value(
-                    val,
-                    boundary="write",
-                )
-                self.versioned_refs[ref] = ver
-            return event
-        
-
-
-        deps = []
-        read_inputs = [] 
-        read_raw = []
-        input_records = {}
-        
-        
-        raw_input = []
-        normalised_input = []
-        resolved_input = []
-        input_deps = normalised_input
-            
-
-        for raw_ref, value in event.reads.items():
-            raw_input.append(raw_ref)
-
-            ref = self._ensure_ref_data_ref(raw_ref, strip_leading=False)
-            normalised_input.append(ref)
-            read_snapshot = tide_snapshot_value(value, boundary="read")
-            read_value = read_snapshot.materialise()
-            resolved_input.append(read_value)
-            ref_str = DataRef.to_string(ref, strip_leading=True)
-
-            last = self._ensure_ref_declared(ref, value)
-
-            producer_exec_id = last["exec_id"] if last else None
-            
-
-            producer_actor = last["actor"] if last else "TIDE: External"
-            producer_source = last["actor"].source_runner if last else Actor("unknown", "unknown", "unknown")
-            producer_ver = last["version"] if last else 0
-
-            dep = DependencyUseRecord(
-                associated_input=None,
-                dep=ref,
-                type="static",
-                unscoped_ref=ref_str,
-                resolved_val=read_value,
-                resolved_ver=producer_ver,
-                producer_source=producer_source, 
-                producer_actor=producer_actor,
-                producer_exec_id=producer_exec_id,
-                input_path=(len(deps),),
-                snapshot_lineage=[read_snapshot.to_dict()],
-            )
-
-            deps.append(dep) 
-            read_raw.append(raw_ref)
-            read_inputs.append(value)
-
-        associated_input = ("args", RunnerNodeInput(raw=tuple(raw_input), evaluated=tuple(raw_input), normalised=tuple(normalised_input), resolved=tuple(resolved_input), deps=list(input_deps)))
-
-        for input_index, dep in enumerate(deps):
-            dep: DependencyUseRecord
-            dep.associated_input = associated_input
-            dep.input_index = input_index
-            
-       
-
-        input_records[associated_input[0]] = InputUseRecord(
-            name=associated_input[0],
-            raw=associated_input[1].raw,
-            evaluated=associated_input[1].evaluated,
-            normalised=associated_input[1].normalised,
-            resolved=associated_input[1].resolved,
-            dependencies=deps,
-        )
-
-        inputs = Inputs(input_records)
-        if isinstance(event.actor, str):
-            actor_name = event.actor
-            func = "unknown"
-            func_name = event.actor
-        else:
-            actor_name = event.actor.__name__
-            func = event.actor
-            func_name = event.actor.__name__
-        if self.pipeline_id=="TIDE: .event()":
-            pipeline_id = f"TIDE: .event({actor_name}[{event.seq_id}])"
-        else: 
-            pipeline_id = self.pipeline_id
-        tide_exec_id = f"{self.EXEC_ID_PREPEND}{event.uuid}"
-        record = ExecRecord(
-            seq_id=self.next_seq_id(),
-            exec_id=tide_exec_id,
-            ocean_id=self.ocean_id,
-            runner_id=event.source,
-            pipeline_id=pipeline_id,
-            node_id="unknown",
-            func=func,
-            func_name=func_name,
-            inputs=inputs,
-            deps=deps,
-            effects=[],
-            declared_deps=[DataRef.from_string(read, strip_leading=False) for read in event.reads.keys()],
-            declared_effects=list(event.effects),
-            declared_targets=[DataRef.from_string(write, strip_leading=False) for write in event.writes.keys()],
-            runtime_effects=[],
-            runtime_targets=[],
-            unscoped_store_refs=list(DataRef.to_string(self._ensure_ref_data_ref(str_ref, strip_leading=False), strip_leading=True).split(":", 1)[0] for str_ref in event.writes),
-            status=event.status,
-            started_at=event.metadata.get("started_at"),
-            finished_at=event.metadata.get("finished_at"),
-            duration_ms=event.metadata.get("duration_ms"),
-            error=event.metadata.get("error"),
-            output_value=None,
-            resolve_output=True,
-            writes=[],
-            emitted_nodes=[],
-            base_node_id=None,
-            base_node_content_id=None,
-            content_id=None,
-            node_options={},
-        )
-
-        for ref, value in event.writes.items():
-            ref = self._ensure_ref_data_ref(ref, strip_leading=False)
-            ref_str = DataRef.to_string(ref, strip_leading=True)
-            write_snapshot = tide_snapshot_value(value, boundary="write")
-            historical_value = write_snapshot.materialise()
-            ver = self.versioned_refs[ref_str] + 1 
-            self.versioned_refs[ref_str] = ver
-
-            record.writes.append(
-                WriteRecord(
-                    cause=f"{event.cause}",
-                    stored_result=historical_value,
-                    stored_version=ver,
-                    stored_target=ref_str,
-                    snapshot_lineage=[write_snapshot.to_dict()],
-                )
-            )
-
-            self.ref_to_last_producer[ref_str] = {
-                "exec_id": tide_exec_id,
-                "actor": record.producer_id,
-                "version": ver,
-            }
-            self.ref_to_last_value[ref_str] = (historical_value, ver)
-            self.ref_to_last_snapshot[ref_str] = write_snapshot
-
-
-        self._append_event_effect_records(record, event.effects)
-
-        self.exec_id_to_log[tide_exec_id] = record
-        return record
-
-class EventCapture:
-    seq_id = -1
-    def __init__(self, source_ocean: Ocean, exec_log: ExecutionLog):
-        self._source_ocean = source_ocean
-        self._source_ocean_id = source_ocean.id
-        self._source_runner = "TIDE: .event()"
-        self._source_pipeline = "TIDE: .event()"
-        self._default_store = "global"
-        self._seen_value_hashes = set()
-        self.events = []
-        self.exec_log = exec_log
-
-    def set_default_store(self, store):
-        self._default_store = store
-        self.exec_log.fallback_store = store
-        return self
-
-    @contextmanager
-    def _store_context(self):
-        token = DataRef.set_default_store(self._default_store)
-        self.exec_log.fallback_store = self._default_store
-        try:
-            yield
-        finally:
-            DataRef.reset_default_store(token)
-
-    def _to_exec_log(self, name:str=None):
-        if not name:
-            name = self._source_pipeline
-
-        exec_log = ExecutionLog(
-            self._source_ocean_id,
-            self.events,
-            pipeline_id=name,
-            fallback_store=self._default_store,
-        )
-        exec_log._build_exec_log()
-        return exec_log.exec_log
-
-    def _next_exec_record_seq_id(self):
-        self.seq_id += 1
-        return self.seq_id
-
-    def _normalise_ref_strs_to_data_ref(self, ref: str):
-        if isinstance(ref, str):
-            if ":" not in ref:
-                ref = DataRef(ref, self._default_store)
-            else:
-                ref = DataRef.from_string(ref,strip_leading=False) 
-        return ref
-
-    def event(
-        self,
-        actor: str | Callable,
-        reads: dict | list | str | None = None,
-        writes: dict | None = None,
-        source: str | None = None,
-        cause: str | None = None,
-        effects=None,
-        return_id: bool = False,
-    ):
-        """Record one observed occurrence.
-
-        ``writes`` maps references to the values actually written. A bare
-        collection of target names is not sufficient evidence for an event.
-        """
-        with self._store_context():
-            return self._event(
-                actor,
-                reads=reads,
-                writes=writes,
-                source=source,
-                cause=cause,
-                effects=effects,
-                return_id=return_id,
-            )
-
-    def _event(
-        self,
-        actor: str | Callable,
-        reads: dict | list | str | None = None,
-        writes: dict | None = None,
-        source: str | None = None,
-        cause: str | None = None,
-        effects=None,
-        return_id: bool = False,
-    ):
-
-        actor = actor
-        reads = reads or {}
-        if not isinstance(reads, (list, dict)):
-            reads = [reads]
-        writes = dict(writes or {}) if isinstance(writes or {}, dict) else writes
-        source = source or self._source_runner
-        cause = cause or "unknown"
-
-        if effects is None:
-            effects = []
-        elif isinstance(effects, Effect):
-            effects = [effects]
-        elif isinstance(effects, (list, tuple, set)):
-            effects = list(effects)
-        else:
-            raise TypeError(
-                "tide.event effects must be an Effect or an iterable of Effects"
-            )
-
-        if any(not isinstance(effect, Effect) for effect in effects):
-            raise TypeError("tide.event effects must contain only Effect objects")
-
-        for effect in effects:
-            if not isinstance(effect, WRITE):
-                continue
-            if isinstance(effect.preserve_output, __TIDE_TEMPLATE_VALUE__):
-                continue
-            for target in effect.targets:
-                writes.setdefault(target, effect.preserve_output)
-
-        seq_id =self._next_exec_record_seq_id()
-        event_exec = ExecEvent(seq_id=seq_id, actor=actor, reads=reads, writes=writes, source=source, cause=cause, effects=effects)
-        if isinstance(reads, list):
-            
-            ref_to_values = {}
-            for idx, ref in enumerate(reads):
-                ref = self._normalise_ref_strs_to_data_ref(ref)
-                if self._source_ocean.store_router.exists(ref.store, ref.key):    
-                    val = self._source_ocean.store_router.get(ref.store, ref.key)
-                    ref_to_values[ref] = val
-                else:
-                    raise RuntimeError(f"[ERROR] ref {ref} from .event({actor}) {reads} was not available! " + "\n" + 
-                                       "please use .exec() to produce this reference, or use a store template!" + "\n" + 
-                                       "tide.ocean() supports declaring work which can wait on external writes!")
-            reads = ref_to_values
-            event_exec.reads = reads
-                       
-        if not isinstance(writes, dict):
-            raise TypeError(
-                "tide.event writes must be a dict mapping references to "
-                f"values, got {type(writes).__name__}"
-            )
-        
-        
-        exec_record = self.exec_log._log_exec_event(event_exec)
-        self.exec_log.exec_log.append(exec_record)
-        if self._source_ocean.done:
-            self._source_ocean.done=False
-        self._source_ocean.consume_event(Event(source="TIDE: .event()", event_type=LogEvents.EVENT_EXEC, payload=exec_record))
-        self.events.append(Event(source="TIDE: .event()", event_type=LogEvents.EVENT_EXEC, payload=exec_record))
-        self._source_ocean.tick(external=True)
-        for ref, val in dict(writes).items():
-            ref = self._normalise_ref_strs_to_data_ref(ref)
-            if self._source_ocean.done:
-                self._source_ocean.done=False
-            self._source_ocean.store_router.set(ref.store, ref.key, val, force=True)
-
-        for effect_record in exec_record.effects:
-            if effect_record.effect != Effects.DELETE:
-                continue
-            ref = self._normalise_ref_strs_to_data_ref(
-                effect_record.targets[0]
-            )
-            found, _ = self._source_ocean.store_router.get_store(
-                ref.store
-            ).pop_if_present(ref.key)
-            effect_record.target_existed = found
-        self._source_ocean.tick(external=True)
-            # self._source_ocean.consume_event(Event(source=f"runner", source_id=self._source_runner, event_type=RouterEvents.STORE_WRITE, payload=(ref.store, ref.key, val, actor if isinstance(actor, str) else actor.__name__, ".event() write"), exec_id=exec_record.exec_id))
-
-        if return_id:
-            return seq_id
-           
-        
-        
-        
-        
-            
-
-
-    def trace(self, name:str="TIDE: .trace()"):
-        exec_log = self.exec_log.exec_log
-        trace = Trace(event_log=self.events, runner=self._source_runner, ocean_id=self._source_ocean_id, exec_log=exec_log, name=name, all_known_pipelines=self._source_ocean.pipelines, all_known_runners=self._source_ocean.runners)
-        
-        return trace

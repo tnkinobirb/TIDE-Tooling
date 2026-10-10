@@ -1,6 +1,7 @@
 import pytest
 
 from tide_tooling import TIDE
+from tide_tooling.tooling_core.engine.errors import InvalidObjectKindError
 
 
 # ================================================================
@@ -77,7 +78,7 @@ def test_find_missing_version_returns_empty_not_latest_fallback(basic_trace):
     assert searched.refs == []
     for inspected_ref in searched.nearby.refs: 
         assert inspected_ref == basic_trace.inspect("global:@A", "reference")
-    assert_empty_search(searched, "reference", nearby=True)
+    assert_empty_search(searched, "reference")
 
 
 def test_find_malformed_ref_string_returns_empty_not_fake_reference(basic_trace):
@@ -97,7 +98,7 @@ def test_find_unknown_actor_returns_empty_not_nearby_success(basic_trace):
 def test_find_missing_exec_id_returns_empty(basic_trace):
     searched = basic_trace.find("not-an-exec-id")
     
-    assert searched.exec == []
+    assert searched.execs == []
     assert_empty_search(searched, "exec_record")
 
 
@@ -174,6 +175,16 @@ def test_investigate_missing_actor_returns_nonexistent_object(basic_trace):
         investigated.inspected,
         expected_type="actor",
     )
+
+
+def test_investigate_missing_exec_record_is_an_empty_result(basic_trace):
+    investigated = basic_trace.investigate(
+        "not-an-exec-id",
+        "exec_record",
+    )
+
+    assert investigated.to_dict()["history"] == []
+    assert "not-an-exec-id" in investigated.show(color=False)
 
 
 def test_path_from_nonexistent_ref_to_actor_returns_no_path(basic_trace):
@@ -254,14 +265,14 @@ def test_show_on_nonexistent_ref_reports_empty_state(basic_trace):
 def test_inspect_unknown_kind_raises_honestly(basic_trace):
     # NOTE:
     # Unknown kind is API misuse, not a missing object within a valid kind.
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidObjectKindError):
         basic_trace.inspect("@A", "not_a_real_kind")
 
 
 def test_investigate_unknown_kind_raises_honestly(basic_trace):
     # NOTE:
     # Unknown kind is API misuse, not a missing object within a valid kind.
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidObjectKindError):
         basic_trace.investigate("@A", "not_a_real_kind")
 
 

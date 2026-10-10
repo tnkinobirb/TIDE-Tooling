@@ -25,18 +25,12 @@ MODEL = {
     },
     "states": {
         "raw-state": {
-            "reference": "model:raw_data",
-            "version": 0,
             "value": " loaded raw data ",
         },
         "clean-state": {
-            "reference": "model:clean_data",
-            "version": 0,
             "value": "loaded raw data",
         },
         "report-state": {
-            "reference": "model:report",
-            "version": 0,
             "value": {"status": "ready"},
         },
     },
@@ -44,7 +38,7 @@ MODEL = {
 
 
 def main():
-    validation = TIDE.validate_model(MODEL)
+    validation = TIDE.report_model_validity(MODEL)
     assert validation["semantically_valid"], validation["errors"]
 
     trace = TIDE.from_model(MODEL)

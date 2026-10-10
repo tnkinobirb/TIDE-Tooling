@@ -1,19 +1,10 @@
 import pytest
 from types import SimpleNamespace
-
-from tide_tooling.tooling_core.cli.event_runtime import _parse_cli_cmd_into_event
-from tide_tooling.tooling_core.cli.utils import (
-    _ast_parse_value_from_string,
-    _safe_parse_func_from_string,
-)
 from tide_tooling.tooling_core.engine.DependencyTools import DependencyTools
-from tide_tooling.tooling_core.engine.DictProcessor import DictProcessor
 from tide_tooling.tooling_core.engine.NodeProcessor import NodeProcessor
 from tide_tooling.tooling_core.engine.classes import (
     DataRef,
     Node,
-    NodeDeferralFlags,
-    NodeState,
     Pipeline,
     ProcessStates,
     RunnerNode,
@@ -22,12 +13,28 @@ from tide_tooling.tooling_core.engine.errors import (
     EventHandlerError,
     StoreReferenceAmbiguityError,
 )
+from tide_tooling.tooling_core.engine.event_payloads import (
+    EffectOccurrence,
+    Nodes,
+    PipelineRun,
+    Reference,
+    State,
+)
+from tide_tooling.tooling_core.engine.event_occurrences import EventLogger
+from tide_tooling.tooling_core.engine.executor import _execute_with_timing
 from tide_tooling.tooling_core.engine.events import (
+    Cause,
     Event,
+    Effects,
     LogEvents,
     OceanEvents,
     PipelineEvents,
     RouterEvents,
+)
+from tide_tooling.tooling_core.engine.utils import (
+    create_tide_exec_uuid,
+    tide_snapshot_value,
+    tide_value_hasher,
 )
 from tide_tooling.tooling_core.engine.registries import StoreRegistry
 from tide_tooling.tooling_core.engine.routers import EventRouter, StoreRouter
@@ -36,14 +43,13 @@ from tide_tooling.tooling_core.engine.tide_rendering import display_identity
 from tide_tooling.tooling_core.engine.tide_logging import (
     Actor,
     DependencyUseRecord,
-    EffectRecord,
     ExecRecord,
     ExpandedDepRecord,
     InputUseRecord,
     Inputs,
-    LogTools,
     WriteRecord,
 )
+from tide_tooling.tooling_core.engine.tide_runtime_logging import ExecutionLog
 from tide_tooling import TIDE
 
 
@@ -64,7 +70,24 @@ def test_tide_does_not_allocate_a_process_pool_until_process_mode_is_used():
     try:
         assert tide.ocean.executor.process_pool_executor is None
     finally:
-        tide.close()
+        tide.ocean.close()
+
+
+def test_executor_preserves_completed_runtime_effects_on_ordinary_failure():
+    from tide_tooling.tooling_core.engine.classes import EffectRuntime, _current_effect_runtime
+
+    effect = {"effect": "observed-before-failure"}
+    runtime = EffectRuntime(exec_id=create_tide_exec_uuid())
+
+    def fail_after_effect():
+        _current_effect_runtime.get().effects.append(effect)
+        raise RuntimeError("ordinary failure")
+
+    meta = _execute_with_timing(runtime.exec_id, fail_after_effect, (), {}, runtime)
+
+    assert meta.status == "failed"
+    assert isinstance(meta.error, RuntimeError)
+    assert meta.runtime_effects == (effect,)
 
 
 def make_exec_record(*, exec_id, effects=None, writes=None):
@@ -96,54 +119,54 @@ def make_exec_record(*, exec_id, effects=None, writes=None):
     )
 
 
-def test_runner_node_uses_the_exported_state_and_deferral_types():
-    runner = RunnerNode(Node(func=lambda: None), id="runner")
-
-    assert isinstance(runner.state, NodeState)
-    assert isinstance(runner.defer_flags, NodeDeferralFlags)
-    assert (
-        RunnerNode.__dataclass_fields__["state"].default_factory
-        is NodeState
-    )
-    assert (
-        RunnerNode.__dataclass_fields__["defer_flags"].default_factory
-        is NodeDeferralFlags
-    )
+def test_exec_record_prefix_must_begin_the_identifier():
+    assert make_exec_record(exec_id="TIDE_EXEC:valid").exec_id == "TIDE_EXEC:valid"
+    assert make_exec_record(exec_id="wrong:TIDE_EXEC:embedded").exec_id == "TIDE_EXEC:wrong:TIDE_EXEC:embedded"
 
 
-@pytest.mark.parametrize(
-    "field_name",
-    [
-        "func",
-        "args",
-        "kwargs",
-        "p_args",
-        "p_kwargs",
-        "k_args",
-        "k_kwargs",
-    ],
-)
-def test_every_deferral_flag_is_reported(field_name):
-    flags = NodeDeferralFlags()
+def test_runner_node_keeps_only_direct_execution_state():
+    runner = RunnerNode(Node(func=lambda: None), id=0)
 
-    assert flags.any() is False
-
-    setattr(flags, field_name, True)
-
-    assert flags.any() is True
+    assert runner.executing is False
+    assert runner.evaluated is False
+    assert runner.status is None
+    assert not hasattr(runner, "state")
+    assert not hasattr(runner, "defer_flags")
 
 
-def test_runner_node_runtime_reset_resets_inputs_without_bad_self_argument():
-    runner = RunnerNode(Node(func=lambda: None), id="runner")
+def test_runner_node_unresolve_invalidates_result_and_input():
+    runner = RunnerNode(Node(func=lambda: None), id=0)
     runner.args.update_state(ProcessStates.EVALUATED, ("evaluated",))
     runner.args.update_state(ProcessStates.NORMALISED, ("normalised",))
     runner.args.update_state(ProcessStates.RESOLVED, ("resolved",))
-    runner.status = "complete"
+    runner.evaluated = True
+    runner.result = "result"
 
-    runner._reset_runtime_state()
+    runner._unresolve_input(runner.args)
 
-    assert runner.status is None
+    assert runner.evaluated is False
+    assert runner.result is None
     assert not runner.args.has_been(ProcessStates.RESOLVED)
+
+
+def test_runtime_reads_retain_selected_dynamic_expansions():
+    input_record = InputUseRecord("args", None, None, None, None, [])
+    selected = object()
+    dependency = DependencyUseRecord(
+        ("args", input_record),
+        DataRef(key="x*", store="mem"),
+        type="dynamic",
+        expanded_to=[selected],
+    )
+    input_record.dependencies.append(dependency)
+
+    ExecutionLog("ocean").append_runtime_reads(
+        Inputs({"args": input_record}),
+        [dependency],
+        [],
+    )
+
+    assert dependency.expanded_to == [selected]
 
 
 def test_inputs_repr_lists_only_input_slots_with_evidence():
@@ -173,330 +196,55 @@ def test_inputs_repr_lists_only_input_slots_with_evidence():
     assert repr(runtime) == "Inputs(['runtime_read'])"
 
 
-def test_dependency_resolver_preserves_the_original_error_as_cause():
-    tools = object.__new__(DependencyTools)
-
+def test_dependency_resolver_preserves_the_original_error():
     def reject_reference(_):
         raise TypeError("resolver exploded")
 
-    with pytest.raises(
-        ValueError,
-        match="in_place_dependency_resolver error: resolver exploded",
-    ) as raised:
-        tools.in_place_dependency_resolver(
-            reject_reference,
+    processor = NodeProcessor(
+        SimpleNamespace(resolve_exact=reject_reference),
+    )
+
+    with pytest.raises(TypeError, match="resolver exploded"):
+        processor._resolve_dependencies(
+            DataRef(key="@A", store="global"),
+            lambda ref: ref,
             node=None,
-            input_value=DataRef(key="@A", store="global"),
         )
 
-    assert isinstance(raised.value.__cause__, TypeError)
 
-
-def test_dynamic_resolver_uses_one_as_the_default_required_count():
-    tools = object.__new__(DependencyTools)
+def test_dynamic_resolver_uses_the_refs_selected_for_the_node():
     dynamic = DataRef(key="@item*", store="global", max=1)
     concrete = DataRef(key="@item_one", store="global")
     node = SimpleNamespace(
         dynamic_to_static_deps={dynamic: [concrete]},
     )
-    tools._snapshot_available_deps = lambda ref: ["@item_one"]
-    tools.resolve = lambda ref: "resolved"
+    processor = NodeProcessor(
+        SimpleNamespace(
+            matching_refs=lambda ref: (concrete,),
+            resolve_exact=lambda ref: "resolved",
+        ),
+    )
 
-    resolved, reads = tools.in_place_dependency_resolver(
+    resolved, reads = processor._resolve_dependencies(
+        dynamic,
         lambda ref: ref,
-        node=node,
-        input_value=dynamic,
+        node,
     )
 
     assert resolved == ["resolved"]
     assert len(reads) == 1
     assert reads[0][0] == concrete
 
-
-def test_callable_input_can_receive_the_memory_store_snapshot():
-    processor = NodeProcessor(SimpleNamespace(
-        dump_store=lambda store: {"source": 41},
-    ))
-
-    def consume_store(store, increment):
-        return store["source"] + increment
-
-    result = processor._callable_input_evaluator(
-        consume_store,
-        inj_args=(1,),
-        inject_data_store=True,
-    )
-
-    assert result == 42
-
-
-def test_cli_relative_function_error_names_the_supplied_value():
-    with pytest.raises(Exception) as raised:
-        _safe_parse_func_from_string(".sqrt")
-
-    message = str(raised.value)
-
-    assert ".sqrt starts with '.'" in message
-    assert "name 'func_name' is not defined" not in message
-
-
-def test_cli_value_parser_preserves_container_shape_and_all_refs():
-    parsed_list = _ast_parse_value_from_string("['@left', '@right']")
-    parsed_tuple = _ast_parse_value_from_string("('@left', '@right')")
-
-    assert isinstance(parsed_list, list)
-    assert isinstance(parsed_tuple, tuple)
-    assert [value.key for value in parsed_list] == ["@left", "@right"]
-    assert [value.key for value in parsed_tuple] == ["@left", "@right"]
-
-
-class RecordingEventInterface:
-    def __init__(self):
-        self.events = []
-
-    def emit_event_to_ocean(self, event):
-        self.events.append(event)
-
-
-class AliasOnlyStoreRouter:
-    def __init__(self, aliases=None):
-        self.store_alias = aliases or {}
-
-
-def test_cli_empty_input_emits_nothing():
-    interface = RecordingEventInterface()
-
-    result = _parse_cli_cmd_into_event(
-        "",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert result is None
-    assert interface.events == []
-
-
-def test_cli_kill_emits_the_selected_runner():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "kill 0",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == OceanEvents.KILL_PIPELINE
-    assert event.target_runner_id == 0
-
-
-@pytest.mark.parametrize("command", ["run", "run_pipeline"])
-def test_cli_run_without_a_pipeline_emits_nothing(command):
-    interface = RecordingEventInterface()
-
-    result = _parse_cli_cmd_into_event(
-        command,
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert result is None
-    assert interface.events == []
-
-
-def test_cli_run_emits_pipeline_and_mode():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "run 4 process",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == OceanEvents.RUN_PIPELINE
-    assert event.payload == (4, "process", {}, True)
-
-
-def test_cli_delete_uses_the_third_argument_as_runner_id():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "delete key mem 7",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == RouterEvents.DELETE
-    assert event.target_runner_id == 7
-    assert event.payload[:2] == ("mem", "key")
-
-
-def test_cli_set_runner_zero_emits_one_scoped_write():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "set key value mem 0",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == RouterEvents.STORE_WRITE
-    assert event.target_runner_id == 0
-    assert event.payload[:3] == ("store_0", "key", "value")
-
-
-def test_cli_set_broadcast_expands_each_store_alias_once():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "set key value mem",
-        interface,
-        AliasOnlyStoreRouter({"mem": ["store_1", "store_2"]}),
-    )
-
-    assert [
-        event.payload[:3]
-        for event in interface.events
-    ] == [
-        ("store_1", "key", "value"),
-        ("store_2", "key", "value"),
-    ]
-
-
-@pytest.mark.parametrize("command", ["set", "update"])
-def test_cli_write_commands_preserve_an_explicit_empty_string(command):
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        f'{command} key "" global',
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    assert interface.events[0].payload[:3] == ("global", "key", "")
-
-
-@pytest.mark.parametrize(
-    ("command", "expected_store", "expected_runner"),
-    [
-        ("update key value global", "global", "*"),
-        ("update key value mem 7", "store_7", 7),
-    ],
-)
-def test_cli_update_emits_exactly_one_write(
-    command,
-    expected_store,
-    expected_runner,
-):
-    interface = RecordingEventInterface()
-
-    result = _parse_cli_cmd_into_event(
-        command,
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert result is None
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == RouterEvents.STORE_WRITE
-    assert event.target_runner_id == expected_runner
-    assert event.payload[:3] == (expected_store, "key", "value")
-
-
-def test_cli_unknown_command_returns_its_command_token():
-    interface = RecordingEventInterface()
-
-    event = _parse_cli_cmd_into_event(
-        "unknown extra words",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert event.event_type == "unknown"
-    assert interface.events == []
-
-
-def test_cli_build_without_a_key_never_emits_an_invalid_build():
-    interface = RecordingEventInterface()
-
-    result = _parse_cli_cmd_into_event(
-        "build",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert result is None
-    assert interface.events == []
-
-
-def test_cli_build_emits_the_documented_store_and_key():
-    interface = RecordingEventInterface()
-
-    _parse_cli_cmd_into_event(
-        "build report global 3",
-        interface,
-        AliasOnlyStoreRouter(),
-    )
-
-    assert len(interface.events) == 1
-    event = interface.events[0]
-    assert event.event_type == PipelineEvents.BUILD
-    assert event.target_runner_id == 3
-    assert event.payload == ("global", "report")
-
-
-def test_dict_processor_flatten_honours_custom_separator_recursively():
-    flattened = DictProcessor.flatten(
-        {"outer": {"inner": {"value": 1}}},
-        sep="/",
-    )
-
-    assert flattened == {"outer/inner/value": 1}
-    assert DictProcessor.unflatten(flattened, sep="/") == {
-        "outer": {"inner": {"value": 1}}
-    }
-
-
 def test_store_registry_reports_local_global_name_ambiguity_directly():
     registry = StoreRegistry()
     registry._locals["same"] = object()
-    registry._stores["same"] = object()
+    registry._globals["same"] = object()
 
     with pytest.raises(
         StoreReferenceAmbiguityError,
         match="registered as both local and global",
     ):
             registry.get("same")
-
-
-def test_store_router_reports_alias_ambiguity_directly():
-    registry = StoreRegistry()
-    router = StoreRouter(
-        registry,
-        event_interface=SimpleNamespace(
-            emit_event_to_ocean=lambda event: None,
-            event_subscriber=lambda *args: None,
-        ),
-        store_alias={"mem": ["mem_1", "mem_2"]},
-        subscribe_events=False,
-    )
-
-    with pytest.raises(
-        StoreReferenceAmbiguityError,
-        match="resolved to multiple stores",
-    ) as raised:
-        router.get_store("mem")
-
-    assert raised.value.name == "mem"
 
 
 def test_store_router_preserves_runner_zero_when_routing_delete():
@@ -514,51 +262,186 @@ def test_store_router_preserves_runner_zero_when_routing_delete():
             emit_event_to_ocean=emitted.append,
             event_subscriber=lambda *args: None,
         ),
-        store_alias={"mem": ["mem_0"]},
-        subscribe_events=False,
     )
 
-    router.on_delete(Event(
+    delete_event = Event(ocean_id=0, 
         source="runner",
         source_id=9,
         target_runner_id=0,
-        event_type=RouterEvents.DELETE,
-        payload=("mem", "key", "user", "test"),
-    ))
+        type=RouterEvents.DELETE,
+        cause=Cause(description="test"),
+        payload=Reference(DataRef(key="key", store="mem_0")),
+        exec_id="execution",
+    )
+    router.on_delete(delete_event)
 
     assert registry.get("mem_0").exists("key") is False
     assert len(emitted) == 1
     assert emitted[0].target_runner_id == 0
-    assert emitted[0].event_type == PipelineEvents.DEP_DELETED
+    assert emitted[0].type == PipelineEvents.DEP_DELETED
+    assert emitted[0].cause.event_id == delete_event.event_id
+    assert emitted[0].payload == delete_event.payload
+    assert emitted[0].exec_id == delete_event.exec_id
+
+
+@pytest.mark.parametrize(
+    ("existing", "value", "force", "expected_type"),
+    [
+        (None, "new", False, PipelineEvents.DEP_AVAILABLE),
+        ("old", "new", False, PipelineEvents.DEP_UPDATED),
+        ("same", "same", False, PipelineEvents.DEP_AVAILABLE),
+        ("same", "same", True, PipelineEvents.DEP_UPDATED),
+    ],
+)
+def test_store_router_write_outcome_matrix(existing, value, force, expected_type):
+    emitted = []
+    initial = {} if existing is None else {"key": existing}
+    registry = StoreRegistry()
+    registry.register(MemoryKVStore(name="global", store_template=initial, scope="global"))
+    router = StoreRouter(registry, SimpleNamespace(
+        emit_event_to_ocean=emitted.append,
+        event_subscriber=lambda *args: None,
+    ))
+    state = State(DataRef("key", "global"), value, tide_snapshot_value(value, boundary="write"))
+    event_type = RouterEvents.FORCE_WRITE if force else RouterEvents.STORE_WRITE
+    event = Event(source="runner", source_id=3, type=event_type, cause=Cause(description="test"), ocean_id=0, target_runner_id=3, payload=state, exec_id="execution")
+
+    if force:
+        router.on_force_write(event)
+    else:
+        router.on_store_write(event)
+
+    assert registry.get("global").get("key") == value
+    assert len(emitted) == 1
+    assert emitted[0].type == expected_type
+    assert emitted[0].cause.event_id == event.event_id
+    assert emitted[0].target_runner_id == "*"
+    # The consequence is a new occurrence captured at the Store mutation
+    # turn, not an alias of the earlier queued request payload.
+    assert emitted[0].payload is not state
+    assert emitted[0].payload.ref == state.ref
+    assert emitted[0].payload.value == state.value
+    assert (
+        emitted[0].payload.snapshot.value_hash
+        == tide_value_hasher(value)
+    )
+    assert emitted[0].exec_id == event.exec_id
+
+
+def test_store_router_missing_delete_emits_no_dependency_event():
+    emitted = []
+    registry = StoreRegistry()
+    registry.register(MemoryKVStore(name="global", scope="global"))
+    router = StoreRouter(registry, SimpleNamespace(
+        emit_event_to_ocean=emitted.append,
+        event_subscriber=lambda *args: None,
+    ))
+    event = Event(source="runner", source_id=3, type=RouterEvents.DELETE, cause=Cause(description="test"), ocean_id=0, target_runner_id=3, payload=Reference(DataRef("missing", "global")))
+
+    router.on_delete(event)
+
+    assert emitted == []
 
 
 def test_event_router_single_enum_subscription_is_idempotent():
     routed = []
-    router = EventRouter(SimpleNamespace(log_event=lambda event: None))
+    router = EventRouter(EventLogger())
 
     router.subscribe(RouterEvents.DELETE, routed.append)
     router.subscribe(RouterEvents.DELETE, routed.append)
-    router.route(Event(event_type=RouterEvents.DELETE))
+    router.route(Event(source="test", source_id="test", type=RouterEvents.DELETE, cause=Cause(description="test"), ocean_id=0, payload=Reference(DataRef("key", "global"))))
 
     assert len(routed) == 1
 
 
 def test_event_router_can_unsubscribe_an_absent_single_enum_consumer():
-    router = EventRouter(SimpleNamespace(log_event=lambda event: None))
+    router = EventRouter(EventLogger())
 
     router.unsubscribe(RouterEvents.DELETE, lambda event: None)
 
     assert router.subscribers[RouterEvents.DELETE] == []
 
 
+def test_event_router_records_log_events_without_delivering_them():
+    logger = EventLogger()
+    router = EventRouter(logger)
+    event = Event(
+        source="test",
+        source_id="test",
+        type=LogEvents.EFFECT,
+        cause=Cause(description="test"),
+        ocean_id=0,
+        payload=EffectOccurrence(Effects.WRITE, (), None, "runtime"),
+    )
+
+    router.route(event)
+
+    assert len(logger.occurrences) == 1
+    assert logger.events[0].event_id == event.event_id
+
+
+def test_event_router_routes_pipeline_event_to_exact_runner():
+    logger = EventLogger()
+    received = []
+    router = EventRouter(logger)
+    router.subscribed_runners[3] = SimpleNamespace(consume_event=received.append)
+    event = Event(source="test", source_id="test", type=PipelineEvents.BUILD, cause=Cause(description="test"), ocean_id=0, target_runner_id=3, payload=Reference(DataRef("key", "global")))
+
+    router.route(event)
+
+    assert logger.events[0].event_id == event.event_id
+    assert received == [event]
+
+
+def test_event_router_broadcasts_same_pipeline_event_to_active_runners():
+    first = []
+    second = []
+    router = EventRouter(EventLogger())
+    router.subscribed_runners = {
+        1: SimpleNamespace(consume_event=first.append),
+        2: SimpleNamespace(consume_event=second.append),
+    }
+    event = Event(source="test", source_id="test", type=PipelineEvents.BUILD, cause=Cause(description="test"), ocean_id=0, target_runner_id="*", payload=Reference(DataRef("key", "global")))
+
+    router.route(event)
+
+    assert first == [event]
+    assert second == [event]
+
+
+@pytest.mark.parametrize("target", [None, "missing"])
+def test_event_router_rejects_missing_pipeline_destination_after_logging(target):
+    logger = EventLogger()
+    router = EventRouter(logger)
+    event = Event(source="test", source_id="test", type=PipelineEvents.BUILD, cause=Cause(description="test"), ocean_id=0, target_runner_id=target, payload=Reference(DataRef("key", "global")))
+
+    with pytest.raises(ValueError):
+        router.route(event)
+
+    assert logger.events[0].event_id == event.event_id
+
+
+def test_event_router_logs_before_calling_ordinary_consumer():
+    logger = EventLogger()
+    router = EventRouter(logger)
+    event = Event(source="test", source_id="test", type=RouterEvents.DELETE, cause=Cause(description="test"), ocean_id=0, payload=Reference(DataRef("key", "global")))
+
+    def consume(received):
+        assert received is event
+        assert len(logger.occurrences) == 1
+
+    router.subscribe(RouterEvents.DELETE, consume)
+    router.route(event)
+
+
 def test_store_template_instances_do_not_share_default_state():
     first = StoreTemplate()
     second = StoreTemplate()
 
-    first.store["key"] = "value"
+    first.set("key", "value")
 
     assert first.scope == "global"
-    assert second.store == {}
+    assert second.dump() == {}
 
 
 def test_memory_store_uses_an_explicit_empty_template():
@@ -567,10 +450,11 @@ def test_memory_store_uses_an_explicit_empty_template():
 
     store.set("key", "value")
 
-    assert template == {"key": "value"}
+    assert template == {}
+    assert store.dump() == {"key": "value"}
 
 
-def test_duck_typed_model_internal_type_error_is_not_masked_or_retried():
+def test_diff_does_not_treat_duck_typed_objects_as_model_adapters():
     tide = TIDE()
     tide.event("Producer", writes={"@A": "a"})
     trace = tide.trace()
@@ -582,31 +466,31 @@ def test_duck_typed_model_internal_type_error_is_not_masked_or_retried():
         def to_model(
             self,
             *,
-            include_hashes=True,
-            identity_mode="host",
+            enrich=True,
+            identity_mode="literal",
         ):
             self.calls += 1
             raise TypeError("adapter implementation failed")
 
     adapter = BrokenModelAdapter()
 
-    with pytest.raises(TypeError, match="adapter implementation failed"):
-        trace.diff(adapter)
+    compared = trace.diff(adapter)
 
-    assert adapter.calls == 1
+    assert compared.same is False
+    assert adapter.calls == 0
 
 
-def test_duck_typed_no_argument_model_adapter_remains_supported():
+def test_diff_treats_no_argument_model_adapters_as_ordinary_values():
     tide = TIDE()
     tide.event("Producer", writes={"@A": "a"})
     trace = tide.trace()
-    model = trace.to_model(include_hashes=False)
+    model = trace.to_model(enrich=False)
 
     class NoArgumentModelAdapter:
         def to_model(self):
             return model
 
-    assert trace.diff(NoArgumentModelAdapter()).same
+    assert trace.diff(NoArgumentModelAdapter()).same is False
 
 
 def test_query_construction_is_silent_until_show(capsys):
@@ -711,8 +595,8 @@ def test_record_equality_handles_array_values_and_dependency_objects():
     assert dep == matching_dep
     assert left_input == right_input
     assert expanded_left == expanded_right
-    assert WriteRecord("test", left_value, 0, "global:@A") == WriteRecord(
-        "test",
+    assert WriteRecord(Cause(description="test"), left_value, 0, "global:@A") == WriteRecord(
+        Cause(description="test"),
         right_value,
         0,
         "global:@A",
@@ -728,7 +612,7 @@ def test_record_equality_handles_array_values_and_dependency_objects():
 def test_pipeline_runner_can_register_a_new_node_or_reject_bad_payload():
     tide = TIDE()
     base = Node(func=lambda: "base", targets=["global:base"])
-    definition = Pipeline(stages=[base], name="register-test")
+    definition = Pipeline(nodes=[base], name="register-test")
     definition = tide.ocean.register_pipeline(definition)
     runner = tide.ocean._create_pipeline_runner(
         definition,
@@ -737,19 +621,24 @@ def test_pipeline_runner_can_register_a_new_node_or_reject_bad_payload():
     )
     added = Node(func=lambda: "added", targets=["global:added"])
 
-    runner.on_register_node(Event(
-        event_type=PipelineEvents.REGISTER_NODE,
-        payload=added,
+    runner.on_register_node(Event(ocean_id=0, 
+        source="test",
+        source_id="test",
+        type=PipelineEvents.REGISTER_NODE,
+        cause=Cause(description="test"),
+        payload=Nodes((added,), ({},)),
     ))
 
-    indexed = runner.index.node_index.node_by_name["<lambda>"]
+    indexed = runner.index.node_index.node_by_definition_id[added.id]
     assert indexed.node is added
-    assert indexed.state.indexed is True
     assert indexed.id in runner.runtime_dag.forward_map
 
     with pytest.raises(EventHandlerError):
-        runner.on_register_node(Event(
-            event_type=PipelineEvents.REGISTER_NODE,
+        runner.on_register_node(Event(ocean_id=0, 
+            source="test",
+            source_id="test",
+            type=PipelineEvents.REGISTER_NODE,
+            cause=Cause(description="test"),
             payload=["not-a-node"],
         ))
 
@@ -763,7 +652,7 @@ def test_build_accepts_dynamic_reference_without_explicit_count():
         args=(dynamic,),
         targets=["global:out"],
     )
-    definition = Pipeline(stages=[consumer], name="build-test")
+    definition = Pipeline(nodes=[consumer], name="build-test")
     definition = tide.ocean.register_pipeline(definition)
     runner = tide.ocean._create_pipeline_runner(
         definition,
@@ -771,9 +660,12 @@ def test_build_accepts_dynamic_reference_without_explicit_count():
         {},
     )
 
-    runner.on_build(Event(
-        event_type=PipelineEvents.BUILD,
-        payload=("global", "out"),
+    runner.on_build(Event(ocean_id=0, 
+        source="test",
+        source_id="test",
+        type=PipelineEvents.BUILD,
+        cause=Cause(description="test"),
+        payload=Reference(DataRef(key="out", store="global")),
     ))
 
 
@@ -792,8 +684,8 @@ def test_capture_model_query_and_bundle_preserve_exact_relationships():
     )
 
     captured = tide.trace()
-    model = captured.to_model(include_hashes=False)
-    report = TIDE.validate_model(model)
+    model = captured.to_model(enrich=False)
+    report = TIDE.report_model_validity(model)
     projected = TIDE.from_model(model)
     restored = TIDE.from_bundle(projected.to_bundle())
 
@@ -818,10 +710,8 @@ def test_capture_model_query_and_bundle_preserve_exact_relationships():
         "exec_id",
         "exec_id",
     ).exists()
-    restored_model = restored.to_model(include_hashes=False)
-    assert restored_model["schema"] == model["schema"]
-    assert restored_model["schema_version"] == model["schema_version"]
-    assert restored_model["host"] == model["host"]
+    restored_model = restored.to_model(enrich=False)
+    assert restored_model.get("host") == model.get("host")
     assert {
         (edge["exec_id"], edge["state_id"])
         for edge in restored_model["I"]
@@ -838,68 +728,16 @@ def test_capture_model_query_and_bundle_preserve_exact_relationships():
     }
 
 
-def test_lines_from_edges_returns_actor_heading_and_edge_line_once():
+def test_downstream_show_renders_the_recorded_handoff_once():
     tide = TIDE()
     tide.event("Producer", writes={"@A": "a"})
     tide.event("Consumer", reads={"@A": "a"}, writes={"@B": "b"})
     trace = tide.trace()
 
-    producer = trace.exec_log[0]
-    consumer = trace.exec_log[1]
-    edge = trace.index.producer_exec_id_to_consumer_input_edges[
-        producer.exec_id
-    ][0]
+    producer = trace.log[0]
+    stream = trace.downstream(producer.exec_id, "exec_record", depth=0)
+    output = stream.show(color=False)
 
-    lines = trace._lines_from_edges([edge], "downstream")
-
-    assert len(lines) == 2
-    assert lines[0] == repr(
-        trace.inspect(consumer.exec_id, "exec_id").object
-    )
-    assert lines[1].startswith("      └─ via global:@A[v0], affected ")
-
-
-def test_blocked_missing_ref_builds_affected_record_before_attaching_it():
-    cause = ("MissingRefFallback",)
-    blocked_ref = DataRef(key="@A", store="global")
-    versioned_blocker = ("global:@A", 0)
-    effect = EffectRecord(cause, versioned_blocker, origin="runtime")
-    record = make_exec_record(
-        exec_id="blocked-source",
-        effects=[effect],
-        writes=[WriteRecord("audit", "a", 0, "global:@A")],
-    )
-    events = [
-        {
-            "event_type": LogEvents.EVENT_EXEC,
-            "payload": record,
-            "source_id": "source",
-            "exec_id": record.exec_id,
-        },
-        {
-            "event_type": LogEvents.NODE_BLOCKED,
-            "payload": (
-                "blocked-node",
-                blocked_ref,
-                [("args", "input")],
-                cause,
-            ),
-            "source_id": "runner",
-            "exec_id": record.exec_id,
-        },
-    ]
-
-    LogTools(ocean_id="audit").reconstruct_causality(events)
-
-    affected = list(effect.affected.values())
-
-    assert len(affected) == 1
-    assert affected[0].affectee == Actor(
-        "audit",
-        "runner",
-        "blocked-node",
-    )
-    assert affected[0].targets == versioned_blocker
-    assert affected[0].affected_inputs == [
-        {"name": "args", "index": None}
-    ]
+    assert stream.count() == 1
+    assert output.count("global:@A[v0]") == 1
+    assert "EXEC_RECORD[1] Consumer" in output

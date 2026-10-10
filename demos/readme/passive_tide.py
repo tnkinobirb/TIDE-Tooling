@@ -13,8 +13,8 @@ def pipeline() -> Trace:
 
     # "data_available" is never explicitly registered as a Reference.
     data_available = True    
-    # Ocean creates one for it, but can be toggled-off
-    # Toggling off means the data is not persisted, tracked or shown explicitly with versioning, so data may silently change over time. 
+    # TIDE represents this otherwise-untracked input explicitly as external
+    # evidence in the Trace.
     
     tide.exec(get_data, args=data_available, writes=["got_data"])
     tide.exec(report_data, reads=["got_data"], writes=["report"])

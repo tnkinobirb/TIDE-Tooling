@@ -8,68 +8,19 @@ class NodeDefinitionError(PipelineError):
     """Raised when a route (node) is incorrectly defined e.g (bad func, bad target etc) """
     pass
 
-# Resolution Errors:
-class NodeResolutionError(PipelineError):
-    """Raised when a route's (node's) dependencies fail to be resolved"""
-    pass
- 
-# Definiton Errors:
-class StageDefinitionError(PipelineError):
-    """Raised when a stage (collection of nodes) is incorrectly defined (bad name, bad list/tuple)"""
-    pass
-
-# Indexing Errors:
-
-class NodeIndexError(PipelineError):
-    """Raised when a node fails to be indexed"""
-    pass 
-
-class StageIndexError(PipelineError):
-    """Raised when a stage fails to be indexed"""
-    pass
-
-class DAGIndexError(PipelineError):
-    """Raised when DAG graph elements are failed to be indexed meaning The DAG graph fails to be built"""
-    pass
-
-class PipelineIndexError(PipelineError):
-    """Raised when a route (node) fails to be indexed """
-    pass
-
 # Runtime Errors:
 
 class PipelineRuntimeError(PipelineError):
     """Raised when a route (node) fails to execute properly or the pipeline_runner hits an error  """
     pass
 
-class PipelineCycleError(PipelineError):
-    """Raised when pipeline nodes form a definite dependency cycle."""
-    pass
-
 class PipelineDeadlockError(PipelineRuntimeError):
     """Raised when a non-persistent pipeline cannot satisfy its remaining refs."""
-    pass
-
-# Dependency Errors:
-class DependencyExtractionError(PipelineError):
-    """Raised when DependencyExtractor fails to exttact a @dependency.string correctly"""
-    pass
-
-# DependencyTools Errors:
-class DependencyToolsInitError(PipelineError):
-    """Raised when DependencyTools hits an error while initialising"""
     pass
 
 class CallableDependencyError(PipelineError):
     """Raised when a Callable Node input hits an error while calling"""
     pass
-
-# KVStore Processing Errors
-class ContactMeNowError(PipelineError):
-    def __init__(self, str, error: Exception):
-        self.str = str
-        self.error = error
-        pass
 
 class StoreReferenceAmbiguityError(PipelineError):
     def __init__(self, message, name=None):
@@ -108,10 +59,6 @@ class NodeFailed(PipelineError):
         self.error = error
         super().__init__(str(error))
 
-class GetResultFromFutureError(PipelineError):
-    """Raise when a result is failed to be gathered from a Future object"""
-    pass
-
 # Base Exception Class
 class TIDEError(Exception):
     """Base class for all TIDE error objects"""
@@ -119,13 +66,19 @@ class TIDEError(Exception):
 
 
 class ReadInsideProcessPoolError(TIDEError):
-    """Signal that a runtime READ must be retried in shared-memory mode."""
+    """A live runtime READ is unavailable inside an explicit process pool."""
 
     pass
 
 
 class DeleteNowInsideProcessPoolError(ReadInsideProcessPoolError):
-    """Signal that DELETE_NOW must be retried in shared-memory mode."""
+    """DELETE_NOW is unavailable inside an explicit process pool."""
+
+    pass
+
+
+class WriteNowInsideProcessPoolError(ReadInsideProcessPoolError):
+    """WRITE_NOW is unavailable inside an explicit process pool."""
 
     pass
 
@@ -178,3 +131,9 @@ class StoreAlreadyRegisteredError(TIDEError):
         super().__init__(error_str)
         self.store = store 
         pass
+
+class ActorOccurrenceAlreadyAssignedError(TIDEError):
+    def __init__(self, error_str, exec_record_id):
+        super().__init__(error_str)
+        self.exec_id = exec_record_id
+        

@@ -2,414 +2,499 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from tide_tooling.tooling_core.engine.events import Effects
-from tide_tooling.tooling_core.engine.tide_links import AffectedStackLink, EmittedStackLink, StackLink
-from tide_tooling.tooling_core.engine.tide_records import (
-    AffectedRecord,
-    DependencyUseRecord,
-    EffectRecord,
-    EmittedNodeRecord,
-    ExecRecord,
-    WriteRecord,
+from tide_tooling.tooling_core.engine.tide_links import EffectEdge, ReadEdge
+from tide_tooling.tooling_core.engine.tide_records import AffectedRecord, ActorOccurrence
+from tide_tooling.tooling_core.engine.utils import (
+    DedupedList,
+    TIDEValueSnapshot,
+    deduped_dict,
+    ensure_tide_snapshot,
+    tide_value_hasher,
 )
-from tide_tooling.tooling_core.engine.utils import DedupedList, deduped_dict, tide_value_hasher
+from tide_tooling.tooling_core.engine.tide_evidence import RestoringValueMap
+
+
+class _FrozenMultiMap(Mapping):
+    """Immutable defaultdict-like view used by a sealed TraceIndex."""
+
+    def __init__(self, values):
+        self._values = MappingProxyType({
+            key: tuple(items)
+            for key, items in values.items()
+        })
+
+    def __getitem__(self, key):
+        return self._values.get(key, ())
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __contains__(self, key):
+        return key in self._values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
 
 class TraceIndex:
-    def __init__(self, ocean_id):
-        self.source_ocean_id = ocean_id
+    def __setattr__(self, name, value):
+        if getattr(self, "_tide_sealed", False):
+            raise AttributeError("TraceIndex is sealed Trace evidence")
+        object.__setattr__(self, name, value)
 
-        # exec / actor
+    def __init__(self):
+        self._tide_sealed = False
+        # Retain explicit readiness outcomes which do not create ExecRecords.
+        self.ready_exec_ids = frozenset()
+        self.blocked_exec_ids = frozenset()
+        # Index executions and their actors.
         self.exec_by_exec_id = {}
+        self.exec_ids_by_runner_node = deduped_dict()
+        self.exec_ids_by_definition_id = deduped_dict()
         self.actor_to_exec_ids = deduped_dict()
+        self.actor_occurrence_to_exec_id: dict[ActorOccurrence, str] = {}
         self.func_name_to_actors = deduped_dict()
-        self.actors_by_emitter_actor = deduped_dict()
-        self.actor_to_emitter_actors = deduped_dict()
-        self.emitted_actor_to_emitter_exec_ids = deduped_dict()
+        self.parent_exec_id_by_exec_id = {}
+        self.child_exec_ids_by_exec_id = deduped_dict()
 
-        # reads / writes
-        self.reads_by_exec_id = deduped_dict()
-        self.writes_by_exec_id = deduped_dict()
-        self.ref_ver_to_read_egdes  = deduped_dict()
-        self.ref_ver_to_write_egde = deduped_dict()
-        self.ref_to_writer_exec_ids = deduped_dict()
-        self.ref_to_consumer_exec_ids = deduped_dict()
+        # Index evidence by exact reference occurrence.
+        self.read_records_by_ref_version = deduped_dict()
+        self.write_records_by_ref_version = deduped_dict()
         self.versions_by_ref = deduped_dict()
         self.seen_refs = DedupedList()
 
-        # ref-version truth
-        self.ref_version_to_producer_exec_id = {}
-        self.ref_version_to_consumer_exec_ids = deduped_dict()
-
-        # value truth
-        self.value_by_hash = {}
-        self.value_repr_by_hash = {}
+        # Index the execution relationships of each occurrence.
+        self.producer_exec_ids_by_ref_version = deduped_dict()
+        self.consumer_exec_ids_by_ref_version = deduped_dict()
+        # Index captured values and their State occurrences.
+        self._value_snapshots_by_hash = {}
+        self.value_by_hash = RestoringValueMap({})
         self.value_hash_by_ref_version = {}
-        self.value_hash_to_versioned_refs = deduped_dict()
-        self.value_hash_to_producer_exec_ids = deduped_dict()
-        self.value_hash_to_consumer_exec_ids = deduped_dict()
+        self.ref_versions_by_value_hash = deduped_dict()
+        self.observed_value_hashes_by_ref_version = deduped_dict()
 
-        # causal stack edges
-        self.input_and_pos_by_exec_input_name_and_ver_ref = defaultdict(lambda: defaultdict(lambda: deduped_dict()))
-        self.consumer_exec_id_to_producer_input_edges = deduped_dict()
-        self.producer_exec_id_to_consumer_input_edges = deduped_dict()
+        # Index every execution relationship from both ends.
+        self.producer_edges_by_exec_id = deduped_dict()
+        self.consumed_edges_by_exec_id = deduped_dict()
 
-        # effects
-        self.effects_by_exec_id = deduped_dict()
-        self.effect_type_to_affected = deduped_dict()
-        self.effect_to_affected = deduped_dict()
-        self.effect_versioned_target_to_affected = deduped_dict()
-        self.effect_type_to_producer_exec_ids = deduped_dict()
-        self.effect_to_producer_exec_ids = deduped_dict()
-        self.effect_versioned_target_to_producer_exec_ids = deduped_dict()
-        self.effect_type_to_versioned_effects = deduped_dict()
-        self.effect_to_touched_exec_ids = deduped_dict()
-        self.ref_version_to_effects = deduped_dict()
-        self.effect_records_by_type = deduped_dict()
-        self.effect_records_by_target = deduped_dict()
-        self.effect_records_by_versioned_target = deduped_dict()
-        self.effect_affected_input_positions = deduped_dict()
+        # Retain each target-level Effect occurrence and its producer.
+        self.effect_by_occurrence = {}
+        self.effect_occurrences_by_event_id = deduped_dict()
+        self.effect_occurrences_by_type = deduped_dict()
+        self.effect_occurrences_by_target = deduped_dict()
+        self.effect_occurrences_by_ref_version = deduped_dict()
+        self.affected_records_by_effect_occurrence = deduped_dict()
         self.deleted_ref_versions = set()
 
-    def _dep_queue(self, record):
-        return record.expanded_to if record.type == "dynamic" else [record]
+        
 
-    def _index_value_touch(self, hashed, val, ref, ver):
-        self.value_by_hash[hashed] = val
-        self.value_repr_by_hash[hashed] = repr(val) 
-        self.value_hash_by_ref_version[(ref, ver)] = hashed
-        self.value_hash_to_versioned_refs[hashed].add((ref, ver))
+    @staticmethod
+    def _concretised_from(dependency):
+        if dependency.type == "dynamic":
+            return tuple(dependency.expanded_to or ())
+        return (dependency,)
 
+    def _register_value(self, value):
+        snapshot = (
+            value
+            if isinstance(value, TIDEValueSnapshot)
+            else ensure_tide_snapshot(value, boundary="trace.index")
+        )
+        value_hash = snapshot.value_hash
+        retained = self._value_snapshots_by_hash.get(value_hash)
+        if retained is None or (not retained.exact and snapshot.exact):
+            self._value_snapshots_by_hash[value_hash] = snapshot
+        return value_hash
 
-    def _index_ref_touch(self, ref, exec_id, actor):
+    def _register_hash_only(self, value_hash, lineage):
+        if value_hash in self._value_snapshots_by_hash:
+            return
+        evidence = next(
+            (
+                entry
+                for entry in lineage or ()
+                if isinstance(entry, dict)
+                and entry.get("value_hash") == value_hash
+            ),
+            {},
+        )
+        self._register_value(TIDEValueSnapshot(
+            value_hash=value_hash,
+            capture_method="hash",
+            type_name=evidence.get("type", "unknown"),
+            representation=evidence.get("repr", "<snapshot unavailable>"),
+            boundary=evidence.get("boundary", "trace.index.authority"),
+            exact=False,
+            observed_mutable=bool(evidence.get("observed_mutable", False)),
+            trusted=bool(evidence.get("trusted", True)),
+        ))
+
+    def _establish_state_value(self, value, ref, version):
+        value_hash = self._register_value(value)
+        ref_version = (ref, version)
+        existing = self.value_hash_by_ref_version.get(ref_version)
+        if existing is None:
+            self.value_hash_by_ref_version[ref_version] = value_hash
+            self.ref_versions_by_value_hash[value_hash].add(ref_version)
+        elif existing != value_hash:
+            self.observed_value_hashes_by_ref_version[ref_version].add(
+                value_hash
+            )
+
+    def _observe_state_value(
+        self,
+        value,
+        ref,
+        version,
+        *,
+        authoritative_hash=None,
+        lineage=None,
+    ):
+        value_hash = self._register_value(value)
+        ref_version = (ref, version)
+        authoritative = self.value_hash_by_ref_version.get(ref_version)
+        if authoritative is None:
+            # Validation is the sole authority for producerless States.  A
+            # first mutable observation may prove an earlier stored identity
+            # than the value which that read happened to observe.
+            authoritative = authoritative_hash or value_hash
+            self._register_hash_only(authoritative, lineage)
+            self.value_hash_by_ref_version[ref_version] = authoritative
+            self.ref_versions_by_value_hash[authoritative].add(ref_version)
+        if authoritative != value_hash:
+            self.observed_value_hashes_by_ref_version[ref_version].add(
+                value_hash
+            )
+
+    def _index_read_as_edge(self, execution, read, state_authorities):
+        exec_id = execution.exec_id
+        ref = read.unscoped_reference
+        version = read.resolved_version
+        ref_version = (ref, version)
+
         self.seen_refs.add(ref)
+        self.read_records_by_ref_version[ref_version].add(read)
+        self.versions_by_ref[ref].add(version)
+        self.consumer_exec_ids_by_ref_version[ref_version].add(exec_id)
+        snapshot = (
+            read._tide_snapshot("resolved_value")
+            if hasattr(read, "_tide_snapshot")
+            else None
+        )
+        self._observe_state_value(
+            snapshot or read.resolved_value,
+            ref,
+            version,
+            authoritative_hash=state_authorities.get(ref_version),
+            lineage=getattr(read, "snapshot_lineage", ()),
+        )
 
-    def _index_input_edge(self, log: ExecRecord, dep_use_record:DependencyUseRecord):
-        exec_id = log.exec_id
-        producer_exec_id = dep_use_record.producer_exec_id
-        ref = dep_use_record.unscoped_reference
-        ver = dep_use_record.resolved_version
+        edge = ReadEdge(execution, read)
+        self.producer_edges_by_exec_id[exec_id].add(edge)
+        if read.producer_exec_id is not None:
+            self.consumed_edges_by_exec_id[read.producer_exec_id].add(edge)
 
-        input_edge = StackLink({
-            "affected_input": dep_use_record.associated_input,
-            "affected_input_index": dep_use_record.input_index,
-            "affected_actor": log.producer_id,
-            "affected_exec_id": exec_id,
-            "producer_actor": dep_use_record.producer_actor,
-            "producer_exec_id": producer_exec_id,
-            "produced_ref": ref,
-            "produced_ref_version": ver,
-            
-        })
+    def _index_write(self, execution, write):
+        exec_id = execution.exec_id
+        ref = write.stored_target
+        version = write.stored_version
+        ref_version = (ref, version)
 
-        self.consumer_exec_id_to_producer_input_edges[exec_id].append(input_edge)
-        if producer_exec_id is not None:
-            self.producer_exec_id_to_consumer_input_edges[producer_exec_id].append(input_edge)
+        self.seen_refs.add(ref)
+        self.write_records_by_ref_version[ref_version].add(write)
+        self.versions_by_ref[ref].add(version)
+        self.producer_exec_ids_by_ref_version[ref_version].add(exec_id)
+        snapshot = (
+            write._tide_snapshot("stored_result")
+            if hasattr(write, "_tide_snapshot")
+            else None
+        )
+        self._establish_state_value(
+            snapshot or write.stored_result,
+            ref,
+            version,
+        )
 
-    def _index_dep_record(self, log: ExecRecord, dep_use_record: DependencyUseRecord):
-        exec_id = log.exec_id
-        ref = dep_use_record.unscoped_reference
-        ver = dep_use_record.resolved_version
-        val = dep_use_record.resolved_value
-        hashed = tide_value_hasher(val)
+    @staticmethod
+    def _effect_target(record):
+        target = record.targets
+        state_effect = record.effect in {
+            Effects.READ,
+            Effects.WRITE,
+            Effects.DELETE,
+        }
+        if (
+            state_effect
+            and isinstance(target, tuple)
+            and len(target) == 2
+            and isinstance(target[0], str)
+        ):
+            return target[0], target[1], True
 
-        self._index_input_edge(log, dep_use_record)
-        self.input_and_pos_by_exec_input_name_and_ver_ref[exec_id][dep_use_record.associated_input[0]][(ref, ver)].append(dep_use_record.input_index)
+        try:
+            hash(target)
+        except TypeError:
+            target = repr(target)
 
-        self._index_ref_touch(ref, exec_id, log.producer_id)
-        self.ref_to_consumer_exec_ids[ref].add(exec_id)
-        self.versions_by_ref[ref].add(ver)
+        return target, None, False
 
-        self.ref_version_to_consumer_exec_ids[(ref, ver)].add(exec_id)
+    def _index_effect(self, execution, record):
+        event_id = record.event_id
+        target_position = len(self.effect_occurrences_by_event_id[event_id])
+        occurrence = (event_id, target_position)
+        effect = record.effect
+        target, version, versioned = self._effect_target(record)
 
-        self._index_value_touch(hashed, val, ref, ver)
+        self.effect_by_occurrence[occurrence] = (execution.exec_id, record)
+        self.effect_occurrences_by_event_id[event_id].add(occurrence)
+        self.effect_occurrences_by_type[effect].add(occurrence)
+        self.effect_occurrences_by_target[(effect, target)].add(occurrence)
 
-        self.value_hash_to_consumer_exec_ids[hashed].add(exec_id)
+        if versioned:
+            ref_version = (target, version)
+            self.seen_refs.add(target)
+            self.effect_occurrences_by_ref_version[
+                (effect, target, version)
+            ].add(occurrence)
+            if effect == Effects.DELETE and record.target_existed:
+                self.deleted_ref_versions.add(ref_version)
+            elif effect == Effects.WRITE:
+                self.deleted_ref_versions.discard(ref_version)
 
-    def _index_write_record(self, log, record: WriteRecord):
-        exec_id = log.exec_id
-        ref = record.stored_target
-        ver = record.stored_version
-        val = record.stored_result
-        hashed = tide_value_hasher(val)
+        for affected in record.affected.values():
+            self._index_effect_as_edge(
+                execution,
+                record,
+                occurrence,
+                affected,
+            )
 
-        self._index_ref_touch(ref, exec_id, log.producer_id)
-        self.ref_to_writer_exec_ids[ref].add(exec_id)
+        return occurrence
 
-        self.ref_version_to_producer_exec_id[(ref, ver)] = exec_id
-        self.versions_by_ref[ref].add(ver)
+    def _index_effect_as_edge(
+        self,
+        execution,
+        record,
+        occurrence,
+        affected,
+    ):
+        self.affected_records_by_effect_occurrence[occurrence].add(affected)
+        if affected.affected_exec_id is None:
+            return
 
-        self._index_value_touch(hashed, val, ref, ver)
-        self.value_hash_to_producer_exec_ids[hashed].add(exec_id)
+        target, version, versioned = self._effect_target(record)
+        if record.effect == Effects.WRITE and versioned:
+            self.consumer_exec_ids_by_ref_version[
+                (target, version)
+            ].add(affected.affected_exec_id)
 
+        edge = EffectEdge(execution, record, affected)
+        self.producer_edges_by_exec_id[affected.affected_exec_id].add(edge)
+        self.consumed_edges_by_exec_id[execution.exec_id].add(edge)
 
-    def _index_affect_record(self, effect, target, ver, actor, affect_record: AffectedRecord):
-
-        self.effect_type_to_affected[effect].append({actor: affect_record})
-        self.effect_to_affected[(effect, target)].append({actor: affect_record})
-        self.effect_versioned_target_to_affected[(effect, (target, ver))].append({actor: affect_record})
-
-        if effect == Effects.WRITE and affect_record.affected_exec_id:
-            self.ref_version_to_consumer_exec_ids[(target, ver)].add(affect_record.affected_exec_id)
-
-    def _affected_inputs_for(self, affectee_log: ExecRecord, targets):
+    def _inputs_read_from(self, execution, ref_version):
         affected_inputs = []
 
-        for _, input_use_record in affectee_log.inputs.items():
-            for dependency in input_use_record.dependencies:
-                for dep_record in self._dep_queue(dependency):
-                    reference = dep_record.unscoped_reference
-                    version = dep_record.resolved_version
+        for _, input_record in execution.inputs.items():
+            for dependency in input_record.dependencies:
+                for read in self._concretised_from(dependency):
+                    if (
+                        read.unscoped_reference,
+                        read.resolved_version,
+                    ) != ref_version:
+                        continue
 
-                    if (reference, version) == targets:
-                        affected_input = {
-                            "name": input_use_record.name,
-                            "index": dep_record.input_index,
-                        }
-                        if affected_input not in affected_inputs:
-                            affected_inputs.append(affected_input)
+                    affected_input = {
+                        "name": input_record.name,
+                        "index": read.input_index,
+                    }
+                    if affected_input not in affected_inputs:
+                        affected_inputs.append(affected_input)
 
         return affected_inputs
 
-    def _index_effect_record(self, log, record):
-        record: EffectRecord
-        exec_id = log.exec_id
-        effect = record.effect
-        targets = record.targets
-        target = targets[0]
-        ver = targets[1]
+    def _index_write_effect_edges(self, execution, record, occurrence):
+        target, version, versioned = self._effect_target(record)
+        if record.effect != Effects.WRITE or not versioned:
+            return
 
-        if target != "Runner":
-            self.seen_refs.add(target)
-            if effect == Effects.DELETE and record.target_existed is True:
-                self.deleted_ref_versions.add((target, ver))
-            elif effect == Effects.WRITE:
-                self.deleted_ref_versions.discard((target, ver))
+        existing = {
+            affected.affected_exec_id
+            for affected in self.affected_records_by_effect_occurrence[
+                occurrence
+            ]
+        }
 
-        self.effect_records_by_type[effect].append(record)
-        self.effect_records_by_target[(effect, target)].append(record)
-        self.effect_records_by_versioned_target[
-            (effect, target, ver)
-        ].append(record)
-        self.effect_type_to_versioned_effects[effect].add(
-            (effect, (target, ver))
-        )
-
-        affectees = []
-
-        if effect == Effects.WRITE:
-            affectees = self.ref_version_to_consumer_exec_ids[(target, ver)]
-            self.effect_type_to_versioned_effects[effect].add((effect, (target, ver)))
-
-        indexed_affected_exec_ids = set()
-        for actor , affect_record in record.affected.items():
-            affect_record: AffectedRecord
-            self._index_affect_record(effect, target, ver, actor, affect_record)
-            affected_exec_id = affect_record.affected_exec_id
-            if affected_exec_id:
-                indexed_affected_exec_ids.add(affected_exec_id)
-                affected_log = self.exec_by_exec_id.get(affected_exec_id)
-                if affected_log is not None:
-                    affected_stack_link = AffectedStackLink(
-                        log.exec_id,
-                        log.producer_id,
-                        effect,
-                        target,
-                        ver,
-                        affected_exec_id,
-                        affected_log.producer_id,
-                        affect_record.affected_inputs,
-                    )
-                    self.consumer_exec_id_to_producer_input_edges[
-                        affected_exec_id
-                    ].append(affected_stack_link)
-                    self.producer_exec_id_to_consumer_input_edges[
-                        log.exec_id
-                    ].append(affected_stack_link)
-                    self.effect_to_touched_exec_ids[
-                        (effect, target)
-                    ].add(affected_exec_id)
-            self.effect_affected_input_positions[
-                (effect, target, ver, affect_record.affected_exec_id)
-            ].extend(affect_record.affected_inputs or [])
-
-        for affectee_id in affectees:
-            if affectee_id in indexed_affected_exec_ids:
+        for consumer_exec_id in self.consumer_exec_ids_by_ref_version[
+            (target, version)
+        ]:
+            if consumer_exec_id in existing:
                 continue
-            affectee_log = self.exec_by_exec_id[affectee_id]
-            affected_inputs = self._affected_inputs_for(affectee_log, (target, ver))
-            affected = AffectedRecord(effect, (target, ver), affectee_log.producer_id, affected_inputs, affectee_id)
 
-            self.ref_to_consumer_exec_ids[target].add(affectee_id)
-            self.ref_version_to_consumer_exec_ids[(target, ver)].add(affectee_id)
-
-            self.effect_to_touched_exec_ids[(effect, target)].add(affectee_id)
-
-            affected_stack_link = AffectedStackLink(
-                log.exec_id,
-                log.producer_id,
-                effect,
-                target,
-                ver,
-                affectee_id,
-                affectee_log.producer_id,
-                affected_inputs,
+            consumer = self.exec_by_exec_id[consumer_exec_id]
+            affected = AffectedRecord(
+                Effects.WRITE,
+                (target, version),
+                consumer.producer_id,
+                self._inputs_read_from(consumer, (target, version)),
+                consumer_exec_id,
+            )
+            self._index_effect_as_edge(
+                execution,
+                record,
+                occurrence,
+                affected,
             )
 
-            self.consumer_exec_id_to_producer_input_edges[affectee_id].append(affected_stack_link)
-            self.producer_exec_id_to_consumer_input_edges[log.exec_id].append(affected_stack_link)
-
-            record.affected[affectee_log.producer_id] = affected
-            self.effect_type_to_affected[effect].append({affected.affectee: affected})
-            self.effect_to_affected[(effect, target)].append({affected.affectee: affected})
-            self.effect_versioned_target_to_affected[(effect, (target, ver))].append({affected.affectee: affected})
-            self.effect_affected_input_positions[
-                (effect, target, ver, affectee_id)
-            ].extend(affected_inputs)
-
-        self.effects_by_exec_id[exec_id].append(record)
-        if target != "Runner":
-            self.ref_version_to_effects[(target, ver)].add(record)
-
-        self.effect_to_producer_exec_ids[(effect, target)].add(exec_id)
-        self.effect_versioned_target_to_producer_exec_ids[(effect, target, ver)].add(exec_id)
-        self.effect_to_touched_exec_ids[(effect, target)].add(exec_id)
-        self.effect_type_to_producer_exec_ids[effect].add(exec_id)
-
-    def _index_emitted_node_record(
+    def build(
         self,
-        emitter_log: ExecRecord,
-        record: EmittedNodeRecord,
-        emitted_exec_id=None,
+        log,
+        *,
+        state_authorities=None,
+        value_backing=None,
+        ready_exec_ids=(),
+        blocked_exec_ids=(),
     ):
-        emitter_actor = emitter_log.producer_id
-        emitted_actor = record.producer_id
-        self.actors_by_emitter_actor[emitter_actor].add(emitted_actor)
-        self.actor_to_emitter_actors[emitted_actor].add(emitter_actor)
-        self.emitted_actor_to_emitter_exec_ids[emitted_actor].add(
-            emitter_log.exec_id
-        )
+        executions = tuple(sorted(log, key=lambda execution: execution.seq_id))
+        state_authorities = dict(state_authorities or {})
+        value_backing = dict(value_backing or {})
 
-        emitted_link = EmittedStackLink(
-            emitter_log.exec_id,
-            emitter_actor,
-            emitted_exec_id,
-            emitted_actor,
-        )
-        if emitted_exec_id is not None:
-            self.consumer_exec_id_to_producer_input_edges[
-                emitted_exec_id
-            ].append(emitted_link)
-        self.producer_exec_id_to_consumer_input_edges[
-            emitter_log.exec_id
-        ].append(emitted_link)
+        # A Bundle's value table is backing storage keyed by the value hash
+        # recorded in TideRun. The value itself may disagree with that key;
+        # that disagreement is an observation, never a replacement identity.
+        for value_hash, value in value_backing.items():
+            if not isinstance(value_hash, str):
+                raise TypeError("Trace value backing hashes must be strings")
+            self._value_snapshots_by_hash[value_hash] = ensure_tide_snapshot(
+                value,
+                boundary="bundle.import",
+            )
 
-    def _link_deleted_runtime_reads(self, exec_logs):
-        last_delete_by_ref_version = {}
-
-        for log in exec_logs:
-            for record in log.effects:
-                target, version = record.targets
-                versioned_target = (target, version)
-
-                if (
-                    record.effect == Effects.DELETE
-                    and record.target_existed is True
-                ):
-                    last_delete_by_ref_version[versioned_target] = record
-                    continue
-
-                if record.effect != Effects.READ:
-                    continue
-                if record.target_existed is not False:
-                    continue
-
-                delete_record = last_delete_by_ref_version.get(
-                    versioned_target
+        # Seed the exact State identities recorded by the evidence source
+        # before inspecting any hydrated Python values.
+        for state, value_hash in state_authorities.items():
+            if (
+                not isinstance(state, tuple)
+                or len(state) != 2
+            ):
+                raise TypeError(
+                    "Trace State authority keys must be (reference, version)"
                 )
-                if delete_record is None:
-                    continue
+            if not isinstance(value_hash, str):
+                raise TypeError("Trace State authority hashes must be strings")
 
-                delete_record.affected[log.producer_id] = AffectedRecord(
-                    Effects.DELETE,
-                    versioned_target,
-                    log.producer_id,
-                    [{"name": "runtime_read", "index": None}],
-                    log.exec_id,
+            existing = self.value_hash_by_ref_version.get(state)
+            if existing is not None and existing != value_hash:
+                raise ValueError(
+                    "Trace received conflicting State authorities: "
+                    f"{state[0]}[v{state[1]}]"
                 )
 
-    def build(self, exec_logs):
-        exec_logs = list(exec_logs)
-        exec_ids_by_node_id = defaultdict(list)
+            self.value_hash_by_ref_version[state] = value_hash
+            self.ref_versions_by_value_hash[value_hash].add(state)
 
-        # Pass one establishes complete producer/consumer truth. Effects can
-        # point at executions that occur later in the log, so indexing them in
-        # the same forward pass silently missed downstream affectees.
-        for idx, log in enumerate(exec_logs):
-            log: ExecRecord
-            log.seq_id = idx
-            exec_id = log.exec_id
+            if value_hash not in self._value_snapshots_by_hash:
+                self._register_hash_only(value_hash, ())
 
-            self.exec_by_exec_id[exec_id] = log
-            exec_ids_by_node_id[log.node_id].append(exec_id)
-            self.reads_by_exec_id[exec_id].extend(log.deps)
-            for dep_record in log.deps:
-                queue = [dep_record]
-                if dep_record.type == "dynamic":
-                    queue = [record for record in dep_record.expanded_to]
-                        
-                for record in queue:
-                    ref = record.unscoped_reference
-                    ver = record.resolved_version
-                    self.ref_ver_to_read_egdes[(ref, ver)].append(record)
+        self.ready_exec_ids = frozenset(ready_exec_ids or ())
+        self.blocked_exec_ids = frozenset(blocked_exec_ids or ())
 
-            self.writes_by_exec_id[exec_id].extend(log.writes)
-            for write_record in log.writes:
-                ref = write_record.stored_target
-                ver = write_record.stored_version
-                self.ref_ver_to_write_egde[(ref, ver)] = write_record
+        for execution in executions:
+            exec_id = execution.exec_id
+            actor = execution.producer_id
+            actor_occurrence_id = execution.producer_occurrence_id
 
-            self.actor_to_exec_ids[log.producer_id].add(exec_id)
-            self.func_name_to_actors[log.producer_id.source_actor].add(log.producer_id)
+            self.exec_by_exec_id[exec_id] = execution
+            self.exec_ids_by_runner_node[
+                (execution.runner_id, execution.node_id)
+            ].add(exec_id)
+            if execution.base_node_id is not None:
+                self.exec_ids_by_definition_id[
+                    execution.base_node_id
+                ].add(exec_id)
+            self.actor_to_exec_ids[actor].add(exec_id)
+            if actor_occurrence_id is not None:
+                self.actor_occurrence_to_exec_id[
+                    actor_occurrence_id
+                ] = exec_id
+            self.func_name_to_actors[actor.source_actor].add(actor)
+            parent_exec_id = getattr(execution, "emitted_by_exec_id", None)
+            if parent_exec_id is not None:
+                self.parent_exec_id_by_exec_id[exec_id] = parent_exec_id
+                self.child_exec_ids_by_exec_id[parent_exec_id].add(exec_id)
 
-            for record in log.deps:
-                record: DependencyUseRecord
+            for write in execution.writes:
+                self._index_write(execution, write)
 
-                for dep_use_record in self._dep_queue(record):
-                    self._index_dep_record(log, dep_use_record)
+        for execution in executions:
+            for dependency in execution.deps:
+                for read in self._concretised_from(dependency):
+                    self._index_read_as_edge(
+                        execution,
+                        read,
+                        state_authorities,
+                    )
 
-            for record in log.writes:
-                record: WriteRecord
-                self._index_write_record(log, record)
-
-        # A failed runtime READ after DELETE is causally affected by the
-        # deletion, but it is not a successful value dependency.
-        self._link_deleted_runtime_reads(exec_logs)
-
-        # Pass two indexes effects against the now-complete dependency graph.
-        for log in exec_logs:
-            for record in log.effects:
-                record: EffectRecord
-                self._index_effect_record(log, record)
-
-            for record in log.emitted_nodes:
-                emitted_exec_id = next(
-                    (
-                        candidate_exec_id
-                        for candidate_exec_id in exec_ids_by_node_id.get(
-                            record.node_id,
-                            (),
-                        )
-                        if self.exec_by_exec_id[
-                            candidate_exec_id
-                        ].seq_id > log.seq_id
-                    ),
-                    None,
-                )
-                self._index_emitted_node_record(
-                    log,
+        for execution in executions:
+            for record in execution.effects:
+                occurrence = self._index_effect(execution, record)
+                self._index_write_effect_edges(
+                    execution,
                     record,
-                    emitted_exec_id,
+                    occurrence,
                 )
 
+        self.value_by_hash = RestoringValueMap(
+            self._value_snapshots_by_hash
+        )
+        return self
+
+    def seal(self):
+        """Freeze a completed index without changing query semantics."""
+        multi_maps = (
+            "exec_ids_by_runner_node",
+            "exec_ids_by_definition_id",
+            "actor_to_exec_ids",
+            "func_name_to_actors",
+            "child_exec_ids_by_exec_id",
+            "read_records_by_ref_version",
+            "write_records_by_ref_version",
+            "versions_by_ref",
+            "producer_exec_ids_by_ref_version",
+            "consumer_exec_ids_by_ref_version",
+            "ref_versions_by_value_hash",
+            "observed_value_hashes_by_ref_version",
+            "producer_edges_by_exec_id",
+            "consumed_edges_by_exec_id",
+            "effect_occurrences_by_event_id",
+            "effect_occurrences_by_type",
+            "effect_occurrences_by_target",
+            "effect_occurrences_by_ref_version",
+            "affected_records_by_effect_occurrence",
+        )
+        for name in multi_maps:
+            setattr(self, name, _FrozenMultiMap(getattr(self, name)))
+
+        for name in (
+            "exec_by_exec_id",
+            "actor_occurrence_to_exec_id",
+            "parent_exec_id_by_exec_id",
+            "value_hash_by_ref_version",
+            "effect_by_occurrence",
+        ):
+            setattr(self, name, MappingProxyType(dict(getattr(self, name))))
+
+        self.seen_refs = tuple(self.seen_refs)
+        self.deleted_ref_versions = frozenset(self.deleted_ref_versions)
+        self._value_snapshots_by_hash = MappingProxyType(
+            dict(self._value_snapshots_by_hash)
+        )
+        object.__setattr__(self, "_tide_sealed", True)
         return self

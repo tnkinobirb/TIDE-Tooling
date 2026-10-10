@@ -135,7 +135,6 @@ def test_event_semantically_equals_exec():
 
                 "emitted_nodes": normalise(record.emitted_nodes or []),
 
-                "status": record.status,
                 "error": normalise(record.error),
             }
 
@@ -188,9 +187,9 @@ def test_event_semantically_equals_exec():
     exec_trace = create_same_exec()
     str_trace = create_same_event_str_func()
 
-    event_exec_log = event_trace.exec_log
-    tide_exec_log = exec_trace.exec_log
-    str_exec_log = str_trace.exec_log
+    event_exec_log = event_trace.log
+    tide_exec_log = exec_trace.log
+    str_exec_log = str_trace.log
     
 
     assert len(event_exec_log) == len(tide_exec_log)
@@ -222,19 +221,19 @@ def test_trace_has_events_log():
 def test_trace_preserves_exec_order():
     trace = create_trace_fixture()
 
-    assert [record.func_name for record in trace.exec_log] == ["A", "B", "C"]
+    assert [record.func_name for record in trace.log] == ["A", "B", "C"]
 
 
 def test_trace_contains_expected_read_amount():
     trace = create_trace_fixture()
 
-    assert sum(len(record.deps or []) for record in trace.exec_log) == 1
+    assert sum(len(record.deps or []) for record in trace.log) == 1
 
 
 def test_trace_contains_expected_write_amount():
     trace = create_trace_fixture()
 
-    assert sum(len(record.writes or []) for record in trace.exec_log) == 3
+    assert sum(len(record.writes or []) for record in trace.log) == 3
 
 
 def test_trace_versions_repeated_writes():
@@ -242,7 +241,7 @@ def test_trace_versions_repeated_writes():
 
     seed_writes = [
         write
-        for record in trace.exec_log
+        for record in trace.log
         for write in record.writes
         if write.stored_target == "global:@seed"
     ]
@@ -255,24 +254,24 @@ def test_trace_versions_repeated_writes():
 def test_trace_contains_expected_execs():
     trace = create_trace_fixture()
 
-    assert len(trace.exec_log) == 3
+    assert len(trace.log) == 3
 
-    assert trace.exec_log[0].seq_id == 0
-    assert trace.exec_log[0].func_name == "A"
+    assert trace.log[0].seq_id == 0
+    assert trace.log[0].func_name == "A"
 
-    assert trace.exec_log[1].seq_id == 1
-    assert trace.exec_log[1].func_name == "B"
+    assert trace.log[1].seq_id == 1
+    assert trace.log[1].func_name == "B"
 
-    assert trace.exec_log[2].seq_id == 2
-    assert trace.exec_log[2].func_name == "C"
+    assert trace.log[2].seq_id == 2
+    assert trace.log[2].func_name == "C"
 
 
 def test_trace_reads_expected_ref_and_version():
     trace = create_trace_fixture()
 
-    a_exec = trace.exec_log[0]
-    b_exec = trace.exec_log[1]
-    c_exec = trace.exec_log[2]
+    a_exec = trace.log[0]
+    b_exec = trace.log[1]
+    c_exec = trace.log[2]
 
     assert len(a_exec.deps or []) == 0
     assert len(b_exec.deps or []) == 1
@@ -287,9 +286,9 @@ def test_trace_reads_expected_ref_and_version():
 def test_trace_writes_expected_ref_and_version():
     trace = create_trace_fixture()
 
-    a_exec = trace.exec_log[0]
-    b_exec = trace.exec_log[1]
-    c_exec = trace.exec_log[2]
+    a_exec = trace.log[0]
+    b_exec = trace.log[1]
+    c_exec = trace.log[2]
 
     assert len(a_exec.writes or []) == 1
     assert len(b_exec.writes or []) == 1
@@ -313,8 +312,8 @@ def test_trace_writes_expected_ref_and_version():
 def test_trace_links_read_to_expected_producer():
     trace = create_trace_fixture()
 
-    a_exec = trace.exec_log[0]
-    b_exec = trace.exec_log[1]
+    a_exec = trace.log[0]
+    b_exec = trace.log[1]
 
     write = a_exec.writes[0]
     read = b_exec.deps[0]
@@ -328,8 +327,8 @@ def test_trace_links_read_to_expected_producer():
 def test_trace_read_matches_producer_write():
     trace = create_trace_fixture()
 
-    a_exec = trace.exec_log[0]
-    b_exec = trace.exec_log[1]
+    a_exec = trace.log[0]
+    b_exec = trace.log[1]
 
     write = a_exec.writes[0]
     read = b_exec.deps[0]
@@ -340,82 +339,88 @@ def test_trace_read_matches_producer_write():
 
 def test_trace_requires_ocean_id():
     try:
-        Trace(event_log=[], exec_log=[])
+        Trace(log=[])
         assert False, "Trace should reject missing ocean_id"
     except ValueError:
         pass
 
-def test_event_trace_contains_expected_runner_metadata():
+def test_event_trace_derives_expected_source_metadata():
     trace = create_trace_fixture()
 
-    assert trace.runner is not None
-    assert trace.run == "TIDE: .event()"
-    assert trace.pipeline == "TIDE: .event()"
-    assert trace.execution_sources == ({
-        "run": "TIDE: .event()",
-        "pipeline_id": "TIDE: .event(A[0])",
-        "pipeline": "TIDE: .event()",
-    },)
+    assert trace.runs == ("TIDE: .event()",)
+    assert trace._sources() == tuple(
+        dict.fromkeys(
+            (record.runner_id, record.pipeline_id)
+            for record in trace.log
+        )
+    )
 
-def test_trace_preserves_known_runners_and_pipelines():
-    known_runners = {"runner": "runner-data"}
+def test_trace_preserves_represented_pipelines():
     known_pipelines = {"pipeline": "pipeline-data"}
 
     trace = Trace(
-        event_log=[],
-        exec_log=[],
+        log=[],
+        pipelines=known_pipelines,
         runner=0,
         ocean_id=0,
-        all_known_runners=known_runners,
-        all_known_pipelines=known_pipelines,
     )
 
-    assert trace.all_known_runners == known_runners
-    assert trace.all_known_pipelines == known_pipelines
+    assert trace.pipelines == known_pipelines
 
 
-def test_trace_indexes_pipeline_ids_and_names_from_known_execs():
+def test_trace_keeps_source_ids_without_inventing_pipeline_snapshots():
     trace = create_trace_fixture()
 
-    assert trace.pipeline_index
-    assert set(trace.pipeline_index) == {
+    assert {pipeline_id for _, pipeline_id in trace._sources()} == {
         record.pipeline_id
-        for record in trace.exec_log
+        for record in trace.log
     }
 
-    for record in trace.exec_log:
+    for record in trace.log:
         inspected = trace.inspect(record.exec_id, "exec_record")
-        pipeline_id, pipeline_name = inspected.object.source_pipeline[0]
-
-        assert pipeline_id == record.pipeline_id
-        assert trace.pipeline_index[pipeline_id] == pipeline_name
+        assert inspected.object.source_pipeline == []
 
 def test_trace_sorts_exec_log_by_seq_id():
     trace = create_trace_fixture()
     trace.show()
 
     unordered_exec_log = (
-        trace.exec_log[2],
-        trace.exec_log[0],
-        trace.exec_log[1],
+        trace.log[2],
+        trace.log[0],
+        trace.log[1],
     )
 
     rebuilt_trace = Trace(
-        event_log=list(unordered_exec_log),
-        exec_log=list(unordered_exec_log),
+        log=list(unordered_exec_log),
+        pipelines=trace.pipelines,
         runner=0,
         ocean_id=trace.ocean_id,
     )
 
-    assert [record.seq_id for record in rebuilt_trace.exec_log] == [0, 1, 2]
+    assert [record.seq_id for record in rebuilt_trace.log] == [0, 1, 2]
     assert rebuilt_trace.reads == trace.reads
     assert rebuilt_trace.writes == trace.writes
     assert rebuilt_trace.values == trace.values
 
+
+def test_trace_exposes_executions_by_exec_id():
+    trace = create_trace_fixture()
+
+    executions = trace.execs
+    log = trace.log
+    assert list(executions) == [record.exec_id for record in log]
+    assert {
+        exec_id: record.seq_id
+        for exec_id, record in executions.items()
+    } == {
+        record.exec_id: record.seq_id
+        for record in log
+    }
+
 def test_trace_read_writes_values():
     trace = create_trace_fixture()
 
-    assert len(trace.exec_log) == 3
+    assert len(trace.log) == 3
     assert len(trace.reads) == 1
     assert len(trace.writes) == 3
     assert len(trace.values) == 3

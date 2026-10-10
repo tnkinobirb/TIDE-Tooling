@@ -1,310 +1,141 @@
-from tide_tooling import IntentIdentityMap, IntentMap, Ocean, node, pipeline
+"""The declared TIDE plan is projected from the pipeline index, not Trace."""
+
+from types import SimpleNamespace
+
+from tide_tooling.tooling_core.engine.classes import (
+    DataRef,
+    Node,
+    __fallback__,
+)
+from tide_tooling.tooling_core.engine.index import (
+    PipelineIndex,
+    _project_pipeline_index_to_tide_plan,
+)
+from tide_tooling.tooling_core.engine.tide_logging import Trace
+from tide_tooling.tooling_core.engine.tide_records import (
+    Actor,
+    ActorOccurrence,
+)
 
 
-def test_trace_init_builds_intent_and_exact_total_maps():
-    ocean = Ocean()
+def test_plan_projects_declared_executions_states_and_incidence():
+    index = PipelineIndex()
+    load = index.node_index.index_node(Node(lambda: "raw", targets="global:raw"))
+    report = index.node_index.index_node(Node(lambda raw: raw.upper(), targets="global:report"))
+    report.deps.append(DataRef("raw", "global"))
 
-    @node(targets="global:raw")
-    def load():
-        return "raw"
+    plan = _project_pipeline_index_to_tide_plan(index)
 
-    @node(args=("@global:raw",), targets="global:report")
-    def report(raw):
-        return raw.upper()
-
-    @pipeline
-    def flow():
-        load()
-        report()
-
-    trace = ocean.run_pipeline(flow, mode="sequential")
-
-    assert trace.intent is not None
-    assert trace.intent.host == "Ocean Intent Graph"
-    assert trace.intent.map.executions.plan == (("load", 0), ("report", 1))
-    assert set(trace.intent.map.executions.actual.values()) == {
-        ("load", 0),
-        ("report", 1),
+    assert {name: plan[name] for name in ("E", "S", "I", "O", "D")} == {
+        "E": {load.node.id, report.node.id},
+        "S": {DataRef("raw", "global"), DataRef("report", "global")},
+        "I": {(report.node.id, DataRef("raw", "global"))},
+        "O": {
+            (load.node.id, DataRef("raw", "global")),
+            (report.node.id, DataRef("report", "global")),
+        },
+        "D": {},
     }
-    assert trace.intent.map.states.plan == (
-        ("global:raw", 0),
-        ("global:report", 0),
-    )
-    assert set(trace.intent.map.states.actual.values()) == set(
-        trace.intent.map.states.plan
-    )
-    assert trace.intent.map.plan_only == {"executions": (), "states": ()}
-    assert trace.intent.map.actual_only == {"executions": (), "states": ()}
-    assert trace.intent.map.compare().complete_agreement is True
-
-
-def test_total_identity_map_retains_both_kinds_of_unpaired_identity():
-    identities = IntentIdentityMap(
-        plan=(("load", 0), ("missing", 1)),
-        actual={
-            "run-load": ("load", 0),
-            "run-extra": ("extra", 2),
+    assert plan["nodes"] == [
+        {
+            "definition_id": load.node.id,
+            "runner_id": None,
+            "actor_name": "<lambda>",
+            "one_shot": False,
+            "dependencies": [],
+            "targets": [DataRef("raw", "global")],
         },
-        _plan_model_ids={
-            ("load", 0): "plan-load",
-            ("missing", 1): "plan-missing",
+        {
+            "definition_id": report.node.id,
+            "runner_id": None,
+            "actor_name": "<lambda>",
+            "one_shot": False,
+            "dependencies": [{
+                "declared": DataRef("raw", "global"),
+                "reference": DataRef("raw", "global"),
+                "dynamic": False,
+            }],
+            "targets": [DataRef("report", "global")],
         },
-    )
-
-    assert identities.paired == {"plan-load": "run-load"}
-    assert identities.plan_only == (("missing", 1),)
-    assert identities.actual_only == (("extra", 2),)
-    assert identities.to_dict()["plan"] == [
-        ["load", 0],
-        ["missing", 1],
     ]
 
 
-def test_dynamic_selector_keeps_expected_and_actual_state_parentage():
-    ocean = Ocean()
-    consumed = []
+def test_dynamic_plan_distinguishes_no_plan_from_explicit_empty_expansion():
+    index = PipelineIndex()
+    node = index.node_index.index_node(Node(lambda rows: rows))
+    selector = DataRef("csv_*", "mem")
+    node.deps.append(selector)
 
-    @node(targets="mem:csv")
-    def write_csv():
-        return "row"
+    absent = _project_pipeline_index_to_tide_plan(index)
+    empty = _project_pipeline_index_to_tide_plan(index, {selector: ()})
 
-    @node(args=("@mem:csv:*",), targets="global:count")
-    def collect(values):
-        consumed.append(values)
-        return len(values)
+    assert absent["D"] == {selector: __fallback__()}
+    assert empty["D"] == {selector: ()}
+    assert absent["I"] == empty["I"] == {(node.node.id, selector)}
 
-    @pipeline
-    def flow():
-        write_csv()
-        collect()
 
-    trace = ocean.run_pipeline(
-        flow,
-        mode="sequential",
-        intent_dynamic_refs={"mem:csv:*": ["mem:csv"]},
+def test_dynamic_plan_retains_the_supplied_static_expansion():
+    index = PipelineIndex()
+    node = index.node_index.index_node(Node(lambda rows: rows))
+    selector = DataRef("csv_*", "mem")
+    expansion = (DataRef("csv_a", "mem"), DataRef("csv_b", "mem"))
+    node.deps.append(selector)
+
+    plan = _project_pipeline_index_to_tide_plan(index, {selector: expansion})
+
+    assert plan["D"] == {selector: expansion}
+    assert plan["S"] == {selector}
+
+
+def test_materialised_plan_counts_only_projected_actor_occurrences():
+    external = Actor(
+        "ocean",
+        "TIDE: External",
+        "TIDE: External",
     )
+    planned = Actor("ocean", "runner", "consume")
 
-    assert consumed == [["row"]]
-    assert trace.intent.concretisations == {
-        "mem:csv:*": (("mem:csv", 0),),
-    }
-    assert trace.concretisations == {
-        "mem:csv:*": (("mem:csv", 0),),
-    }
-    assert trace.intent.map.compare().complete_agreement is True
+    def record(seq_id, actor, occurrence_id, definition_id=None, deps=()):
+        return SimpleNamespace(
+            seq_id=seq_id,
+            exec_id=f"exec-{seq_id}",
+            producer_id=actor,
+            source_ocean_id=actor.source_ocean,
+            producer_occurrence_id=ActorOccurrence(
+                actor,
+                occurrence_id,
+            ),
+            runner_id=actor.source_runner,
+            node_id=seq_id,
+            func_name=actor.source_actor,
+            base_node_id=definition_id,
+            deps=list(deps),
+            writes=[],
+            effects=[],
+        )
 
-
-def test_intent_and_actual_concretisations_apply_max_after_minimum():
-    ocean = Ocean()
-    consumed = []
-
-    @node(targets="mem:csv_0")
-    def write_csv_0():
-        return "row-0"
-
-    @node(targets="mem:csv_1")
-    def write_csv_1():
-        return "row-1"
-
-    @node(targets="mem:csv_2")
-    def write_csv_2():
-        return "row-2"
-
-    @node(targets="mem:csv_3")
-    def write_csv_3():
-        return "row-3"
-
-    @node(targets="mem:csv_4")
-    def write_csv_4():
-        return "row-4"
-
-    @node(args=("@mem:csv_*:5:3",), targets="global:count")
-    def collect(values):
-        consumed.append(values)
-        return len(values)
-
-    @pipeline
-    def flow():
-        write_csv_0()
-        write_csv_1()
-        write_csv_2()
-        write_csv_3()
-        write_csv_4()
-        collect()
-
-    expected = [f"mem:csv_{index}" for index in range(5)]
-    trace = ocean.run_pipeline(
-        flow,
-        mode="sequential",
-        intent_dynamic_refs={"mem:csv_*:5:3": expected},
-    )
-    selected = tuple((reference, 0) for reference in expected[:3])
-
-    assert consumed == [["row-0", "row-1", "row-2"]]
-    assert trace.intent.concretisations == {
-        "mem:csv_*:5:3": selected,
-    }
-    assert trace.concretisations == {
-        "mem:csv_*:5:3": selected,
-    }
-    assert trace.intent.map.compare()["intent_equal"] is True
-
-
-def test_numeric_star_uses_numeric_bound_for_plan_and_actual_selection():
-    ocean = Ocean()
-    ocean.register_store(
-        "seeded",
-        store_template={
-            f"csv_{index}": f"row-{index}"
-            for index in range(7)
+    reference = DataRef("value", "global")
+    trace = Trace(
+        log=[
+            record(0, external, 0),
+            record(1, external, 1),
+            record(2, planned, 0, "consume-definition"),
+        ],
+        ocean_id="ocean",
+        tide_plan={
+            "nodes": [{
+                "definition_id": "consume-definition",
+                "runner_id": "runner",
+                "actor_name": "consume",
+                "one_shot": False,
+                "dependencies": [{
+                    "declared": reference,
+                    "reference": reference,
+                    "dynamic": False,
+                }],
+                "targets": [],
+            }],
         },
     )
-    consumed = []
 
-    @node(args=("@seeded:csv_*:5:*",), targets="global:count")
-    def collect(values):
-        consumed.append(values)
-        return len(values)
-
-    @pipeline
-    def flow():
-        collect()
-
-    expected = [f"seeded:csv_{index}" for index in range(7)]
-    selected = tuple((reference, 0) for reference in expected[:5])
-    trace = ocean.run_pipeline(
-        flow,
-        mode="sequential",
-        intent_dynamic_refs={"seeded:csv_*:5:*": expected},
-    )
-
-    assert consumed == [[f"row-{index}" for index in range(5)]]
-    assert trace.intent.concretisations == {
-        "seeded:csv_*:5:*": selected,
-    }
-    assert trace.concretisations == {
-        "seeded:csv_*:5:*": selected,
-    }
-    assert len(trace.exec_log[-1].deps[0].expanded_to) == 5
-
-
-def test_imported_trace_has_no_invented_intent_but_is_inspectable():
-    from tide_tooling import TIDE
-
-    trace = TIDE.from_model({
-        "E": ["p", "c"],
-        "S": ["s"],
-        "I": [["c", "s"]],
-        "O": [["p", "s"]],
-    })
-
-    assert trace.intent is None
-    assert trace.concretisations == {}
-
-
-def test_repeated_actor_uses_the_global_planned_and_observed_sequence():
-    ocean = Ocean()
-
-    @node(targets="global:value")
-    def step():
-        return "value"
-
-    @pipeline
-    def flow():
-        step()
-        step()
-
-    trace = ocean.run_pipeline(flow, mode="sequential")
-
-    assert trace.intent.map.executions.plan == (("step", 0), ("step", 1))
-    assert set(trace.intent.map.executions.actual.values()) == {
-        ("step", 0),
-        ("step", 1),
-    }
-    assert trace.intent.map.states.plan == (
-        ("global:value", 0),
-        ("global:value", 1),
-    )
-    assert trace.intent.map.compare()["intent_equal"] is True
-
-
-def test_unspecified_dynamic_set_is_retained_and_not_invented():
-    ocean = Ocean()
-
-    @node(targets="mem:csv")
-    def write_csv():
-        return "row"
-
-    @node(args=("@mem:csv:*",))
-    def collect(values):
-        return values
-
-    @pipeline
-    def flow():
-        write_csv()
-        collect()
-
-    trace = ocean.run_pipeline(flow, mode="sequential")
-
-    assert trace.intent.concretisations == {"mem:csv:*": ()}
-    assert trace.concretisations == {
-        "mem:csv:*": (("mem:csv", 0),),
-    }
-    assert trace.intent.map.compare()["intent_equal"] is False
-
-
-def test_failed_planned_write_remains_on_the_plan_side_of_total_state_map():
-    ocean = Ocean()
-
-    @node(targets="global:never_written")
-    def fail():
-        raise RuntimeError("planned failure")
-
-    @pipeline
-    def flow():
-        fail()
-
-    try:
-        ocean.run_pipeline(flow, mode="sequential")
-    except RuntimeError as error:
-        trace = error.tide_trace
-    else:
-        raise AssertionError("pipeline should fail")
-
-    assert trace.intent.map.states.plan_only == (
-        ("global:never_written", 0),
-    )
-    assert trace.intent.map.states.actual_only == ()
-    report = trace.intent.map.compare()
-    assert report["complete_agreement"] is False
-    assert report["identity_alignment_complete"] is False
-    assert report["intent_equal"] is False
-
-
-def test_nested_unsequenced_expression_uses_stable_topological_order():
-    ocean = Ocean()
-
-    @node(targets="global:raw")
-    def load():
-        return "raw"
-
-    @node(targets="global:clean")
-    def clean(raw):
-        return raw.upper()
-
-    @node(targets="global:report")
-    def report(cleaned):
-        return f"report:{cleaned}"
-
-    @pipeline
-    def flow():
-        return report(clean(load()))
-
-    trace = ocean.run_pipeline(flow, mode="sequential")
-
-    assert trace.intent.map.executions.plan == (
-        ("clean", 1),
-        ("load", 0),
-        ("report", 2),
-    )
-    assert trace.intent.map.compare()["intent_equal"] is True
+    assert trace.plan["E"] == ["consume[0]", "TIDE: External[0]"]

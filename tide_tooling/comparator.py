@@ -1,19 +1,8 @@
-"""Explicit-map comparison for finite TIDE Model structures.
-
-This module integrates the reference comparator shipped with the TIDE Model
-artifact.  It deliberately does not discover, infer, repair, or extend an
-identity map: callers supply the Execution and State correspondences.
-"""
+"""Private comparison core for finite TIDE Models."""
 
 from __future__ import annotations
 
 import copy
-import inspect
-import json
-import warnings
-from collections import defaultdict
-from os import PathLike
-from pathlib import Path
 
 from tide_tooling.tooling_core.engine.tide_rendering import (
     SHOW_BOLD,
@@ -28,246 +17,354 @@ from tide_tooling.tooling_core.engine.tide_rendering import (
     _show_options,
     _show_render,
 )
-
-__all__ = ["TIDEComparatorReport", "comparator"]
-
-
-def _call_to_model(candidate):
-    to_model = candidate.to_model
-    try:
-        parameters = inspect.signature(to_model).parameters
-    except (TypeError, ValueError):
-        parameters = {}
-    accepts_kwargs = any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-    options = {}
-    for name, value in (
-        ("include_hashes", False),
-        ("incidence_format", "pairs"),
-        ("identity_mode", "host"),
-    ):
-        if accepts_kwargs or name in parameters:
-            options[name] = value
-
-    comparison_options = getattr(
-        candidate,
-        "_tide_model_comparison_options",
-        None,
-    )
-    if callable(comparison_options):
-        for name, value in comparison_options().items():
-            if accepts_kwargs or name in parameters:
-                options[name] = value
-
-    if options.get("assign_unknown") is True:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Trace States have no host-identified producer:.*",
-                category=RuntimeWarning,
-            )
-            return to_model(**options)
-    return to_model(**options)
+from tide_tooling.tooling_core.engine.tide_model import TIDEModel
 
 
-def _load_json(candidate, name):
-    if isinstance(candidate, bytes):
-        try:
-            return json.loads(candidate.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"{name} is not valid UTF-8 JSON: {error}") from error
-
-    if isinstance(candidate, PathLike):
-        path = Path(candidate)
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"Could not load {name} JSON from {path}: {error}") from error
-
-    if isinstance(candidate, str):
-        stripped = candidate.lstrip()
-        if stripped.startswith("{"):
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"{name} is not valid JSON: {error}") from error
-        path = Path(candidate)
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(f"Could not load {name} JSON from {path}: {error}") from error
-
-    return candidate
+def _identity_sort_key(value):
+    return type(value) is str, value
 
 
-def _import_structure(candidate, name):
-    """Normalize a Trace, model dict, JSON text/bytes, or JSON file path."""
-    candidate = _load_json(candidate, name)
-    if not isinstance(candidate, dict) and hasattr(candidate, "to_model"):
-        candidate = _call_to_model(candidate)
-    if not isinstance(candidate, dict):
-        raise ValueError(
-            f"{name} must be a Trace, TIDE Model dictionary, or JSON input"
+def _ordered(values):
+    return [
+        list(value) if isinstance(value, tuple) else value
+        for value in sorted(
+            values,
+            key=lambda value: tuple(
+                _identity_sort_key(item)
+                for item in value
+            ),
         )
-    missing = [field for field in ("E", "S", "I", "O") if field not in candidate]
-    if missing:
-        raise ValueError(
-            f"{name} must contain E, S, I and O; missing {', '.join(missing)}"
-        )
-
-    from tide_tooling.core import TIDE
-
-    try:
-        structure = {
-            "E": set(TIDE._normalise_model_carrier(candidate["E"], "E")),
-            "S": set(TIDE._normalise_model_carrier(candidate["S"], "S")),
-            "I": set(TIDE._normalise_model_incidence(
-                TIDE._model_list(candidate["I"], "I"),
-                "I",
-            )),
-            "O": set(TIDE._normalise_model_incidence(
-                TIDE._model_list(candidate["O"], "O"),
-                "O",
-            )),
-        }
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{name}: {error}") from error
-
-    for relation in ("I", "O"):
-        for execution, state in structure[relation]:
-            if execution not in structure["E"]:
-                raise ValueError(
-                    f"{name}.{relation} references Execution {execution!r} outside E"
-                )
-            if state not in structure["S"]:
-                raise ValueError(
-                    f"{name}.{relation} references State {state!r} outside S"
-                )
-    return structure, candidate.get("host")
+    ]
 
 
 def _map_errors(mapping, name):
     if not isinstance(mapping, dict):
         return [f"{name} map must be a dictionary"]
+
     errors = []
     targets = []
-    from tide_tooling.core import TIDE
-
     for source, target in mapping.items():
         try:
-            TIDE._model_identifier(source, f"{name} map source")
+            TIDEModel.identifier(source, f"{name} map source")
         except ValueError as error:
             errors.append(str(error))
         try:
-            TIDE._model_identifier(target, f"{name} map target")
+            TIDEModel.identifier(target, f"{name} map target")
             targets.append(target)
         except ValueError as error:
             errors.append(str(error))
+
     if len(set(targets)) != len(targets):
         errors.append(f"{name} map must be one-to-one")
+
     return errors
 
 
-def _judgment_sets(inputs, outputs):
+def _incidence(model, relation):
+    return {
+        (edge["exec_id"], edge["state_id"])
+        for edge in model[relation]
+    }
+
+
+def _judgments(executions, inputs, outputs):
+    consumers_by_state = {}
+    for execution, state in inputs:
+        consumers_by_state.setdefault(state, set()).add(execution)
+
     handoffs = {
         (producer, state, consumer)
         for producer, state in outputs
-        for consumer, consumed_state in inputs
-        if state == consumed_state
+        for consumer in consumers_by_state.get(state, ())
     }
-    adjacency = defaultdict(set)
-    for producer, _, consumer in handoffs:
-        adjacency[producer].add(consumer)
 
-    executions = {execution for execution, _ in inputs | outputs}
-    reachability = set()
-    for start in executions:
-        pending = list(adjacency[start])
-        visited = set()
-        while pending:
-            current = pending.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            reachability.add((start, current))
-            pending.extend(adjacency[current])
+    reachability = TIDEModel.directed_reachability(executions, handoffs)
     return handoffs, reachability
 
 
-def _identity_sort_key(value):
-    return type(value).__name__, repr(value)
+def _prepare_tide_comparison(
+    source,
+    target,
+    *,
+    mapping,
+    execution_map,
+    state_map,
+):
+    source = TIDEModel.normalise(source)
+    target = TIDEModel.normalise(target)
+    source_validity = TIDEModel.report_validity(source)
+    target_validity = TIDEModel.report_validity(target)
 
-
-def _ordered(values):
-    return tuple(sorted(
-        values,
-        key=lambda value: tuple(
-            _identity_sort_key(item)
-            for item in value
-        ),
-    ))
-
-
-def _validity_report(structure, handoffs, reachability):
-    executions, states = structure["E"], structure["S"]
-    producers = defaultdict(set)
-    for execution, state in structure["O"]:
-        producers[state].add(execution)
-    producer_counts = {state: len(producers[state]) for state in states}
-    unique_creation = all(count == 1 for count in producer_counts.values())
-    cyclic_executions = tuple(sorted(
-        (
-            execution
-            for execution in executions
-            if (execution, execution) in reachability
-        ),
-        key=_identity_sort_key,
-    ))
-    return {
-        "valid": unique_creation and not cyclic_executions,
-        "unique_creation": unique_creation,
-        "acyclic_ancestry": not cyclic_executions,
-        "producer_count_errors": {
-            state: count
-            for state, count in sorted(
-                producer_counts.items(),
-                key=lambda item: _identity_sort_key(item[0]),
+    for name, report in (
+        ("source", source_validity),
+        ("target", target_validity),
+    ):
+        if not report.structurally_valid:
+            raise ValueError(
+                f"{name} is not a structurally valid TIDE Model: "
+                + "; ".join(report["errors"])
             )
-            if count != 1
-        },
-        "cyclic_executions": cyclic_executions,
-        "counts": {
-            "executions": len(executions),
-            "states": len(states),
-            "inputs": len(structure["I"]),
-            "outputs": len(structure["O"]),
-            "direct_handoffs": len(handoffs),
-            "reachability": len(reachability),
+
+    if mapping not in {"structural", "literal", "supplied"}:
+        raise ValueError(
+            "mapping must be 'structural', 'literal', or 'supplied'"
+        )
+
+    maps_present = execution_map is not None or state_map is not None
+
+    if mapping == "supplied":
+        if execution_map is None or state_map is None:
+            raise TypeError(
+                "mapping='supplied' requires both execution_map and state_map"
+            )
+        return source, target, execution_map, state_map
+
+    if maps_present:
+        raise TypeError("Explicit maps require mapping='supplied'")
+
+    if mapping == "structural":
+        source = TIDEModel.normalise(TIDEModel.canonicalise(source))
+        target = TIDEModel.normalise(TIDEModel.canonicalise(target))
+
+    execution_ids = set(source["E"]) | set(target["E"])
+    state_ids = set(source["S"]) | set(target["S"])
+
+    execution_map = {exec_id: exec_id for exec_id in execution_ids}
+    state_map = {state_id: state_id for state_id in state_ids}
+    return source, target, execution_map, state_map
+
+
+def _compare_tide_models(
+    source,
+    target,
+    *,
+    mapping,
+    execution_map,
+    state_map,
+):
+    source_validity = TIDEModel.report_validity(source)
+    target_validity = TIDEModel.report_validity(target)
+    mapping_errors = [
+        *_map_errors(execution_map, "Execution"),
+        *_map_errors(state_map, "State"),
+    ]
+
+    report = {
+        "type": "tide_model_comparison",
+        "mapping": mapping,
+        "assessable": not mapping_errors,
+        "mapping_errors": mapping_errors,
+        "models": {
+            "source": source_validity.to_dict(),
+            "target": target_validity.to_dict(),
         },
     }
 
+    if mapping_errors:
+        report.update({
+            "mapped_scope": None,
+            "mapped_identities_absent": None,
+            "outside": None,
+            "deltas": None,
+            "preservation": None,
+            "reflection": None,
+            "judgments_correspond": None,
+            "conformant": None,
+            "identity_coverage": None,
+            "complete_agreement": None,
+        })
+        return TIDEModelComparisonReport(report)
 
-def _judgment_report(handoffs, reachability):
-    return {
-        "direct_handoffs": _ordered(handoffs),
-        "reachability": _ordered(reachability),
+    source_executions = set(source["E"])
+    source_states = set(source["S"])
+    target_executions = set(target["E"])
+    target_states = set(target["S"])
+    mapped_source_executions = source_executions & set(execution_map)
+    mapped_source_states = source_states & set(state_map)
+    mapped_target_executions = target_executions & set(execution_map.values())
+    mapped_target_states = target_states & set(state_map.values())
+
+    source_inputs = _incidence(source, "I")
+    source_outputs = _incidence(source, "O")
+    target_inputs = _incidence(target, "I")
+    target_outputs = _incidence(target, "O")
+
+    mapped_source_inputs = {
+        edge for edge in source_inputs
+        if edge[0] in mapped_source_executions
+        and edge[1] in mapped_source_states
+    }
+    mapped_source_outputs = {
+        edge for edge in source_outputs
+        if edge[0] in mapped_source_executions
+        and edge[1] in mapped_source_states
+    }
+    mapped_target_inputs = {
+        edge for edge in target_inputs
+        if edge[0] in mapped_target_executions
+        and edge[1] in mapped_target_states
+    }
+    mapped_target_outputs = {
+        edge for edge in target_outputs
+        if edge[0] in mapped_target_executions
+        and edge[1] in mapped_target_states
     }
 
+    reflected_source_inputs = {
+        (execution_map[execution], state_map[state])
+        for execution, state in mapped_source_inputs
+    }
+    reflected_source_outputs = {
+        (execution_map[execution], state_map[state])
+        for execution, state in mapped_source_outputs
+    }
 
-def _json_value(value):
-    if isinstance(value, tuple):
-        return [_json_value(item) for item in value]
-    if isinstance(value, list):
-        return [_json_value(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    return copy.deepcopy(value)
+    delta_i_minus = reflected_source_inputs - mapped_target_inputs
+    delta_i_plus = mapped_target_inputs - reflected_source_inputs
+    delta_o_minus = reflected_source_outputs - mapped_target_outputs
+    delta_o_plus = mapped_target_outputs - reflected_source_outputs
+
+    source_handoffs, source_reachability = _judgments(
+        mapped_source_executions,
+        mapped_source_inputs,
+        mapped_source_outputs,
+    )
+    target_handoffs, target_reachability = _judgments(
+        mapped_target_executions,
+        mapped_target_inputs,
+        mapped_target_outputs,
+    )
+    reflected_source_handoffs = {
+        (
+            execution_map[producer],
+            state_map[state],
+            execution_map[consumer],
+        )
+        for producer, state, consumer in source_handoffs
+    }
+    reflected_source_reachability = {
+        (execution_map[source_id], execution_map[target_id])
+        for source_id, target_id in source_reachability
+    }
+
+    source_coverage = (
+        source_executions == set(execution_map)
+        and source_states == set(state_map)
+    )
+    target_coverage = (
+        target_executions == set(execution_map.values())
+        and target_states == set(state_map.values())
+    )
+    conformant = not any((
+        delta_i_minus,
+        delta_i_plus,
+        delta_o_minus,
+        delta_o_plus,
+    ))
+
+    report.update({
+        "mapped_scope": {
+            "source": {
+                "executions": sorted(
+                    mapped_source_executions,
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    mapped_source_states,
+                    key=_identity_sort_key,
+                ),
+            },
+            "target": {
+                "executions": sorted(
+                    mapped_target_executions,
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    mapped_target_states,
+                    key=_identity_sort_key,
+                ),
+            },
+        },
+        "mapped_identities_absent": {
+            "source": {
+                "executions": sorted(
+                    set(execution_map) - source_executions,
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    set(state_map) - source_states,
+                    key=_identity_sort_key,
+                ),
+            },
+            "target": {
+                "executions": sorted(
+                    set(execution_map.values()) - target_executions,
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    set(state_map.values()) - target_states,
+                    key=_identity_sort_key,
+                ),
+            },
+        },
+        "outside": {
+            "source": {
+                "executions": sorted(
+                    source_executions - set(execution_map),
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    source_states - set(state_map),
+                    key=_identity_sort_key,
+                ),
+                "I": _ordered(source_inputs - mapped_source_inputs),
+                "O": _ordered(source_outputs - mapped_source_outputs),
+            },
+            "target": {
+                "executions": sorted(
+                    target_executions - set(execution_map.values()),
+                    key=_identity_sort_key,
+                ),
+                "states": sorted(
+                    target_states - set(state_map.values()),
+                    key=_identity_sort_key,
+                ),
+                "I": _ordered(target_inputs - mapped_target_inputs),
+                "O": _ordered(target_outputs - mapped_target_outputs),
+            },
+        },
+        "deltas": {
+            "I_minus": _ordered(delta_i_minus),
+            "I_plus": _ordered(delta_i_plus),
+            "O_minus": _ordered(delta_o_minus),
+            "O_plus": _ordered(delta_o_plus),
+        },
+        "preservation": {
+            "I": not delta_i_minus,
+            "O": not delta_o_minus,
+        },
+        "reflection": {
+            "I": not delta_i_plus,
+            "O": not delta_o_plus,
+        },
+        "judgments_correspond": (
+            reflected_source_handoffs == target_handoffs
+            and reflected_source_reachability == target_reachability
+        ),
+        "conformant": conformant,
+        "identity_coverage": {
+            "source": source_coverage,
+            "target": target_coverage,
+        },
+        "complete_agreement": (
+            conformant and source_coverage and target_coverage
+        ),
+    })
+    return TIDEModelComparisonReport(report)
 
 
-class TIDEComparatorReport(dict):
-    """Mapping-compatible explicit-correspondence comparison report."""
+class TIDEModelComparisonReport(dict):
+    """Mapped semantic comparison between two TIDE Models."""
 
     @property
     def assessable(self):
@@ -282,29 +379,37 @@ class TIDEComparatorReport(dict):
         return self["complete_agreement"]
 
     @property
-    def mapped_judgments_correspond(self):
-        return self["judgments"].get("mapped_correspond")
+    def judgments_correspond(self):
+        return self["judgments_correspond"]
 
     def to_dict(self):
-        return _json_value(dict(self))
+        return copy.deepcopy(dict(self))
 
     @staticmethod
-    def _render_incidence(value, relation):
-        if relation == "I":
-            return f"{value[0]} <- {value[1]}"
-        return f"{value[0]} -> {value[1]}"
-
-    @staticmethod
-    def _append_values(lines, values, render, marker, colour, reset, dim, white):
+    def _append_values(
+        lines,
+        values,
+        *,
+        render,
+        marker,
+        colour,
+        reset,
+        dim,
+        white,
+        indent="    ",
+    ):
         if not values:
-            lines.append(f"  {dim}none{reset}")
+            lines.append(f"{indent}{dim}none{reset}")
             return
         for value in values:
             lines.append(
-                f"  {colour}{marker}{reset} {white}{render(value)}{reset}"
+                f"{indent}{colour}{marker}{reset} {white}{render(value)}{reset}"
             )
 
-    def show(self, color=True, simple=False, colour=None):
+    def show(self, color=True, simple=False, colour=None, full=False):
+        if not isinstance(full, bool):
+            raise TypeError("show full must be a bool")
+
         color, simple = _show_options(
             color=color,
             simple=simple,
@@ -321,228 +426,165 @@ class TIDEComparatorReport(dict):
 
         if not self.assessable:
             status, status_colour = "UNASSESSABLE", red
+        elif self.complete_agreement:
+            status, status_colour = "COMPLETE AGREEMENT", green
         elif self.conformant:
             status, status_colour = "CONFORMANT", green
         else:
             status, status_colour = "NON-CONFORMANT", yellow
 
-        k1_counts = self["validity"]["K1"]["counts"]
-        k2_counts = self["validity"]["K2"]["counts"]
-        source_host = self["sources"]["K1"].get("host") or "unspecified"
-        target_host = self["sources"]["K2"].get("host") or "unspecified"
+        source = self["models"]["source"]
+        target = self["models"]["target"]
+        source_counts = source["counts"]
+        target_counts = target["counts"]
         lines = [
             "",
             f"{cyan}{'=' * SHOW_SECTION_WIDTH}{reset}",
-            f"{cyan}{bold}TIDE COMPARATOR{reset} | "
+            f"{cyan}{bold}TIDE MODEL COMPARE{reset} | "
             f"{status_colour}{status}{reset} | "
-            f"{k1_counts['executions']}E/{k1_counts['states']}S "
-            f"{dim}\u2192{reset} {k2_counts['executions']}E/{k2_counts['states']}S",
-            f"{dim}explicit supplied Execution and State maps | "
-            f"host: {source_host} \u2192 {target_host}{reset}",
+            f"{source_counts['executions']}E/{source_counts['states']}S "
+            f"{dim}→{reset} "
+            f"{target_counts['executions']}E/{target_counts['states']}S",
+            f"{dim}mapping: {self['mapping']} | "
+            f"host: {source.get('host') or 'unspecified'} → "
+            f"{target.get('host') or 'unspecified'}{reset}",
             f"{cyan}{'=' * SHOW_SECTION_WIDTH}{reset}",
+            f"{dim}SUMMARY:{reset}",
+            f"  source validity: "
+            f"{green if source['semantically_valid'] else red}"
+            f"{'valid' if source['semantically_valid'] else 'invalid'}{reset}",
+            f"  target validity: "
+            f"{green if target['semantically_valid'] else red}"
+            f"{'valid' if target['semantically_valid'] else 'invalid'}{reset}",
         ]
 
-        if self["mapping_errors"]:
+        if not self.assessable:
             lines.append(f"{dim}MAPPING ERRORS:{reset}")
             for error in self["mapping_errors"]:
                 lines.append(f"  {red}{error}{reset}")
+            return _show_render(lines, color)
 
-        lines.append(f"{dim}SUMMARY:{reset}")
-        for name in ("K1", "K2"):
-            valid = self["validity"][name]["valid"]
-            lines.append(
-                f"  {name} validity: "
-                f"{green if valid else red}{'valid' if valid else 'invalid'}{reset}"
-            )
-        if self.assessable:
-            lines.extend([
-                f"  mapped incidence: "
-                f"{green if self.conformant else yellow}"
-                f"{'corresponds' if self.conformant else 'differs'}{reset}",
-                f"  mapped judgments: "
-                f"{green if self.mapped_judgments_correspond else yellow}"
-                f"{'correspond' if self.mapped_judgments_correspond else 'differ'}{reset}",
-                f"  complete agreement: "
-                f"{green if self.complete_agreement else dim}"
-                f"{'yes' if self.complete_agreement else 'no'}{reset}",
-            ])
+        lines.extend([
+            f"  mapped incidence: "
+            f"{green if self.conformant else yellow}"
+            f"{'corresponds' if self.conformant else 'differs'}{reset}",
+            f"  preservation: I "
+            f"{'yes' if self['preservation']['I'] else 'no'} | O "
+            f"{'yes' if self['preservation']['O'] else 'no'}",
+            f"  reflection: I "
+            f"{'yes' if self['reflection']['I'] else 'no'} | O "
+            f"{'yes' if self['reflection']['O'] else 'no'}",
+            f"  judgments: "
+            f"{'correspond' if self.judgments_correspond else 'differ'}",
+            f"  identity coverage: source "
+            f"{'complete' if self['identity_coverage']['source'] else 'partial'}"
+            f" | target "
+            f"{'complete' if self['identity_coverage']['target'] else 'partial'}",
+            f"  complete agreement: "
+            f"{'yes' if self.complete_agreement else 'no'}",
+        ])
 
-        if not self.assessable:
-            return _show_render(lines, color=color)
+        if not full:
+            return _show_render(lines, color)
 
-        differences = self["judgments"]["mapped_differences"]
-        sections = (
-            ("DIRECT HANDOFFS MISSING", differences["handoffs_missing"],
-             lambda value: f"{value[0]} --{value[1]}--> {value[2]}", "-", red),
-            ("DIRECT HANDOFFS UNSUPPORTED", differences["handoffs_unsupported"],
-             lambda value: f"{value[0]} --{value[1]}--> {value[2]}", "+", green),
-            ("REACHABILITY MISSING", differences["reachability_missing"],
-             lambda value: f"{value[0]} \u2192 {value[1]}", "-", red),
-            ("REACHABILITY UNSUPPORTED", differences["reachability_unsupported"],
-             lambda value: f"{value[0]} \u2192 {value[1]}", "+", green),
-        )
-        for title, values, render, marker, marker_colour in sections:
-            if simple and not values:
-                continue
-            lines.append(f"{dim}{title}:{reset}")
-            self._append_values(
-                lines, values, render, marker, marker_colour,
-                reset, dim, white,
-            )
+        absent = self["mapped_identities_absent"]
+        if not simple or any(
+            values
+            for side in absent.values()
+            for values in side.values()
+        ):
+            lines.extend(["", f"{dim}MAPPED IDENTITIES ABSENT:{reset}"])
+            for side_name, side in absent.items():
+                if simple and not any(side.values()):
+                    continue
+                lines.append(f"  {dim}{side_name.upper()}:{reset}")
+                for label, key in (
+                    ("Executions", "executions"),
+                    ("States", "states"),
+                ):
+                    values = side[key]
+                    if simple and not values:
+                        continue
+                    lines.append(f"    {dim}{label}:{reset}")
+                    self._append_values(
+                        lines,
+                        values,
+                        render=str,
+                        marker="!",
+                        colour=yellow,
+                        reset=reset,
+                        dim=dim,
+                        white=white,
+                        indent="      ",
+                    )
 
-        lines.append(f"{dim}MAPPED KERNEL DIFFERENCES:{reset}")
+        lines.append("")
+        lines.append(f"{dim}MAPPED INCIDENCE:{reset}")
         for name, relation, marker, marker_colour in (
             ("I_minus", "I", "-", red),
-            ("I_plus", "I", "+", green),
             ("O_minus", "O", "-", red),
+            ("I_plus", "I", "+", green),
             ("O_plus", "O", "+", green),
         ):
             values = self["deltas"][name]
             if simple and not values:
                 continue
             lines.append(f"  {dim}{name}:{reset}")
-            if not values:
-                lines.append(f"    {dim}none{reset}")
-            for value in values:
-                lines.append(
-                    f"    {marker_colour}{marker}{reset} {white}"
-                    f"{self._render_incidence(value, relation)}{reset}"
-                )
+            self._append_values(
+                lines,
+                values,
+                render=(
+                    (lambda value: f"{value[0]} ← {value[1]}")
+                    if relation == "I"
+                    else (lambda value: f"{value[0]} → {value[1]}")
+                ),
+                marker=marker,
+                colour=marker_colour,
+                reset=reset,
+                dim=dim,
+                white=white,
+            )
 
-        if not simple:
-            lines.append(f"{dim}SCOPE:{reset}")
-            for name in ("K1", "K2"):
-                scope = self["mapped_scope"][name]
-                outside = self["outside"][name]
-                absent = self["mapped_identities_absent"][name]
-                lines.append(
-                    f"  {name}: {len(scope['Executions'])} mapped executions, "
-                    f"{len(scope['States'])} mapped states | "
-                    f"outside {len(outside['I'])}I/{len(outside['O'])}O | "
-                    f"absent {len(absent['Executions'])}E/"
-                    f"{len(absent['States'])}S"
-                )
-        return _show_render(lines, color=color)
+        if self["mapping"] == "supplied":
+            outside = self["outside"]
+            if not simple or any(
+                values
+                for side in outside.values()
+                for values in side.values()
+            ):
+                lines.extend(["", f"{dim}OUTSIDE MAPPING SCOPE:{reset}"])
+                for side_name, side in outside.items():
+                    if simple and not any(side.values()):
+                        continue
+                    lines.append(f"  {dim}{side_name.upper()}:{reset}")
+                    for label, key, render in (
+                        ("Executions", "executions", str),
+                        ("States", "states", str),
+                        (
+                            "Input incidence",
+                            "I",
+                            lambda value: f"{value[0]} ← {value[1]}",
+                        ),
+                        (
+                            "Output incidence",
+                            "O",
+                            lambda value: f"{value[0]} → {value[1]}",
+                        ),
+                    ):
+                        values = side[key]
+                        if simple and not values:
+                            continue
+                        lines.append(f"    {dim}{label}:{reset}")
+                        self._append_values(
+                            lines,
+                            values,
+                            render=render,
+                            marker="~",
+                            colour=yellow,
+                            reset=reset,
+                            dim=dim,
+                            white=white,
+                            indent="      ",
+                        )
 
-
-def comparator(source, target, *, execution_map, state_map):
-    """Compare two normalized TIDE structures under supplied identity maps.
-
-    ``source`` and ``target`` may independently be a Trace/TIDE object, a
-    TIDE Model dictionary, JSON text/bytes, or a path to a JSON model.  The
-    maps are mandatory and are never inferred or extended.
-    """
-    k1, source_host = _import_structure(source, "K1")
-    k2, target_host = _import_structure(target, "K2")
-    k1_handoffs, k1_reachability = _judgment_sets(k1["I"], k1["O"])
-    k2_handoffs, k2_reachability = _judgment_sets(k2["I"], k2["O"])
-    validity = {
-        "K1": _validity_report(k1, k1_handoffs, k1_reachability),
-        "K2": _validity_report(k2, k2_handoffs, k2_reachability),
-    }
-    judgments = {
-        "K1": _judgment_report(k1_handoffs, k1_reachability),
-        "K2": _judgment_report(k2_handoffs, k2_reachability),
-    }
-    mapping_errors = [
-        *_map_errors(execution_map, "Execution"),
-        *_map_errors(state_map, "State"),
-    ]
-    base = {
-        "type": "tide_model_comparison",
-        "sources": {
-            "K1": {"host": source_host},
-            "K2": {"host": target_host},
-        },
-        "assessable": not mapping_errors,
-        "mapping_errors": mapping_errors,
-        "validity": validity,
-        "judgments": judgments,
-    }
-    if mapping_errors:
-        base.update({
-            "conformant": None,
-            "identity_coverage": {"K1": None, "K2": None},
-            "complete_agreement": None,
-        })
-        return TIDEComparatorReport(base)
-
-    e1, s1 = k1["E"], k1["S"]
-    e2, s2 = k2["E"], k2["S"]
-    d_e, r_e = set(execution_map), set(execution_map.values())
-    d_s, r_s = set(state_map), set(state_map.values())
-    e1_m, e2_m = e1 & d_e, e2 & r_e
-    s1_m, s2_m = s1 & d_s, s2 & r_s
-
-    i1_m = {(e, s) for e, s in k1["I"] if e in e1_m and s in s1_m}
-    o1_m = {(e, s) for e, s in k1["O"] if e in e1_m and s in s1_m}
-    i2_m = {(e, s) for e, s in k2["I"] if e in e2_m and s in s2_m}
-    o2_m = {(e, s) for e, s in k2["O"] if e in e2_m and s in s2_m}
-    i1_out, o1_out = k1["I"] - i1_m, k1["O"] - o1_m
-    i2_out, o2_out = k2["I"] - i2_m, k2["O"] - o2_m
-    f_i1_m = {(execution_map[e], state_map[s]) for e, s in i1_m}
-    f_o1_m = {(execution_map[e], state_map[s]) for e, s in o1_m}
-    delta_i_minus, delta_i_plus = f_i1_m - i2_m, i2_m - f_i1_m
-    delta_o_minus, delta_o_plus = f_o1_m - o2_m, o2_m - f_o1_m
-    conformant = not any(
-        (delta_i_minus, delta_i_plus, delta_o_minus, delta_o_plus)
-    )
-
-    h1_m, r1_m = _judgment_sets(i1_m, o1_m)
-    h2_m, r2_m = _judgment_sets(i2_m, o2_m)
-    f_h1_m = {
-        (execution_map[p], state_map[s], execution_map[c])
-        for p, s, c in h1_m
-    }
-    f_r1_m = {
-        (execution_map[source_id], execution_map[target_id])
-        for source_id, target_id in r1_m
-    }
-    k1_covered = e1 == d_e and s1 == d_s
-    k2_covered = e2 == r_e and s2 == r_s
-
-    judgments.update({
-        "mapped_correspond": f_h1_m == h2_m and f_r1_m == r2_m,
-        "mapped_differences": {
-            "handoffs_missing": _ordered(f_h1_m - h2_m),
-            "handoffs_unsupported": _ordered(h2_m - f_h1_m),
-            "reachability_missing": _ordered(f_r1_m - r2_m),
-            "reachability_unsupported": _ordered(r2_m - f_r1_m),
-        },
-    })
-    base.update({
-        "mapped_scope": {
-            "K1": {"Executions": tuple(sorted(e1_m)), "States": tuple(sorted(s1_m))},
-            "K2": {"Executions": tuple(sorted(e2_m)), "States": tuple(sorted(s2_m))},
-        },
-        "outside_identities": {
-            "K1": {
-                "Executions": tuple(sorted(e1 - d_e)),
-                "States": tuple(sorted(s1 - d_s)),
-            },
-            "K2": {
-                "Executions": tuple(sorted(e2 - r_e)),
-                "States": tuple(sorted(s2 - r_s)),
-            },
-        },
-        "mapped_identities_absent": {
-            "K1": {"Executions": tuple(sorted(d_e - e1)), "States": tuple(sorted(d_s - s1))},
-            "K2": {"Executions": tuple(sorted(r_e - e2)), "States": tuple(sorted(r_s - s2))},
-        },
-        "deltas": {
-            "I_minus": _ordered(delta_i_minus),
-            "I_plus": _ordered(delta_i_plus),
-            "O_minus": _ordered(delta_o_minus),
-            "O_plus": _ordered(delta_o_plus),
-        },
-        "preservation": {"I": not delta_i_minus, "O": not delta_o_minus},
-        "reflection": {"I": not delta_i_plus, "O": not delta_o_plus},
-        "outside": {
-            "K1": {"I": _ordered(i1_out), "O": _ordered(o1_out)},
-            "K2": {"I": _ordered(i2_out), "O": _ordered(o2_out)},
-        },
-        "conformant": conformant,
-        "identity_coverage": {"K1": k1_covered, "K2": k2_covered},
-        "complete_agreement": conformant and k1_covered and k2_covered,
-    })
-    return TIDEComparatorReport(base)
+        return _show_render(lines, color)

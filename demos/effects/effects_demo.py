@@ -7,15 +7,15 @@ from tide_tooling import DELETE, READ, Effects, TIDE, WRITE, node
     effects=[
         WRITE(
             "global:prepared",
-            preserve_output={"status": "prepared", "count": 3},
+            {"status": "prepared", "count": 3},
         ),
         WRITE(
             "global:audit",
-            preserve_output={"event": "prepare", "accepted": True},
+            {"event": "prepare", "accepted": True},
         ),
         DELETE(
             "global:prepared",
-            preserve_output={"deleted": "prepared"},
+            output={"deleted": "prepared"},
         ),
     ]
 )
@@ -42,7 +42,7 @@ def build_effect_trace():
         "manual marker",
         effects=WRITE(
             "global:temporary_marker",
-            preserve_output="remove me",
+            "remove me",
         ),
     )
     tide.event(
@@ -60,14 +60,14 @@ if __name__ == "__main__":
     trace.show()
 
     print("\n2. FIND WRITE EFFECTS")
-    trace.find(Effects.WRITE).show(type="effect")
+    trace.find(Effects.WRITE).show(kind="effect")
 
     print("\n3. INVESTIGATE WRITE EFFECTS")
     trace.investigate(Effects.WRITE, "effect").show()
 
     consumer = next(
         record
-        for record in trace.exec_log
+        for record in trace.execs.values()
         if record.func_name == "consume_prepared"
     )
 
@@ -103,7 +103,7 @@ if __name__ == "__main__":
 
     imported_consumer = next(
         record
-        for record in imported_trace.exec_log
+        for record in imported_trace.execs.values()
         if record.func_name == "consume_prepared"
     )
     imported_trace.path(
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     )
     deleted_reader = next(
         record
-        for record in deleted_trace.exec_log
+        for record in deleted_trace.execs.values()
         if record.func_name == "read_deleted"
     )
     deleted_trace.path(

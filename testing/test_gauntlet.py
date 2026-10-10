@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 
-from tide_tooling import EMIT, TIDE, WRITE, comparator, node, pipeline
+from tide_tooling import EMIT, TIDE, WRITE, node, pipeline
 
 
 SEED = 0x71DE
@@ -73,7 +73,7 @@ def test_500_model_structures_match_an_independent_oracle():
     for case in range(500):
         model = _random_model(rng, case)
         handoffs, reachability, valid = _model_oracle(model)
-        report = TIDE.validate_model(model)
+        report = TIDE.report_model_validity(model)
 
         assert set(report.direct_handoffs) == handoffs
         assert set(report.reachability) == reachability
@@ -98,14 +98,14 @@ def test_500_model_structures_match_an_independent_oracle():
         if renamed["O"]:
             renamed["O"].append(list(renamed["O"][0]))
 
-        compared = comparator(
-            model,
+        compared = TIDE.from_model(model).compare(
             renamed,
+            mapping="supplied",
             execution_map=execution_map,
             state_map=state_map,
         )
         assert compared.complete_agreement is True
-        assert compared.mapped_judgments_correspond is True
+        assert compared.judgments_correspond is True
 
 
 def _reachable(adjacency, source, target):
@@ -157,7 +157,7 @@ def test_random_dag_paths_and_bundle_restores_match_an_independent_oracle():
         for trace in traces:
             exec_ids = {
                 int(record.func_name.removeprefix("actor_")): record.exec_id
-                for record in trace.exec_log
+                for record in trace.log
             }
             for source in range(size):
                 for target in range(size):
@@ -220,27 +220,31 @@ def test_emission_occurrences_order_duplicates_paths_and_bundle_as_one_contract(
     for candidate in (trace, restored):
         assert [
             (occurrence.func_name, occurrence.origin)
-            for occurrence in candidate.exec_log[0].emitted_nodes
+            for occurrence in candidate.log[0].emitted_nodes
         ] == expected
-        assert candidate.path(
+        declared_path = candidate.path(
             "emitter", "declared_child", "actor", "actor"
-        ).count() == 2
-        assert candidate.path(
+        )
+        runtime_path = candidate.path(
             "emitter", "runtime_child", "actor", "actor"
-        ).count() == 3
-        assert len(candidate.exec_log) == 3
+        )
+        assert declared_path.count() == 1
+        assert runtime_path.count() == 1
+        assert len(declared_path.get_path()["handoffs"][0]) == 2
+        assert len(runtime_path.get_path()["handoffs"][0]) == 3
+        assert len(candidate.log) == 3
 
 
 def test_equal_writes_remain_ordered_occurrences_through_bundle_restore():
     @node(
         targets="global:trajectory",
         effects=[
-            WRITE("global:trajectory", preserve_output="same"),
-            WRITE("global:trajectory", preserve_output="same"),
+            WRITE("global:trajectory", "same"),
+            WRITE("global:trajectory", "same"),
         ],
     )
     def write_trajectory():
-        return WRITE("global:trajectory", preserve_output="same")
+        return WRITE("global:trajectory", "same", output="same")
 
     @pipeline
     def flow():
@@ -250,7 +254,7 @@ def test_equal_writes_remain_ordered_occurrences_through_bundle_restore():
     restored = TIDE.from_bundle(trace.to_bundle().to_dict())
 
     for candidate in (trace, restored):
-        record = candidate.exec_log[0]
+        record = candidate.log[0]
         assert [write.stored_version for write in record.writes] == [0, 1, 2, 3]
         assert candidate.value_of("global:trajectory") == [
             "same", "same", "same", "same"

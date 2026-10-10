@@ -20,6 +20,8 @@ __pycache__/
 
 # Test and coverage output
 .pytest_cache/
+.pytest_*/
+pytest-of-*/
 .coverage
 .coverage.*
 htmlcov/
@@ -57,3 +59,20 @@ Desktop.ini
 *.temp
 *.swp
 *~
+
+# Codex and local refactor scratch output
+.codex-pip-temp/
+.codex-test-temp/
+.audit-*/
+.trace-*/
+.noworkflow/
+out.txt
+tide_lightweight_safe_chain_benchmark.json
+tide_safe_heavy_benchmark_full.json
+tide_stuck_exec_diagnostic.json
+
+# Demo-generated outputs
+demos/bug/tide_*_trace.json
+demos/pipeline/data_pipeline_trace.json
+demos/pipeline/processed_data.csv
+demos/trace/basic_trace.json

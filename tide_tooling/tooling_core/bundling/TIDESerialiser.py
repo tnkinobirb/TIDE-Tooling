@@ -1,11 +1,17 @@
 import io
+import json
 import os
 import types
+from contextlib import contextmanager
 from dataclasses import is_dataclass
 from enum import Enum
 
 from .TIDEEncoder import TIDEEncoder
 from .TIDEOpaqueValue import TIDEOpaqueValue
+
+
+class TIDEUnorderedValueError(ValueError):
+    pass
 
 
 # Create a serialiser to handle these objects:
@@ -31,12 +37,33 @@ class TIDESerialiser:
             "primitive": self._serialise_primitive,
             "bytes": self._serialise_bytes,
             "container": self._serialise_container,
+            "data_ref": self._serialise_data_ref,
+            "tide_fallback": self._serialise_tide_fallback,
             "object_state": self._serialise_object_state,
             "opaque": self._serialise_opaque,
+            "path": self._serialise_path
         }
+        self._session_depth = 0
+        self._object_state_cache = {}
+
+    @contextmanager
+    def graph_session(self):
+        """Retain one factual object-state observation per value graph."""
+        root_session = self._session_depth == 0
+        if root_session:
+            self._object_state_cache = {}
+
+        self._session_depth += 1
+        try:
+            yield
+        finally:
+            self._session_depth -= 1
+            if root_session:
+                self._object_state_cache = {}
 
     def serialise(self, obj: object):
-        return self._serialise(obj, self.serialise)
+        with self.graph_session():
+            return self._serialise(obj, self.serialise)
 
     def serialise_with_refs(self, obj: object, reference_value):
         if not callable(reference_value):
@@ -70,6 +97,8 @@ class TIDESerialiser:
 
         try:
             record = handler(obj, serialise_value)
+        except TIDEUnorderedValueError:
+            raise
         except Exception as error:
             if self.unsupported == "strict":
                 raise
@@ -113,6 +142,31 @@ class TIDESerialiser:
             "codec": "raw",
             "codec_version": 1,
             "payload": self.encoder.encode_bytes(obj),
+        }
+
+    @staticmethod
+    def _serialise_data_ref(obj, serialise_value):
+        return {
+            "kind": "data_ref",
+            "serialiser": "data_ref",
+            "codec": "tide_structure",
+            "codec_version": 1,
+            "key": serialise_value(obj.key),
+            "store": obj.store,
+            "count": obj.count,
+            "max": obj.max,
+            "literal": obj.literal,
+            "prefix": obj.prefix,
+            "source_str": obj.source_str,
+        }
+
+    @staticmethod
+    def _serialise_tide_fallback(obj, serialise_value):
+        return {
+            "kind": "tide_fallback",
+            "serialiser": "tide_fallback",
+            "codec": "tide_structure",
+            "codec_version": 1,
         }
 
     @staticmethod
@@ -164,15 +218,227 @@ class TIDESerialiser:
                 f"Unsupported container value: {type(value).__name__}"
             )
 
+        items = list(value)
+        if container_type in {"set", "frozenset"}:
+            keyed = [
+                (self._canonical_order_key(item), item)
+                for item in items
+            ]
+            keys = [key for key, _ in keyed]
+            if len(keys) != len(set(keys)):
+                raise TIDEUnorderedValueError(
+                    "Unordered container contains canonically "
+                    "indistinguishable values"
+                )
+            items = [item for _, item in sorted(keyed, key=lambda pair: pair[0])]
+
         return {
             "kind": self.get_value_kind(value),
             "serialiser": "container",
             "container_type": container_type,
             "items": [
                 self._serialise_value(item, serialise_value)
-                for item in value
+                for item in items
             ],
         }
+
+    def _serialise_path(self, obj, serialise_value):
+        if not isinstance(obj, os.PathLike):
+            raise TypeError("Path serialiser requires an os.PathLike value")
+
+        path_text = os.fspath(obj)
+        if not isinstance(path_text, str):
+            raise TypeError("TIDE Path values must resolve to text")
+
+        class_name = type(obj).__name__
+        flavour = (
+            "windows"
+            if "Windows" in class_name
+            else "posix"
+            if "Posix" in class_name
+            else "native"
+        )
+
+        return {
+            "kind": "path",
+            "serialiser": "path",
+            "codec": "path",
+            "codec_version": 1,
+            "flavour": flavour,
+            "value": path_text,
+        }
+
+    def _canonical_order_key(self, value):
+        canonical = self._canonical_order_value(value, {}, "$root")
+        return json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    def _canonical_order_value(self, value, active, path):
+        identity = id(value)
+        if identity in active:
+            return {"kind": "cycle", "path": active[identity]}
+
+        value_type = type(value)
+        type_name = f"{value_type.__module__}:{value_type.__qualname__}"
+
+        if value is None or value_type in {bool, int, float, complex, str}:
+            return {
+                "kind": "primitive",
+                "type": type_name,
+                "value": self.encoder.encode_python_primatives(value).hex(),
+            }
+
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return {
+                "kind": "bytes",
+                "type": type_name,
+                "value": bytes(value).hex(),
+            }
+
+        if isinstance(value, Enum):
+            active[identity] = path
+            try:
+                return {
+                    "kind": "enum",
+                    "type": type_name,
+                    "value": self._canonical_order_value(
+                        value.value,
+                        active,
+                        f"{path}.value",
+                    ),
+                }
+            finally:
+                del active[identity]
+
+        if isinstance(value, (list, tuple)):
+            active[identity] = path
+            try:
+                return {
+                    "kind": type(value).__name__,
+                    "items": [
+                        self._canonical_order_value(
+                            item,
+                            active,
+                            f"{path}[{index}]",
+                        )
+                        for index, item in enumerate(value)
+                    ],
+                }
+            finally:
+                del active[identity]
+
+        if isinstance(value, (set, frozenset)):
+            active[identity] = path
+            try:
+                items = [
+                    self._canonical_order_value(
+                        item,
+                        active,
+                        f"{path}{{item}}",
+                    )
+                    for item in value
+                ]
+                return {
+                    "kind": type(value).__name__,
+                    "items": sorted(
+                        items,
+                        key=lambda item: json.dumps(
+                            item,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    ),
+                }
+            finally:
+                del active[identity]
+
+        if isinstance(value, dict):
+            active[identity] = path
+            try:
+                items = [
+                    [
+                        self._canonical_order_value(
+                            key,
+                            active,
+                            f"{path}.key",
+                        ),
+                        self._canonical_order_value(
+                            item,
+                            active,
+                            f"{path}.value",
+                        ),
+                    ]
+                    for key, item in value.items()
+                ]
+                return {
+                    "kind": "dict",
+                    "items": sorted(
+                        items,
+                        key=lambda item: json.dumps(
+                            item[0],
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        ),
+                    ),
+                }
+            finally:
+                del active[identity]
+
+        if self._is_data_ref(value):
+            active[identity] = path
+            try:
+                return {
+                    "kind": "data_ref",
+                    "type": type_name,
+                    "key": self._canonical_order_value(
+                        value.key,
+                        active,
+                        f"{path}.key",
+                    ),
+                    "store": value.store,
+                    "count": value.count,
+                    "max": value.max,
+                    "literal": value.literal,
+                    "prefix": value.prefix,
+                    "source_str": value.source_str,
+                }
+            finally:
+                del active[identity]
+
+        if self.choose_serialiser(value) != "object_state":
+            raise TIDEUnorderedValueError(
+                "Unordered container contains a non-canonical value: "
+                f"{type_name}"
+            )
+
+        active[identity] = path
+        try:
+            state = self.get_object_state(value)
+            state_value = (
+                state["get_state"]
+                if state["get_state"] is not None and state["set_state"]
+                else {
+                    "dict": state["dict"],
+                    "slots": state["slots"],
+                }
+            )
+            return {
+                "kind": "object_state",
+                "type": type_name,
+                "state": self._canonical_order_value(
+                    state_value,
+                    active,
+                    f"{path}.state",
+                ),
+            }
+        finally:
+            del active[identity]
 
     def _serialise_dict(self, value: dict, serialise_value):
         if not isinstance(value, dict):
@@ -232,13 +498,18 @@ class TIDESerialiser:
                 f"Object cannot expose rebuildable state: {obj!r}"
             )
 
-        return { 
+        return {
             **module_info,
             "kind": "object",
             "serialiser": "object_state",
             "codec": "state",
             "codec_version": 1,
             "state": state_data,
+            "exception_args": (
+                self._serialise_value(obj.args, serialise_value)
+                if isinstance(obj, BaseException)
+                else None
+            ),
         }
 
     def _get_byte_value_kind(self, obj: object):
@@ -320,6 +591,13 @@ class TIDESerialiser:
         if isinstance(obj, TIDEOpaqueValue):
             return "opaque"
 
+        from tide_tooling.tooling_core.engine.classes import __fallback__
+        if isinstance(obj, __fallback__):
+            return "tide_fallback"
+
+        if self._is_data_ref(obj):
+            return "data_ref"
+
         if isinstance(
             obj,
             (
@@ -374,6 +652,14 @@ class TIDESerialiser:
                 return "opaque"
 
     @staticmethod
+    def _is_data_ref(value):
+        try:
+            from tide_tooling.tooling_core.engine.classes import DataRef
+        except ImportError:
+            return False
+        return isinstance(value, DataRef)
+
+    @staticmethod
     def get_module_and_type(obj):
         object_class = obj.__class__
 
@@ -384,6 +670,14 @@ class TIDESerialiser:
         }
 
     def get_object_state(self, obj: object):
+        identity = id(obj)
+        cached = self._object_state_cache.get(identity)
+        if cached is not None:
+            original, state = cached
+            if original is not obj:
+                raise RuntimeError("Serialiser object identity collision")
+            return state
+
         object_class = obj.__class__
 
         get_state_method = getattr(obj, "__getstate__", None)
@@ -433,7 +727,11 @@ class TIDESerialiser:
             "slots": obj_slots,
         }
 
-        return {
+        state = {
             **module_info,
             **state_data,
         }
+        # Keep the original alive so its id cannot be reused, and ensure
+        # canonical ordering and retained storage use the same observation.
+        self._object_state_cache[identity] = (obj, state)
+        return state

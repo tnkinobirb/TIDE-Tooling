@@ -1,6 +1,6 @@
 from tide_tooling import TIDE, Trace
-from tide_tooling.tooling_core.engine.events import Effects
-from tide_tooling.tooling_core.engine.tide_logging import Actor, AffectedStackLink, DependencyUseRecord, EffectRecord, ExecRecord, ExpandedDepRecord, InputUseRecord, WriteRecord
+from tide_tooling.tooling_core.engine.events import Cause, Effects
+from tide_tooling.tooling_core.engine.tide_logging import Actor, DependencyUseRecord, EffectEdge, EffectRecord, ExecRecord, ExpandedDepRecord, InputUseRecord, ReadEdge, WriteRecord
 
 
 def create_stream_fixture():
@@ -17,11 +17,16 @@ def create_stream_fixture():
 
 
 def exec_id(trace: Trace, seq_id: int) -> str:
-    return trace.exec_log[seq_id].exec_id
+    return trace.log[seq_id].exec_id
 
 
 def edge_tuple(edge) -> tuple:
-    return edge.producer_exec_id, edge.consumer_exec_id, edge.produced_ref, edge.produced_ver
+    if isinstance(edge, ReadEdge):
+        reference = edge.read.unscoped_reference
+        version = edge.read.resolved_version
+    else:
+        reference, version = edge.effect_record.targets
+    return edge.producer_exec_id, edge.consumer_exec_id, reference, version
 
 
 def root_edges(stream_object, root_exec_id: str) -> list:
@@ -58,29 +63,29 @@ def make_exec(seq_id: int, name: str, deps=None, writes=None, effects=None, inpu
 
 
 def create_dynamic_trace():
-    producer = make_exec(0, "A", writes=[WriteRecord("test", "!A", 0, "global:@A")])
+    producer = make_exec(0, "A", writes=[WriteRecord(Cause(description="test"), "!A", 0, "global:@A")])
     associated_input = ("payload", object())
     expanded = ExpandedDepRecord(associated_input, None, "static", "global:@A", "!A", 0, "tests", producer.producer_id, producer.exec_id, [])
     dynamic = DependencyUseRecord(associated_input, None, "dynamic", "global:@*", expanded_to=[expanded])
     consumer = make_exec(1, "D", deps=[dynamic])
 
-    return Trace(event_log=None, exec_log=[producer, consumer], runner="tests", ocean_id=0)
+    return Trace(log=[producer, consumer], runner="tests", ocean_id=0)
 
 
 def create_multi_store_trace():
-    global_writer = make_exec(0, "GlobalWriter", writes=[WriteRecord("test", "!GLOBAL", 0, "global:@A")])
-    mem_writer = make_exec(1, "MemWriter", writes=[WriteRecord("test", "!MEM", 0, "mem:@A")])
+    global_writer = make_exec(0, "GlobalWriter", writes=[WriteRecord(Cause(description="test"), "!GLOBAL", 0, "global:@A")])
+    mem_writer = make_exec(1, "MemWriter", writes=[WriteRecord(Cause(description="test"), "!MEM", 0, "mem:@A")])
 
     global_dep = DependencyUseRecord(("global_input", object()), None, "static", "global:@A", "!GLOBAL", 0, "tests", global_writer.producer_id, global_writer.exec_id)
     mem_dep = DependencyUseRecord(("mem_input", object()), None, "static", "mem:@A", "!MEM", 0, "tests", mem_writer.producer_id, mem_writer.exec_id)
     global_consumer = make_exec(2, "GlobalConsumer", deps=[global_dep])
     mem_consumer = make_exec(3, "MemConsumer", deps=[mem_dep])
 
-    return Trace(event_log=None, exec_log=[global_writer, mem_writer, global_consumer, mem_consumer], runner="tests", ocean_id=0)
+    return Trace(log=[global_writer, mem_writer, global_consumer, mem_consumer], runner="tests", ocean_id=0)
 
 
 def create_effect_trace():
-    writer = make_exec(0, "Writer", writes=[WriteRecord("test", "!A", 0, "global:@A")])
+    writer = make_exec(0, "Writer", writes=[WriteRecord(Cause(description="test"), "!A", 0, "global:@A")])
     input_use = InputUseRecord("payload", None, None, None, None, [])
     dep = DependencyUseRecord(("payload", input_use), None, "static", "global:@A", "!A", 0, "tests", writer.producer_id, writer.exec_id)
     input_use.dependencies = [dep]
@@ -89,12 +94,14 @@ def create_effect_trace():
     effect = EffectRecord(
         Effects.WRITE,
         ("global:@A", 0),
+        event_id="test-effect",
         origin="declared",
+        immediate=False,
         output="!A",
     )
     effect_producer = make_exec(2, "EffectProducer", effects=[effect])
 
-    return Trace(event_log=None, exec_log=[writer, consumer, effect_producer], runner="tests", ocean_id=0)
+    return Trace(log=[writer, consumer, effect_producer], runner="tests", ocean_id=0)
 
 
 def test_stream_edges_preserve_affected_input():
@@ -104,8 +111,8 @@ def test_stream_edges_preserve_affected_input():
 
     assert edge_tuple(global_edge) == (exec_id(trace, 0), exec_id(trace, 2), "global:@A", 0)
     assert edge_tuple(mem_edge) == (exec_id(trace, 1), exec_id(trace, 3), "mem:@A", 0)
-    assert global_edge.consumer_input[0] == "global_input"
-    assert mem_edge.consumer_input[0] == "mem_input"
+    assert global_edge.read.associated_input[0] == "global_input"
+    assert mem_edge.read.associated_input[0] == "mem_input"
 
 
 def test_reference_version_downstream_does_not_follow_sibling_outputs():
@@ -113,7 +120,7 @@ def test_reference_version_downstream_does_not_follow_sibling_outputs():
     inspected = trace.inspect("@A", "reference", version=1, grouped=False)
     stream = trace.downstream(inspected)
 
-    assert list(trace.index.ref_version_to_consumer_exec_ids[("global:@A", 1)]) == []
+    assert list(trace.index.consumer_exec_ids_by_ref_version[("global:@A", 1)]) == []
     assert dict(stream.stream) == {}
     assert dict(stream.paths) == {}
     assert stream.count() == 0
@@ -125,8 +132,6 @@ def test_reference_version_target_refs_are_exact():
 
     assert [(read.unscoped_reference, read.resolved_version) for read in inspected.reads] == []
     assert [(write.stored_target, write.stored_version) for write in inspected.writes] == [("global:@A", 1)]
-    assert trace._get_target_refs(inspected, "downstream") == []
-    assert trace._get_target_refs(inspected, "upstream") == [("global:@A", 1)]
 
 
 def test_stream_to_dict_preserves_roots_edges_and_direction():
@@ -138,14 +143,12 @@ def test_stream_to_dict_preserves_roots_edges_and_direction():
     data = stream.to_dict()
 
     assert data["direction"] == "downstream"
-    assert data["roots"] == [exec_id(trace, 0)]
-    assert set(data["next"]) == {exec_id(trace, 0)}
-    assert {entry["exec"] for entry in data["next"][exec_id(trace, 0)]} == {exec_id(trace, 1), exec_id(trace, 3)}
-    assert {(edge["producer_exec"], edge["consumer_exec"], edge["ref"], edge["version"]) for edge in data["edges"].values()} == {
-        (exec_id(trace, 0), exec_id(trace, 1), "global:@A", 0),
-        (exec_id(trace, 0), exec_id(trace, 3), "global:@A", 0),
-    }
-    assert all(edge["affected_input"] for edge in data["edges"].values())
+    assert [path["executions"] for path in data["paths"]] == [
+        [exec_id(trace, 0), exec_id(trace, 1)],
+        [exec_id(trace, 0), exec_id(trace, 3)],
+    ]
+    assert all(len(path["handoffs"]) == 1 for path in data["paths"])
+    assert all(path["endpoint_evidence"] == [] for path in data["paths"])
 
 
 def test_stream_show_keeps_reference_roots_separate(capsys):
@@ -184,10 +187,10 @@ def test_stream_show_renders_complete_numbered_tide_chains(capsys):
     assert "At 0 to 1" not in shown
     assert (
         "EXEC_RECORD[0] A\n"
-        "└── global:@A[v0]\n"
-        "    └── EXEC_RECORD[1] B\n"
-        "        └── global:@B[v0]\n"
-        "            └── EXEC_RECORD[2] C"
+        "├── global:@A[v0] as str\n"
+        "└── EXEC_RECORD[1] B\n"
+        "    ├── global:@B[v0] as str\n"
+        "    └── EXEC_RECORD[2] C"
     ) in shown
 
 
@@ -201,10 +204,10 @@ def test_stream_show_reverses_each_complete_chain_upstream(capsys):
 
     assert (
         "EXEC_RECORD[5] Y\n"
-        "└── global:@X[v0]\n"
-        "    └── EXEC_RECORD[3] X\n"
-        "        └── global:@A[v0]\n"
-        "            └── EXEC_RECORD[0] A"
+        "├── global:@X[v0] as str\n"
+        "└── EXEC_RECORD[3] X\n"
+        "    ├── global:@A[v0] as str\n"
+        "    └── EXEC_RECORD[0] A"
     ) in shown
 
 
@@ -245,6 +248,22 @@ def test_stream_show_reports_empty_stream_without_fake_edges(capsys):
     assert "global:@A" not in shown
 
 
+def test_upstream_root_state_shows_its_origin_without_inventing_a_path(capsys):
+    trace = create_stream_fixture()
+
+    shown = trace.upstream(
+        "global:@A[v0]",
+        "reference",
+        grouped=False,
+    ).show(color=False)
+    capsys.readouterr()
+
+    assert "1 producer found | no upstream handoffs" in shown
+    assert "ORIGIN:" in shown
+    assert "EXEC_RECORD[0] A" in shown
+    assert "PATH 1" not in shown
+
+
 def test_stream_queries_preserve_grouped_false_for_raw_actor_identifiers():
     trace = create_stream_fixture()
 
@@ -259,11 +278,11 @@ def test_stream_queries_preserve_grouped_false_for_raw_actor_identifiers():
         grouped=False,
     )
 
-    assert downstream.inspected.grouped is False
-    assert upstream.inspected.grouped is False
+    assert downstream.source.grouped is False
+    assert upstream.source.grouped is False
 
 
-def test_execs_from_stream_uses_directional_related_execs():
+def test_complete_paths_retain_directional_execution_chains():
     trace = create_stream_fixture()
     downstream = trace.downstream(
         trace.inspect("A", "actor", grouped=False),
@@ -274,8 +293,8 @@ def test_execs_from_stream_uses_directional_related_execs():
         depth=0,
     )
 
-    assert set(downstream.execs_from_stream(downstream.stream, "downstream")) == {exec_id(trace, 1), exec_id(trace, 3)}
-    assert set(upstream.execs_from_stream(upstream.stream, "upstream")) == {exec_id(trace, 0), exec_id(trace, 2)}
+    assert {path["executions"][-1] for path in downstream.paths[exec_id(trace, 0)]} == {exec_id(trace, 1), exec_id(trace, 3)}
+    assert {path["executions"][-1] for path in upstream.paths[exec_id(trace, 3)]} == {exec_id(trace, 0), exec_id(trace, 2)}
 
 
 def test_paths_remain_isolated_by_root():
@@ -286,8 +305,8 @@ def test_paths_remain_isolated_by_root():
     )
 
     assert set(stream.paths) == {exec_id(trace, 0)}
-    assert all(len(path) == 1 for paths in stream.paths.values() for path in paths)
-    assert {edge_tuple(path[0]) for path in stream.paths[exec_id(trace, 0)]} == {
+    assert all(len(path["handoffs"]) == 1 for paths in stream.paths.values() for path in paths)
+    assert {edge_tuple(path["handoffs"][0][0]) for path in stream.paths[exec_id(trace, 0)]} == {
         (exec_id(trace, 0), exec_id(trace, 1), "global:@A", 0),
         (exec_id(trace, 0), exec_id(trace, 3), "global:@A", 0),
     }
@@ -319,7 +338,11 @@ def test_downstream_depth_preserves_complete_branches():
     root = exec_id(trace, 0)
 
     actual = {
-        tuple(edge_tuple(edge) for edge in path)
+        tuple(
+            edge_tuple(edge)
+            for handoffs in path["handoffs"]
+            for edge in handoffs
+        )
         for path in stream.paths[root]
     }
 
@@ -337,6 +360,23 @@ def test_downstream_depth_preserves_complete_branches():
     }
 
     assert actual == expected
+
+
+def test_depth_none_walks_each_branch_to_its_maximum():
+    trace = create_stream_fixture()
+    stream = trace.downstream(
+        trace.inspect("A", "actor", grouped=False),
+        depth=None,
+    )
+
+    assert {
+        tuple(trace.index.exec_by_exec_id[item].seq_id for item in path["executions"])
+        for paths in stream.paths.values()
+        for path in paths
+    } == {
+        (0, 1, 2, 3, 5),
+        (0, 3, 5),
+    }
 
 
 def test_downstream_depth_stops_at_requested_layer():
@@ -359,22 +399,22 @@ def test_dynamic_dependency_indexes_concrete_edge():
     assert len(edges) == 1
     edge = edges[0]
     assert edge_tuple(edge) == (exec_id(trace, 0), exec_id(trace, 1), "global:@A", 0)
-    assert edge.consumer_input[0] == "payload"
-    assert trace.index.ref_version_to_producer_exec_id[("global:@A", 0)] == exec_id(trace, 0)
-    assert list(trace.index.ref_version_to_consumer_exec_ids[("global:@A", 0)]) == [exec_id(trace, 1)]
+    assert edge.read.associated_input[0] == "payload"
+    assert list(trace.index.producer_exec_ids_by_ref_version[("global:@A", 0)]) == [exec_id(trace, 0)]
+    assert list(trace.index.consumer_exec_ids_by_ref_version[("global:@A", 0)]) == [exec_id(trace, 1)]
 
 
-def test_effect_creates_affected_stack_link_with_affected_input():
+def test_effect_creates_effect_edge_with_affected_input():
     trace = create_effect_trace()
     stream = trace.downstream(trace.inspect(2, "seq_id"))
     edges = root_edges(stream, exec_id(trace, 2))
 
     assert len(edges) == 1
     edge = edges[0]
-    assert isinstance(edge, AffectedStackLink)
+    assert isinstance(edge, EffectEdge)
     assert edge_tuple(edge) == (exec_id(trace, 2), exec_id(trace, 1), "global:@A", 0)
-    assert edge.consumer_inputs == [{"name": "payload", "index": None}]
-    assert edge.cause_effect == Effects.WRITE
+    assert edge.affected_record.affected_inputs == [{"name": "payload", "index": None}]
+    assert edge.effect_record.effect == Effects.WRITE
 
 
 def test_same_key_in_different_stores_stays_separate():
@@ -385,8 +425,8 @@ def test_same_key_in_different_stores_stays_separate():
     global_edges = {edge_tuple(edge) for edge in root_edges(global_stream, exec_id(trace, 0))}
     mem_edges = {edge_tuple(edge) for edge in root_edges(mem_stream, exec_id(trace, 1))}
 
-    assert trace.index.ref_version_to_producer_exec_id[("global:@A", 0)] == exec_id(trace, 0)
-    assert trace.index.ref_version_to_producer_exec_id[("mem:@A", 0)] == exec_id(trace, 1)
+    assert list(trace.index.producer_exec_ids_by_ref_version[("global:@A", 0)]) == [exec_id(trace, 0)]
+    assert list(trace.index.producer_exec_ids_by_ref_version[("mem:@A", 0)]) == [exec_id(trace, 1)]
     assert global_edges == {(exec_id(trace, 0), exec_id(trace, 2), "global:@A", 0)}
     assert mem_edges == {(exec_id(trace, 1), exec_id(trace, 3), "mem:@A", 0)}
     assert not root_edges(global_stream, exec_id(trace, 1)) 

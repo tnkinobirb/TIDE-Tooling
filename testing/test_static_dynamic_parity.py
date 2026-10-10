@@ -196,7 +196,7 @@ def test_seeded_exec_read_and_dynamic_expansion_share_concrete_ref_and_version_s
     tide.exec(UseSeed, args=["@testing:@seed"], writes=["@out"])
 
     trace = tide.trace()
-    use_exec = first_exec(trace, 1) if len(trace.exec_log) > 1 else first_exec(trace, 0)
+    use_exec = first_exec(trace, 1) if len(trace.log) > 1 else first_exec(trace, 0)
 
     static_read = use_exec.reads[0]
     expanded = dynamic_expanded_record(
@@ -227,7 +227,7 @@ def test_seeded_event_read_and_dynamic_expansion_share_concrete_ref_and_version_
     tide.event("UseSeedEvent", reads={"testing:@seed": "seed-value"}, writes={"@out": "out"})
 
     trace = tide.trace()
-    use_exec = first_exec(trace, 1) if len(trace.exec_log) > 1 else first_exec(trace, 0)
+    use_exec = first_exec(trace, 1) if len(trace.log) > 1 else first_exec(trace, 0)
 
     static_read = use_exec.reads[0]
     expanded = dynamic_expanded_record(

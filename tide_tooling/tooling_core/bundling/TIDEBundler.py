@@ -1,317 +1,1119 @@
+"""Native TIDE Trace bundle encoding.
+
+
+
+A Trace bundle contains one native TideRun plus the arbitrary values referenced
+
+by that run. Values are stored through TIDESerialiser/TIDEDeserialiser and
+
+TIDECas. Raw Events are an optional sidecar only; they are never used to
+
+reconstruct the Trace.
+
+
+
+Standalone value bundles remain supported, but they do not project a Trace.
+
+"""
+
+
+
+from __future__ import annotations
+
+
+
 from copy import deepcopy
 
-from .TIDEDeserialiser import TIDEDeserialiser
+
+
 from .TIDECas import TIDECas
+
+from .TIDEDeserialiser import TIDEDeserialiser
+
 from .TIDEOpaqueValue import TIDEOpaqueValue
+
 from .TIDERunDeserialiser import TIDERunDeserialiser
+
 from .TIDERunSerialiser import TIDERunSerialiser
+
 from .TIDESerialiser import TIDESerialiser
+
+from ..engine.utils import (
+    is_tide_value_hash,
+    tide_value_hash_from_bundle,
+)
+
+
+
 
 
 DEFAULT_RESOURCE_LIMITS = {
+
     "max_bundle_file_bytes": 256 * 1024 * 1024,
-    "max_cas_records": 100_000,
-    "max_cas_record_bytes": 64 * 1024 * 1024,
-    "max_cas_total_bytes": 512 * 1024 * 1024,
+
     "max_values": 100_000,
+
+    "max_events": 1_000_000,
+
+    "max_event_records": 1_000_000,
+
     "max_exec_records": 250_000,
-    "max_ref_versions": 1_000_000,
-    "max_manifest_record_refs": 1_000_000,
+
+    "max_ready_attempts": 250_000,
+
+    "max_cas_records": 100_000,
+
+    "max_cas_record_bytes": 64 * 1024 * 1024,
+
+    "max_cas_total_bytes": 512 * 1024 * 1024,
+
     "max_value_records": 100_000,
+
     "max_deserialise_depth": 256,
+
     "max_container_items": 100_000,
+
 }
 
 
+
+
+
 class TIDEBundler:
+
+    """Encode and decode native Trace storage.
+
+
+
+    TideRun is the semantic persistence format for Trace evidence.
+
+    TIDECas stores arbitrary value-graph records referenced by TideRun.
+
+    A FrozenEventLogBundle may be retained as an optional sidecar.
+
+    The Bundle manifest binds that sidecar to its TideRun without making the
+    Event log a second reconstruction authority.
+
+    """
+
+
+
+    KIND = "tide_bundle"
+
+    CODEC_VERSION = 1
+
     def __init__(
+
         self,
+
         serialiser=None,
+
         deserialiser=None,
+
         run_serialiser=None,
+
         run_deserialiser=None,
+
         unsupported="opaque",
+
         trusted=False,
+
+        verify_events=True,
+
         resource_limits=None,
+
     ):
-        if unsupported not in ["opaque", "strict"]:
+
+        if unsupported not in {"opaque", "strict"}:
+
             raise ValueError("unsupported must be 'opaque' or 'strict'")
+
         if not isinstance(trusted, bool):
+
             raise TypeError("trusted must be a bool")
 
-        self.resource_limits = self._normalise_resource_limits(
-            resource_limits
-        )
+        if not isinstance(verify_events, bool):
+
+            raise TypeError("verify_events must be a bool")
+
+        self.resource_limits = self._normalise_resource_limits(resource_limits)
+
+
+
         self.serialiser = serialiser or TIDESerialiser(
-            unsupported=unsupported
+
+            unsupported=unsupported,
+
         )
+
         self.deserialiser = deserialiser or TIDEDeserialiser(
+
             trusted=trusted,
+
             max_depth=self.resource_limits["max_deserialise_depth"],
+
             max_container_items=self.resource_limits[
+
                 "max_container_items"
+
             ],
+
             max_records=self.resource_limits["max_value_records"],
+
         )
+
         self.run_serialiser = run_serialiser or TIDERunSerialiser()
-        self.run_deserialiser = run_deserialiser or TIDERunDeserialiser()
+
+        self.run_deserialiser = (
+            run_deserialiser
+            or TIDERunDeserialiser(trusted=trusted)
+        )
+
         self.trusted = trusted
 
-    def bundle(self, value: object, handle=None):
+        self.verify_events = verify_events
+
+
+
+    def _verify_event_correspondence(self, run, run_state, event_log):
+
+        """Compare one optional Event sidecar with its authoritative TideRun."""
+
+        if event_log is None or not self.verify_events:
+
+            return None
+
+        try:
+            from tide_tooling.tooling_core.engine.events import (
+                LogEvents,
+                OceanEvents,
+            )
+            from tide_tooling.tooling_core.engine.tide_logging import Trace
+            from tide_tooling.tooling_core.engine.tide_runtime_logging import (
+                trace_from_event_log,
+            )
+            from types import SimpleNamespace
+
+            trace_meta = run_state["trace"]
+            events = event_log.events
+            root_event_id = (
+                events[0].event_id
+                if events
+                and events[0].type == OceanEvents.RUN_PIPELINE
+                and events[0].source == "ocean"
+                and events[0].source_id == events[0].ocean_id
+                and events[0].exec_id is None
+                else None
+            )
+            root_runner_id = None
+            if root_event_id is not None and trace_meta["runner"] is not None:
+                root_runner_id = next((
+                    event.source_id
+                    for event in events
+                    if getattr(event.cause, "event_id", None) == root_event_id
+                    and event.type == LogEvents.RUNNER_PLAN
+                    and event.source_id is not None
+                ), None)
+
+            event_runner = (
+                None
+                if trace_meta["runner"] is None
+                else SimpleNamespace(
+                    id=root_runner_id,
+                    trace_event_start_id=root_event_id,
+                    runner_start_event_id=root_event_id,
+                )
+            )
+            event_trace = trace_from_event_log(
+                event_log,
+                ocean_id=trace_meta["ocean_id"],
+                runner=event_runner,
+            )
+            authoritative_trace = Trace(
+                run_state["records"],
+                ocean_id=trace_meta["ocean_id"],
+                runner=trace_meta["runner"],
+                trace_starting_event=trace_meta["trace_starting_event_id"],
+                pipeline_starting_event=(
+                    trace_meta["pipeline_starting_event_id"]
+                ),
+                tide_plan=trace_meta["tide_plan"],
+                missing_referenced_events=(
+                    trace_meta["missing_referenced_events"]
+                ),
+                causal_order_violations=(
+                    trace_meta["causal_order_violations"]
+                ),
+                ready_exec_ids=trace_meta["ready_exec_ids"],
+                blocked_exec_ids=trace_meta["blocked_exec_ids"],
+                deadlock=trace_meta["deadlock"],
+                ready_attempts=run_state["ready_attempts"],
+                started_runner_ids=trace_meta["started_runner_ids"],
+                causal_runner_ids=trace_meta["causal_runner_ids"],
+                ended_runner_ids=trace_meta["ended_runner_ids"],
+                evidence_violations=trace_meta["evidence_violations"],
+                _state_authorities=run_state["state_authorities"],
+                _require_closed_evidence=True,
+            )
+
+            return authoritative_trace.diff(event_trace).same
+
+        except Exception:
+
+            return False
+
+
+
+    # ------------------------------------------------------------------
+
+    # Arbitrary value graphs
+
+    # ------------------------------------------------------------------
+
+    def bundle(self, value, handle=None):
+
+        """Encode one arbitrary Python value graph."""
+
         self.records = {}
+
         self.object_ids = {}
+
         self.next_object_index = 0
 
-        return {
-            "root": self._add_value(value),
-            "records": self.records,
-            "metadata": self._get_handle_metadata(handle),
-        }
 
-    def deserialise(self, bundle: dict):
+
+        with self.serialiser.graph_session():
+
+            return {
+
+                "root": self._add_value(value),
+
+                "records": self.records,
+
+                "metadata": self._get_handle_metadata(handle),
+
+            }
+
+
+
+    def deserialise(self, bundle):
+
+        """Decode one arbitrary Python value graph."""
+
         return self.deserialiser.deserialise_bundle(bundle)
 
-    def declare(self, trace_or_values, handle=None):
-        from .TIDEBundle import TIDEBundle
 
-        return TIDEBundle.from_trace(
-            trace_or_values,
-            handle=handle,
-            bundler=self,
+
+    def _add_value(self, value):
+
+        identity = id(value)
+
+        cached = self.object_ids.get(identity)
+
+
+
+        if cached is not None:
+
+            original, object_id = cached
+
+            if original is not value:
+
+                raise RuntimeError("Bundle object identity collision")
+
+            return object_id
+
+
+
+        object_id = f"object_{self.next_object_index}"
+
+        self.next_object_index += 1
+
+        self.object_ids[identity] = (value, object_id)
+
+
+
+        # Install the identity before descending so cycles can refer back to it.
+
+        self.records[object_id] = None
+
+        self.records[object_id] = self.serialiser.serialise_with_refs(
+
+            value,
+
+            self._add_value,
+
         )
 
-    def bundle_trace(self, trace_or_values, cas=None, handle=None):
+        return object_id
+
+
+
+    # ------------------------------------------------------------------
+
+    # Public bundle construction
+
+    # ------------------------------------------------------------------
+
+    def bundle_trace(
+
+        self,
+
+        trace_or_values,
+
+        cas=None,
+
+        handle=None,
+
+        serialise_events=False,
+
+    ):
+
+        """Bundle a native Trace or an explicit collection of values.
+
+
+
+        ``serialise_events`` changes only whether raw Event evidence is
+
+        retained alongside a Trace. It never changes the Trace persistence
+
+        format or reconstruction authority.
+
+        """
+
+        if not isinstance(serialise_events, bool):
+
+            raise TypeError("serialise_events must be a bool")
+
+
+
+        if (
+
+            not isinstance(trace_or_values, (list, tuple))
+
+            and getattr(trace_or_values, "from_cas", False)
+
+        ):
+
+            raise ValueError(
+
+                "TIDEBundler will not serialise a Trace restored from a "
+
+                "Bundle. Use Trace.to_bundle() to re-export its retained "
+
+                "source Bundle."
+
+            )
+
+
+
         cas = cas if cas is not None else TIDECas()
-        values, ref_versions, trace_metadata = self._get_trace_values(
-            trace_or_values,
-            cas,
-        )
-        manifest = {
-            "kind": "tide_trace_values",
-            "codec_version": 1,
-            "value_hash_codec": "tide_serialised_bytes_v1",
-            "values": {},
-            "ref_index": {},
-            "value_index": {},
-            "cas_index": {},
-            "metadata": self._get_handle_metadata(handle),
-            "trace": trace_metadata,
-        }
 
-        for value_hash, value in values.items():
-            bundle_manifest = cas.store_bundle(self.bundle(value))
-            root_cas_ref = bundle_manifest["record_refs"][
-                bundle_manifest["root"]
-            ]
-            manifest["values"][value_hash] = {
-                "root_cas_ref": root_cas_ref,
-                "bundle": bundle_manifest,
-            }
-            manifest["value_index"][value_hash] = []
-            manifest["cas_index"].setdefault(
-                root_cas_ref,
-                [],
-            ).append(value_hash)
+        if not isinstance(cas, TIDECas):
 
-        for (raw_ref, version), value_hash in ref_versions.items():
-            if value_hash not in manifest["values"]:
+            raise TypeError("cas must be a TIDECas or None")
+
+
+
+        metadata = self._get_handle_metadata(handle)
+
+
+
+        if isinstance(trace_or_values, (list, tuple)):
+
+            if serialise_events:
+
                 raise ValueError(
-                    "Trace ref/version points to a value missing from "
-                    "TraceIndex.value_by_hash: "
-                    f"{raw_ref}[v{version}]"
+
+                    "serialise_events is valid only for Trace bundles"
+
                 )
 
-            root_cas_ref = manifest["values"][value_hash]["root_cas_ref"]
-            ref_entry = {
-                "value_hash": value_hash,
-                "root_cas_ref": root_cas_ref,
-            }
-            manifest["ref_index"].setdefault(
-                raw_ref,
-                {"versions": {}},
-            )["versions"][str(version)] = ref_entry
-            manifest["value_index"][value_hash].append(
-                {"ref": raw_ref, "version": version}
+            return self._bundle_values(
+
+                trace_or_values,
+
+                cas=cas,
+
+                metadata=metadata,
+
             )
 
-        if not isinstance(trace_or_values, (list, tuple)):
-            manifest["run"] = self.run_serialiser.serialise(
-                trace_or_values
+
+
+        return self._bundle_native_trace(
+
+            trace_or_values,
+
+            cas=cas,
+
+            metadata=metadata,
+
+            serialise_events=serialise_events,
+
+        )
+
+
+
+    def _bundle_native_trace(
+
+        self,
+
+        trace,
+
+        *,
+
+        cas,
+
+        metadata,
+
+        serialise_events,
+
+    ):
+
+        if not hasattr(trace, "log") or not hasattr(trace, "ocean_id"):
+
+            raise TypeError(
+
+                "bundle_trace expects a Trace or a list/tuple of values"
+
             )
 
-        return {
-            "manifest": manifest,
-            "cas": cas.export_bytes(),
+
+
+        run, values = self.run_serialiser.serialise_with_values(trace)
+
+
+
+        if len(values) > self.resource_limits["max_values"]:
+
+            raise ValueError(
+
+                "TIDE bundle resource limit exceeded: values"
+
+            )
+
+
+
+        value_entries = self._store_hashed_values(values, cas)
+
+
+
+        event_payload = None
+
+        event_log = None
+
+        if serialise_events:
+
+            event_log = getattr(trace, "event_log", None)
+
+            if event_log is not None:
+
+                event_payload = event_log.to_event_bundle().to_dict()
+
+
+        if event_log is not None and serialise_events:
+
+            run_state = self.run_deserialiser.deserialise_trace(run, values)
+
+            self._verify_event_correspondence(run, run_state, event_log)
+
+
+
+        manifest = {
+
+            "kind": self.KIND,
+
+            "codec_version": self.CODEC_VERSION,
+
+            "content": "trace",
+
+            "run": run,
+
+            "values": value_entries,
+
+            "events": event_payload,
+
+            "metadata": metadata,
+
         }
 
-    def load_trace_bundle(self, complete, cas=None):
-        if not isinstance(complete, dict):
-            raise TypeError("Imported trace bundle must be a dict")
+
+
+        complete = {
+
+            "manifest": manifest,
+
+            "cas": cas.export_bytes(),
+
+        }
 
         self.validate_trace_bundle_resources(complete)
-        manifest = deepcopy(complete.get("manifest"))
-        cas_bytes = complete.get("cas")
+
         self._validate_trace_manifest(manifest)
 
-        if not isinstance(cas_bytes, dict):
-            raise TypeError("Imported trace bundle CAS must be a dict")
+        return complete
 
-        cas = cas if cas is not None else TIDECas()
-        cas.import_bytes(cas_bytes)
-        values = {}
 
-        for value_hash, value_entry in manifest["values"].items():
-            if not isinstance(value_entry, dict):
-                raise TypeError("Trace value entry must be a dict")
 
-            bundle_manifest = value_entry.get("bundle")
-            root_cas_ref = value_entry.get("root_cas_ref")
+    def _bundle_values(self, values, *, cas, metadata):
 
-            if not isinstance(bundle_manifest, dict):
-                raise TypeError("Trace value bundle must be a dict")
+        if len(values) > self.resource_limits["max_values"]:
 
-            bundle_root = bundle_manifest.get("root")
-            record_refs = bundle_manifest.get("record_refs")
+            raise ValueError(
 
-            if not isinstance(record_refs, dict):
-                raise TypeError("Trace value record_refs must be a dict")
+                "TIDE bundle resource limit exceeded: values"
 
-            if record_refs.get(bundle_root) != root_cas_ref:
-                raise ValueError(
-                    "Trace value root_cas_ref does not match its bundle"
-                )
-
-            values[value_hash] = self.deserialise(
-                cas.load_bundle(bundle_manifest)
             )
 
-            if isinstance(values[value_hash], TIDEOpaqueValue):
-                values[value_hash].value_hash = value_hash
 
-        manifest, values = self._normalise_trace_value_hashes(
-            manifest,
-            values,
-            cas,
-        )
 
-        run = manifest.get("run")
-        exec_logs = (
-            self.run_deserialiser.deserialise(run, values)
-            if run is not None
-            else []
-        )
+        items = [
 
-        return {
-            "manifest": manifest,
-            "cas": cas,
-            "values": values,
-            "ref_index": manifest["ref_index"],
-            "value_index": manifest["value_index"],
-            "cas_index": manifest["cas_index"],
-            "run": run,
-            "exec_logs": exec_logs,
+            self._store_value(value, cas)
+
+            for value in values
+
+        ]
+
+
+
+        manifest = {
+
+            "kind": self.KIND,
+
+            "codec_version": self.CODEC_VERSION,
+
+            "content": "values",
+
+            "items": items,
+
+            "metadata": metadata,
+
         }
 
-    def validate_trace_bundle_resources(self, complete):
-        """Reject oversized imported structures before copying or decoding."""
-        if not isinstance(complete, dict):
-            raise TypeError("Imported trace bundle must be a dict")
 
-        manifest = complete.get("manifest")
+
+        complete = {
+
+            "manifest": manifest,
+
+            "cas": cas.export_bytes(),
+
+        }
+
+        self.validate_trace_bundle_resources(complete)
+
+        self._validate_trace_manifest(manifest)
+
+        return complete
+
+
+
+    def _store_hashed_values(self, values, cas):
+
+        entries = {}
+
+
+
+        for value_hash, value in values.items():
+
+            if not isinstance(value_hash, str):
+
+                raise TypeError("TideRun value hashes must be strings")
+
+
+
+            entry = self._store_value(value, cas)
+
+            entries[value_hash] = entry
+
+
+
+        return entries
+
+
+
+    def _store_value(self, value, cas):
+
+        graph = self.bundle(value)
+
+        graph_manifest = cas.store_bundle(graph)
+
+        root = graph_manifest.get("root")
+
+        record_refs = graph_manifest.get("record_refs", {})
+
+        root_cas_ref = record_refs.get(root)
+
+
+
+        if root_cas_ref is None:
+
+            raise ValueError("Bundled value has no CAS root reference")
+
+
+
+        return {
+
+            "root_cas_ref": root_cas_ref,
+
+            "bundle": graph_manifest,
+
+        }
+
+
+
+    # ------------------------------------------------------------------
+
+    # Loading
+
+    # ------------------------------------------------------------------
+
+    def load_trace_bundle(
+
+        self,
+
+        complete,
+
+        cas=None,
+
+        source_bundle_hash=None,
+
+    ):
+
+        if not isinstance(complete, dict):
+
+            raise TypeError("Imported TIDE Bundle must be a dict")
+
+
+
+        self.validate_trace_bundle_resources(complete)
+
+
+
+        manifest = deepcopy(complete.get("manifest"))
+
+        self._validate_trace_manifest(manifest)
+
+
+
         cas_bytes = complete.get("cas")
 
-        if isinstance(cas_bytes, dict):
-            self._check_resource_limit(
-                "CAS records",
-                len(cas_bytes),
-                "max_cas_records",
+        if not isinstance(cas_bytes, dict):
+
+            raise TypeError("Imported TIDE Bundle CAS must be a dict")
+
+
+
+        cas = cas if cas is not None else TIDECas()
+
+        if not isinstance(cas, TIDECas):
+
+            raise TypeError("cas must be a TIDECas or None")
+
+        cas.import_bytes(cas_bytes)
+
+
+
+        content = manifest["content"]
+
+
+
+        if content == "values":
+
+            return {
+
+                "manifest": manifest,
+
+                "content": "values",
+
+                "source_bundle_hash": source_bundle_hash,
+
+                "cas": cas,
+
+                "values": [
+
+                    self._load_value_entry(entry, cas)
+
+                    for entry in manifest["items"]
+
+                ],
+
+            }
+
+
+
+        values = {}
+
+        warnings = []
+
+
+
+        for value_hash, entry in manifest["values"].items():
+
+            value, warning = self._load_hashed_value_entry(
+
+                value_hash,
+
+                entry,
+
+                cas,
+
             )
-            total_bytes = 0
-            for content in cas_bytes.values():
-                if not isinstance(content, (bytes, bytearray, memoryview)):
-                    continue
-                content_size = len(content)
-                self._check_resource_limit(
-                    "CAS record bytes",
-                    content_size,
-                    "max_cas_record_bytes",
-                )
-                total_bytes += content_size
-                self._check_resource_limit(
-                    "CAS total bytes",
-                    total_bytes,
-                    "max_cas_total_bytes",
-                )
 
-        if not isinstance(manifest, dict):
-            return
 
-        values = manifest.get("values")
-        if isinstance(values, dict):
-            self._check_resource_limit(
-                "manifest values",
-                len(values),
-                "max_values",
+
+            values[value_hash] = value
+
+
+
+            if warning is not None:
+
+                warnings.append(warning)
+
+
+
+        run = manifest["run"]
+
+        run_state = self.run_deserialiser.deserialise_trace(
+            run,
+            values,
+            divergent_value_hashes={
+                warning["expected"]
+                for warning in warnings
+                if warning.get("type") == "value_hash_mismatch"
+            },
+        )
+
+
+
+        event_bundle = None
+
+        event_log = None
+
+        if manifest.get("events") is not None:
+
+            from tide_tooling.tooling_core.engine.event_occurrences import (
+
+                FrozenEventLog,
+
+                FrozenEventLogBundle,
+
             )
-            total_record_refs = 0
-            for value_entry in values.values():
-                if not isinstance(value_entry, dict):
-                    continue
-                bundle = value_entry.get("bundle")
-                if not isinstance(bundle, dict):
-                    continue
-                record_refs = bundle.get("record_refs")
-                if not isinstance(record_refs, dict):
-                    continue
-                self._check_resource_limit(
-                    "value records",
-                    len(record_refs),
-                    "max_value_records",
-                )
-                total_record_refs += len(record_refs)
-                self._check_resource_limit(
-                    "manifest record references",
-                    total_record_refs,
-                    "max_manifest_record_refs",
-                )
 
-        ref_index = manifest.get("ref_index")
-        if isinstance(ref_index, dict):
-            version_count = 0
-            for ref_entry in ref_index.values():
-                if not isinstance(ref_entry, dict):
-                    continue
-                versions = ref_entry.get("versions")
-                if isinstance(versions, dict):
-                    version_count += len(versions)
-                    self._check_resource_limit(
-                        "reference versions",
-                        version_count,
-                        "max_ref_versions",
-                    )
 
-        run = manifest.get("run")
-        if isinstance(run, dict):
-            records = run.get("exec_records")
-            if isinstance(records, list):
-                self._check_resource_limit(
-                    "execution records",
-                    len(records),
-                    "max_exec_records",
-                )
 
-    def rebuild_trace(self, loaded):
+            event_bundle = FrozenEventLogBundle.from_dict(
+
+                manifest["events"]
+
+            )
+
+            event_log = FrozenEventLog.from_event_bundle(
+
+                event_bundle,
+
+                trusted=self.trusted,
+
+            )
+
+        events_verified = self._verify_event_correspondence(
+
+            run,
+
+            run_state,
+
+            event_log,
+
+        )
+
+
+
+        return {
+
+            "manifest": manifest,
+
+            "content": "trace",
+
+            "source_bundle_hash": source_bundle_hash,
+
+            "cas": cas,
+
+            "values": values,
+
+            "run": run,
+
+            "run_state": run_state,
+
+            "event_bundle": event_bundle,
+
+            "event_log": event_log,
+
+            "events_verified": events_verified,
+
+            "divergence": {
+
+                "warnings": warnings,
+
+            },
+
+        }
+
+
+
+    def _load_hashed_value_entry(self, value_hash, entry, cas):
+
+        graph = self._load_value_graph(entry, cas)
+
+        root_record = graph["records"][graph["root"]]
+        retained_opaque_hash = (
+            root_record.get("value_hash")
+            if root_record.get("serialiser") == "opaque"
+            and is_tide_value_hash(root_record.get("value_hash"))
+            else None
+        )
+        observed_hash = (
+            retained_opaque_hash
+            or tide_value_hash_from_bundle(graph)
+        )
+
+
+
+        warning = None
+
+
+
+        if observed_hash != value_hash:
+
+            warning = {
+
+                "type": "value_hash_mismatch",
+
+                "expected": value_hash,
+
+                "observed": observed_hash,
+
+            }
+
+
+
+        value = self.deserialise(graph)
+
+        if warning is not None:
+
+            value = TIDEOpaqueValue(
+
+                type_name=(
+                    value.type_name
+                    if isinstance(value, TIDEOpaqueValue)
+                    else type(value).__name__
+                ),
+
+                representation=repr(value)[:1024],
+
+                reason=(
+                    "Bundle backing value does not authenticate its "
+                    "recorded TIDE identity"
+                ),
+
+                value_hash=value_hash,
+
+            )
+
+
+
+        if isinstance(value, TIDEOpaqueValue):
+
+            value.value_hash = value_hash
+
+
+
+        return value, warning
+
+
+
+    def _load_value_entry(self, entry, cas):
+
+        graph = self._load_value_graph(entry, cas)
+
+        return self.deserialise(graph)
+
+
+
+    def _load_value_graph(self, entry, cas):
+
+        if not isinstance(entry, dict):
+
+            raise TypeError("TIDE value entry must be a dict")
+
+
+
+        graph_manifest = entry.get("bundle")
+
+        root_cas_ref = entry.get("root_cas_ref")
+
+
+
+        if not isinstance(graph_manifest, dict):
+
+            raise TypeError("TIDE value bundle must be a dict")
+
+        if not isinstance(root_cas_ref, str):
+
+            raise TypeError("TIDE value root_cas_ref must be a string")
+
+
+
+        root = graph_manifest.get("root")
+
+        record_refs = graph_manifest.get("record_refs")
+
+
+
+        if not isinstance(record_refs, dict):
+
+            raise TypeError("TIDE value record_refs must be a dict")
+
+        if record_refs.get(root) != root_cas_ref:
+
+            raise ValueError(
+
+                "TIDE value root_cas_ref does not match its bundle"
+
+            )
+
+
+
+        return cas.load_bundle(graph_manifest)
+
+
+
+    # ------------------------------------------------------------------
+
+    # Native Trace reconstruction
+
+    # ------------------------------------------------------------------
+
+    def rebuild_trace(self, loaded, source_bundle=None):
+
         if not isinstance(loaded, dict):
-            raise TypeError("Loaded trace bundle must be a dict")
+            raise TypeError("Loaded TIDE Bundle state must be a dict")
 
-        run = loaded.get("run")
-        exec_logs = loaded.get("exec_logs")
+        if loaded["content"] != "trace":
+            raise ValueError(
+                "A standalone values Bundle does not project a Trace"
+            )
 
-        if run is None:
-            raise ValueError("Loaded trace bundle has no TideRun evidence")
+        run_state = loaded["run_state"]
+        if not isinstance(run_state, dict):
+            raise TypeError("Loaded Trace bundle has no native TideRun state")
 
-        if not isinstance(exec_logs, list):
-            raise TypeError("Loaded trace bundle exec_logs must be a list")
+        expected_run_state = {
+            "records",
+            "ready_attempts",
+            "trace",
+            "state_authorities",
+        }
+        if set(run_state) != expected_run_state:
+            missing = sorted(expected_run_state - set(run_state))
+            unknown = sorted(set(run_state) - expected_run_state)
+            raise ValueError(
+                "Normalized TideRun state shape changed: "
+                f"missing={missing}, unknown={unknown}"
+            )
+
+        records = run_state["records"]
+        ready_attempts = run_state["ready_attempts"]
+        trace_meta = run_state["trace"]
+        state_authorities = run_state["state_authorities"]
+
+        if not isinstance(records, list):
+            raise TypeError("Loaded TideRun records must be a list")
+        if not isinstance(ready_attempts, list):
+            raise TypeError("Loaded TideRun ready_attempts must be a list")
+        if not isinstance(trace_meta, dict):
+            raise TypeError("Loaded TideRun trace metadata must be a dict")
+        if not isinstance(state_authorities, dict):
+            raise TypeError(
+                "Loaded TideRun state_authorities must be a dict"
+            )
+
+        ocean_id = trace_meta["ocean_id"]
+        if ocean_id is None:
+            raise ValueError("Bundled Trace is missing ocean_id")
+
+        name = trace_meta["name"]
+        if not isinstance(name, str):
+            raise TypeError("Bundled Trace name must be text")
+
+        pipelines = trace_meta["pipelines"]
+        bundle_context = trace_meta["bundle_context"]
+        model_context = trace_meta["model_context"]
+        missing_referenced_events = trace_meta["missing_referenced_events"]
+        causal_order_violations = trace_meta["causal_order_violations"]
+        deadlock = trace_meta["deadlock"]
+        evidence_violations = trace_meta["evidence_violations"]
+
+        for label, value in {
+            "pipelines": pipelines,
+            "bundle_context": bundle_context,
+            "model_context": model_context,
+            "missing_referenced_events": missing_referenced_events,
+            "causal_order_violations": causal_order_violations,
+            "deadlock": deadlock,
+            "evidence_violations": evidence_violations,
+        }.items():
+            if not isinstance(value, dict):
+                raise TypeError(
+                    f"Bundled Trace {label} must be a dict"
+                )
+
+        for label in (
+            "ready_exec_ids",
+            "blocked_exec_ids",
+            "started_runner_ids",
+            "causal_runner_ids",
+            "ended_runner_ids",
+        ):
+            if not isinstance(trace_meta[label], tuple):
+                raise TypeError(
+                    f"Bundled Trace {label} must be a tuple"
+                )
+
+        loaded_divergence = loaded["divergence"]
+        if not isinstance(loaded_divergence, dict):
+            raise TypeError("Loaded Bundle divergence must be a dict")
+
+        loaded_warnings = loaded_divergence["warnings"]
+        if not isinstance(loaded_warnings, list):
+            raise TypeError("Loaded Bundle divergence warnings must be a list")
+
+        bundle_context = deepcopy(bundle_context)
+
+        if loaded_warnings:
+            divergence = bundle_context.get("divergence")
+            if divergence is None:
+                divergence = {}
+            elif not isinstance(divergence, dict):
+                raise TypeError(
+                    "Bundled Trace divergence context must be a dict"
+                )
+            else:
+                divergence = deepcopy(divergence)
+
+            existing_warnings = divergence.get("warnings")
+            if existing_warnings is None:
+                existing_warnings = []
+            elif not isinstance(existing_warnings, list):
+                raise TypeError(
+                    "Bundled Trace divergence context warnings must be a list"
+                )
+            else:
+                existing_warnings = list(existing_warnings)
+
+            existing_warnings.extend(deepcopy(loaded_warnings))
+            divergence["warnings"] = existing_warnings
+            bundle_context["divergence"] = divergence
 
         try:
             from tide_tooling.tooling_core.engine.tide_logging import Trace
@@ -320,309 +1122,698 @@ class TIDEBundler:
                 "Trace rebuild requires the TIDE engine runtime"
             ) from error
 
-        trace = run.get("trace", {})
-        host_record_value_hash = trace.get("host_record_value_hash")
-        host_record = (
-            loaded.get("values", {}).get(host_record_value_hash)
-            if host_record_value_hash is not None
-            else None
-        )
-
         return Trace(
-            event_log=[],
-            exec_log=exec_logs,
-            runner=trace.get("run"),
-            ocean_id=trace.get("ocean_id"),
-            name=trace.get("name", "TIDE: .trace()"),
+            records,
+            event_log=loaded["event_log"],
+            events_verified=loaded["events_verified"],
+            pipelines=pipelines,
+            runner=trace_meta["runner"],
+            ocean_id=ocean_id,
+            name=name,
             from_cas=True,
-            source_context=trace.get("sources"),
-            model_context=trace.get("model_context"),
-            host=trace.get("host"),
-            host_record=host_record,
-            bundle_context={
-                "kind": loaded["manifest"].get("kind"),
-                "codec_version": loaded["manifest"].get("codec_version"),
-                "value_count": len(loaded.get("values", {})),
-                "opaque_value_hashes": [
-                    value_hash
-                    for value_hash, value in loaded.get("values", {}).items()
-                    if isinstance(value, TIDEOpaqueValue)
-                ],
-            },
+            bundle_context=bundle_context,
+            model_context=model_context,
+            host=trace_meta["host"],
+            host_record=trace_meta["host_record"],
+            trace_starting_event=trace_meta["trace_starting_event_id"],
+            pipeline_starting_event=trace_meta["pipeline_starting_event_id"],
+            tide_plan=trace_meta["tide_plan"],
+            missing_referenced_events=missing_referenced_events,
+            causal_order_violations=causal_order_violations,
+            ready_exec_ids=trace_meta["ready_exec_ids"],
+            blocked_exec_ids=trace_meta["blocked_exec_ids"],
+            deadlock=deadlock,
+            ready_attempts=ready_attempts,
+            started_runner_ids=trace_meta["started_runner_ids"],
+            causal_runner_ids=trace_meta["causal_runner_ids"],
+            ended_runner_ids=trace_meta["ended_runner_ids"],
+            evidence_violations=evidence_violations,
+            _state_authorities=state_authorities,
+            _value_backing=loaded["values"],
+            _require_closed_evidence=True,
+            _source_bundle=source_bundle,
         )
 
-    def _add_value(self, value: object):
-        value_identity = id(value)
 
-        if value_identity in self.object_ids:
-            return self.object_ids[value_identity]
+    # ------------------------------------------------------------------
 
-        object_id = f"object_{self.next_object_index}"
-        self.next_object_index += 1
-        self.object_ids[value_identity] = object_id
-        self.records[object_id] = None
-        self.records[object_id] = self.serialiser.serialise_with_refs(
-            value,
-            self._add_value,
-        )
-        return object_id
+    # Validation / resource limits
 
-    @staticmethod
-    def _get_trace_values(trace_or_values, cas):
-        if isinstance(trace_or_values, (list, tuple)):
-            return (
-                {
-                    cas.value_hasher(value): value
-                    for value in trace_or_values
-                },
-                {},
-                {},
+    # ------------------------------------------------------------------
+
+    def validate_trace_bundle_resources(self, complete):
+
+        if not isinstance(complete, dict):
+
+            raise TypeError("Imported TIDE Bundle must be a dict")
+
+        self._validate_nested_bundle_resources(complete)
+
+
+
+        manifest = complete.get("manifest")
+
+        cas_bytes = complete.get("cas")
+
+
+
+        if isinstance(cas_bytes, dict):
+
+            self._check_resource_limit(
+
+                "CAS records",
+
+                len(cas_bytes),
+
+                "max_cas_records",
+
             )
 
-        index = getattr(trace_or_values, "index", None)
 
-        if index is None:
-            raise TypeError(
-                "bundle_trace expects a Trace or a list/tuple of values"
-            )
 
-        indexed_values = getattr(index, "value_by_hash", None)
-        indexed_ref_versions = getattr(
-            index,
-            "value_hash_by_ref_version",
-            None,
-        )
+            total_bytes = 0
 
-        if not isinstance(indexed_values, dict):
-            raise TypeError(
-                "TraceIndex.value_by_hash must be a dict"
-            )
+            for content in cas_bytes.values():
 
-        if not isinstance(indexed_ref_versions, dict):
-            raise TypeError(
-                "TraceIndex.value_hash_by_ref_version must be a dict"
-            )
+                if not isinstance(content, (bytes, bytearray, memoryview)):
 
-        values = {
-            cas.value_hasher(value): value
-            for value in indexed_values.values()
-        }
-        host_record = getattr(trace_or_values, "host_record", None)
-        host_record_value_hash = None
-        if host_record is not None:
-            host_record_value_hash = cas.value_hasher(host_record)
-            values[host_record_value_hash] = host_record
-        for record in getattr(trace_or_values, "exec_log", ()) or ():
-            output_value = getattr(record, "output_value", None)
-            if (
-                hasattr(record, "output_value")
-                and output_value.__class__.__name__
-                != "__TIDE_TEMPLATE_VALUE__"
-            ):
-                values[cas.value_hasher(output_value)] = output_value
-            for effect in getattr(record, "effects", ()) or ():
-                value = getattr(effect, "output", None)
-                if value.__class__.__name__ == "__TIDE_TEMPLATE_VALUE__":
                     continue
-                values[cas.value_hasher(value)] = value
-        ref_versions = {
-            ref_version: cas.value_hasher(indexed_values[value_hash])
-            for ref_version, value_hash in indexed_ref_versions.items()
-            if value_hash in indexed_values
-        }
 
-        missing_ref_values = [
-            ref_version
-            for ref_version, value_hash in indexed_ref_versions.items()
-            if value_hash not in indexed_values
-        ]
 
-        if missing_ref_values:
-            raw_ref, version = missing_ref_values[0]
-            raise ValueError(
-                "Trace ref/version points to a value missing from "
-                "TraceIndex.value_by_hash: "
-                f"{raw_ref}[v{version}]"
-            )
 
-        return (
-            values,
-            ref_versions,
-            {
-                name: value
-                for name, value in {
-                    "name": getattr(trace_or_values, "name", None),
-                    "ocean_id": getattr(trace_or_values, "ocean_id", None),
-                    "run": getattr(trace_or_values, "run", None),
-                    "pipeline": getattr(trace_or_values, "pipeline", None),
-                    "host_record_value_hash": host_record_value_hash,
-                    "sources": (
-                        [
-                            dict(source)
-                            for source in trace_or_values.execution_sources
-                        ]
-                        if getattr(
-                            trace_or_values,
-                            "execution_sources",
-                            None,
-                        )
-                        else None
-                    ),
-                }.items()
-                if value is not None
-            },
-        )
+                size = len(content)
 
-    @staticmethod
-    def _validate_trace_manifest(manifest):
-        if not isinstance(manifest, dict):
-            raise TypeError("Imported trace manifest must be a dict")
+                self._check_resource_limit(
 
-        if manifest.get("kind") != "tide_trace_values":
-            raise ValueError("Unsupported trace manifest kind")
+                    "CAS record bytes",
 
-        if manifest.get("codec_version") != 1:
-            raise ValueError("Unsupported trace manifest codec version")
+                    size,
 
-        for key in ["values", "ref_index", "value_index", "cas_index"]:
-            if not isinstance(manifest.get(key), dict):
-                raise TypeError(f"Trace manifest {key} must be a dict")
+                    "max_cas_record_bytes",
 
-        value_hash_codec = manifest.get("value_hash_codec")
-
-        if value_hash_codec not in [None, "tide_serialised_bytes_v1"]:
-            raise ValueError("Unsupported trace value hash codec")
-
-    @staticmethod
-    def _normalise_trace_value_hashes(manifest, values, cas):
-        if manifest.get("value_hash_codec") == "tide_serialised_bytes_v1":
-            return manifest, values
-
-        hash_map = {
-            value_hash: cas.value_hasher(value)
-            for value_hash, value in values.items()
-        }
-        manifest["values"] = {
-            hash_map[value_hash]: value_entry
-            for value_hash, value_entry in manifest["values"].items()
-        }
-        manifest["value_index"] = {
-            hash_map[value_hash]: [dict(reference) for reference in references]
-            for value_hash, references in manifest["value_index"].items()
-        }
-        manifest["cas_index"] = {
-            cas_ref: [hash_map[value_hash] for value_hash in value_hashes]
-            for cas_ref, value_hashes in manifest["cas_index"].items()
-        }
-
-        for ref_entry in manifest["ref_index"].values():
-            for version_entry in ref_entry["versions"].values():
-                value_hash = version_entry["value_hash"]
-                version_entry["value_hash"] = hash_map.get(
-                    value_hash,
-                    value_hash,
                 )
 
-        TIDEBundler._normalise_run_value_hashes(
-            manifest.get("run"),
-            hash_map,
-        )
-        manifest["value_hash_codec"] = "tide_serialised_bytes_v1"
+                total_bytes += size
 
-        return (
-            manifest,
-            {
-                hash_map[value_hash]: value
-                for value_hash, value in values.items()
-            },
-        )
+                self._check_resource_limit(
 
-    @staticmethod
-    def _normalise_run_value_hashes(run, hash_map):
-        if not isinstance(run, dict):
+                    "CAS total bytes",
+
+                    total_bytes,
+
+                    "max_cas_total_bytes",
+
+                )
+
+
+
+        if not isinstance(manifest, dict):
+
             return
 
-        for record in run.get("exec_records", []):
-            for read in record.get("reads", []):
-                TIDEBundler._normalise_value_hash_entry(read, hash_map)
 
-                for expanded in read.get("expanded", []):
-                    TIDEBundler._normalise_value_hash_entry(
-                        expanded,
-                        hash_map,
+
+        content = manifest.get("content")
+
+
+
+        if content == "values":
+
+            items = manifest.get("items")
+
+            if isinstance(items, list):
+
+                self._check_resource_limit(
+
+                    "values",
+
+                    len(items),
+
+                    "max_values",
+
+                )
+
+                self._validate_value_entries_resources(items)
+
+            return
+
+
+
+        values = manifest.get("values")
+
+        if isinstance(values, dict):
+
+            self._check_resource_limit(
+
+                "values",
+
+                len(values),
+
+                "max_values",
+
+            )
+
+            self._validate_value_entries_resources(values.values())
+
+
+
+        run = manifest.get("run")
+
+        if isinstance(run, dict):
+
+            records = run.get("records")
+
+            if isinstance(records, list):
+
+                self._check_resource_limit(
+
+                    "Trace records",
+
+                    len(records),
+
+                    "max_exec_records",
+
+                )
+
+
+
+            attempts = run.get("ready_attempts")
+
+            if isinstance(attempts, list):
+
+                self._check_resource_limit(
+
+                    "ready attempts",
+
+                    len(attempts),
+
+                    "max_ready_attempts",
+
+                )
+
+
+
+        events = manifest.get("events")
+
+        if isinstance(events, dict):
+
+            count = events.get("count")
+
+            if isinstance(count, int):
+
+                self._check_resource_limit(
+
+                    "events",
+
+                    count,
+
+                    "max_events",
+
+                )
+
+
+
+            graph = events.get("events")
+
+            if isinstance(graph, dict):
+
+                records = graph.get("records")
+
+                if isinstance(records, dict):
+
+                    self._check_resource_limit(
+
+                        "Event graph records",
+
+                        len(records),
+
+                        "max_event_records",
+
                     )
 
-            for write in record.get("writes", []):
-                TIDEBundler._normalise_value_hash_entry(write, hash_map)
 
-            for effect in record.get("effects", []):
-                TIDEBundler._normalise_named_value_hash(
-                    effect,
-                    "output_value_hash",
-                    hash_map,
-                )
-            TIDEBundler._normalise_named_value_hash(
-                record,
-                "output_value_hash",
-                hash_map,
+    def _validate_nested_bundle_resources(
+        self,
+        value,
+        *,
+        depth=0,
+        active=None,
+    ):
+        if depth > self.resource_limits["max_deserialise_depth"]:
+            raise ValueError(
+                "TIDE bundle resource limit exceeded: Bundle depth"
             )
 
-    @staticmethod
-    def _normalise_value_hash_entry(entry, hash_map):
-        if not isinstance(entry, dict):
+        if not isinstance(
+            value,
+            (dict, list, tuple, set, frozenset),
+        ):
             return
 
-        value_hash = entry.get("value_hash")
+        self._check_resource_limit(
+            "Bundle container items",
+            len(value),
+            "max_container_items",
+        )
 
-        if value_hash is not None:
-            entry["value_hash"] = hash_map.get(value_hash, value_hash)
+        active = set() if active is None else active
+        identity = id(value)
+        if identity in active:
+            raise ValueError("Imported TIDE Bundle contains a container cycle")
 
-    @staticmethod
-    def _normalise_named_value_hash(entry, name, hash_map):
-        if not isinstance(entry, dict):
+        active.add(identity)
+        children = value.values() if isinstance(value, dict) else value
+        try:
+            for child in children:
+                self._validate_nested_bundle_resources(
+                    child,
+                    depth=depth + 1,
+                    active=active,
+                )
+        finally:
+            active.remove(identity)
+
+
+
+    def _validate_value_entries_resources(self, entries):
+
+        total_records = 0
+
+
+
+        for entry in entries:
+
+            if not isinstance(entry, dict):
+
+                continue
+
+
+
+            graph = entry.get("bundle")
+
+            if not isinstance(graph, dict):
+
+                continue
+
+
+
+            record_refs = graph.get("record_refs")
+
+            if not isinstance(record_refs, dict):
+
+                continue
+
+
+
+            self._check_resource_limit(
+
+                "value records",
+
+                len(record_refs),
+
+                "max_value_records",
+
+            )
+
+            total_records += len(record_refs)
+
+
+
+            self._check_resource_limit(
+
+                "CAS records referenced by values",
+
+                total_records,
+
+                "max_cas_records",
+
+            )
+
+
+
+    @classmethod
+
+    def _validate_trace_manifest(cls, manifest):
+
+        if not isinstance(manifest, dict):
+
+            raise TypeError("Imported TIDE Bundle manifest must be a dict")
+
+        if manifest.get("kind") != cls.KIND:
+
+            raise ValueError("Unsupported TIDE Bundle kind")
+
+        if manifest.get("codec_version") != cls.CODEC_VERSION:
+
+            raise ValueError("Unsupported TIDE Bundle codec version")
+
+        if not isinstance(manifest.get("metadata"), dict):
+
+            raise TypeError("TIDE Bundle metadata must be a dict")
+
+
+
+        content = manifest.get("content")
+
+
+
+        if content == "trace":
+
+            cls._validate_native_trace_manifest(manifest)
+
             return
 
-        value_hash = entry.get(name)
-        if value_hash is not None:
-            entry[name] = hash_map.get(value_hash, value_hash)
+
+
+        if content == "values":
+
+            cls._validate_values_manifest(manifest)
+
+            return
+
+
+
+        raise ValueError("Unsupported TIDE Bundle content type")
+
+
 
     @staticmethod
+
+    def _validate_native_trace_manifest(manifest):
+
+        expected = {
+
+            "kind",
+
+            "codec_version",
+
+            "content",
+
+            "run",
+
+            "values",
+
+            "events",
+
+            "metadata",
+
+        }
+
+        if set(manifest) != expected:
+
+            unexpected = sorted(set(manifest) - expected)
+
+            missing = sorted(expected - set(manifest))
+
+            details = []
+
+            if missing:
+
+                details.append("missing: " + ", ".join(missing))
+
+            if unexpected:
+
+                details.append("unexpected: " + ", ".join(unexpected))
+
+            raise ValueError(
+
+                "Invalid native Trace bundle manifest"
+
+                + (": " + "; ".join(details) if details else "")
+
+            )
+
+
+
+        run = manifest.get("run")
+
+        if not isinstance(run, dict):
+
+            raise TypeError("TIDE Trace bundle run must be a dict")
+
+        if run.get("kind") != TIDERunSerialiser.KIND:
+
+            raise ValueError("Unsupported TideRun kind")
+
+        if run.get("codec_version") != TIDERunSerialiser.CODEC_VERSION:
+
+            raise ValueError("Unsupported TideRun codec version")
+
+
+
+        values = manifest.get("values")
+
+        if not isinstance(values, dict):
+
+            raise TypeError("TIDE Trace bundle values must be a dict")
+
+        for value_hash, entry in values.items():
+
+            if not is_tide_value_hash(value_hash):
+
+                raise ValueError(
+
+                    "TIDE Trace value key must be a valid TIDE value hash"
+
+                )
+
+            TIDEBundler._validate_value_entry(entry)
+
+
+
+        events = manifest.get("events")
+
+        if events is None:
+            return
+
+        if events is not None:
+
+            from tide_tooling.tooling_core.engine.event_occurrences import (
+
+                FrozenEventLogBundle,
+
+            )
+
+            FrozenEventLogBundle.from_dict(events)
+
+
+
+    @staticmethod
+
+    def _validate_values_manifest(manifest):
+
+        expected = {
+
+            "kind",
+
+            "codec_version",
+
+            "content",
+
+            "items",
+
+            "metadata",
+
+        }
+
+        if set(manifest) != expected:
+
+            unexpected = sorted(set(manifest) - expected)
+
+            missing = sorted(expected - set(manifest))
+
+            details = []
+
+            if missing:
+
+                details.append("missing: " + ", ".join(missing))
+
+            if unexpected:
+
+                details.append("unexpected: " + ", ".join(unexpected))
+
+            raise ValueError(
+
+                "Invalid values bundle manifest"
+
+                + (": " + "; ".join(details) if details else "")
+
+            )
+
+
+
+        items = manifest.get("items")
+
+        if not isinstance(items, list):
+
+            raise TypeError("TIDE values bundle items must be a list")
+
+        for entry in items:
+
+            TIDEBundler._validate_value_entry(entry)
+
+
+
+    @staticmethod
+
+    def _validate_value_entry(entry):
+
+        if not isinstance(entry, dict):
+
+            raise TypeError("TIDE value entry must be a dict")
+
+
+
+        allowed = {"root_cas_ref", "bundle"}
+
+        if not set(entry).issubset(allowed):
+
+            raise ValueError("TIDE value entry contains unknown fields")
+
+
+
+        root_cas_ref = entry.get("root_cas_ref")
+
+        graph = entry.get("bundle")
+
+
+
+        if not isinstance(root_cas_ref, str):
+
+            raise TypeError("TIDE value root_cas_ref must be a string")
+
+        if not isinstance(graph, dict):
+
+            raise TypeError("TIDE value bundle must be a dict")
+
+
+
+        root = graph.get("root")
+
+        record_refs = graph.get("record_refs")
+
+
+
+        if not isinstance(record_refs, dict):
+
+            raise TypeError("TIDE value bundle record_refs must be a dict")
+
+        if record_refs.get(root) != root_cas_ref:
+
+            raise ValueError(
+
+                "TIDE value root_cas_ref does not match its bundle"
+
+            )
+
+
+
+    # ------------------------------------------------------------------
+
+    # Helpers
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+
     def _get_handle_metadata(handle):
-        if isinstance(handle, dict):
-            metadata = handle.get("metadata")
-        else:
-            metadata = getattr(handle, "metadata", None)
 
-        return dict(metadata) if isinstance(metadata, dict) else {}
+        if handle is None:
+
+            return {}
+
+
+
+        metadata = getattr(handle, "metadata", None)
+
+
+
+        if isinstance(metadata, dict):
+
+            return deepcopy(metadata)
+
+
+
+        if isinstance(handle, dict) and isinstance(handle.get("metadata"), dict):
+
+            return deepcopy(handle["metadata"])
+
+
+
+        return {}
+
+
 
     @staticmethod
+
     def _normalise_resource_limits(resource_limits):
+
         if resource_limits is None:
+
             return dict(DEFAULT_RESOURCE_LIMITS)
+
         if not isinstance(resource_limits, dict):
+
             raise TypeError("resource_limits must be a dict or None")
 
+
+
         unknown = set(resource_limits) - set(DEFAULT_RESOURCE_LIMITS)
+
         if unknown:
+
             raise ValueError(
+
                 "Unknown TIDE bundle resource limits: "
+
                 + ", ".join(sorted(unknown))
+
             )
 
+
+
         limits = dict(DEFAULT_RESOURCE_LIMITS)
+
         limits.update(resource_limits)
+
+
+
         for name, value in limits.items():
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+
+            if (
+
+                not isinstance(value, int)
+
+                or isinstance(value, bool)
+
+                or value < 1
+
+            ):
+
                 raise ValueError(
-                    f"TIDE bundle resource limit {name} must be a "
-                    "positive integer"
+
+                    f"TIDE bundle resource limit {name} "
+
+                    "must be a positive integer"
+
                 )
+
+
+
         return limits
 
+
+
     def _check_resource_limit(self, label, actual, limit_name):
+
         maximum = self.resource_limits[limit_name]
+
         if actual > maximum:
+
             raise ValueError(
+
                 "TIDE bundle resource limit exceeded: "
+
                 f"{label} {actual} > {maximum} ({limit_name})"
+
             )

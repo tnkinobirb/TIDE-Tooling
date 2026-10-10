@@ -207,4 +207,3 @@ def test_get_value_kind_handles_numpy_when_available(serialiser):
     assert serialiser.get_value_kind(
         numpy.int64(1)
     ) == "numpy_scalar"
-

@@ -20,6 +20,8 @@ class TIDEOpaqueValue:
         self.observed_mutable = observed_mutable
 
     def __repr__(self):
+        if self.type_name in {"TIDEUnknownType", "TIDEUnknownValue"}:
+            return f"opaque<{self.type_name}>"
         value_hash = self.value_hash or "unhashed"
         return f"opaque<{self.type_name}>[{value_hash[:20]}]"
 

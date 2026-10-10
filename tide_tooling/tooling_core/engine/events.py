@@ -1,77 +1,65 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Callable
-from dataclasses import dataclass, field
+from typing import Any
+from dataclasses import KW_ONLY, dataclass, field
 from uuid import uuid4
 import time
-from tide_tooling.tooling_core import debug_print as print
 
 
-def event_type_is(value, event_enum):
-    """Return whether *value* is a member or value of an event Enum.
+@dataclass(frozen=True)
+class Cause:
+    event_id: str | None = None
+    description: str | None = None
 
-    ``value in SomeEnum`` raises ``TypeError`` for raw values on Python 3.11,
-    while Python 3.12+ accepts them. Converting explicitly keeps routing
-    semantics identical across every supported Python version.
-    """
-    try:
-        event_enum(value)
-    except (TypeError, ValueError):
-        return False
-    return True
+    def __post_init__(self):
+        if self.description is None:
+            raise ValueError("Cause requires a description")
+
+    @classmethod
+    def from_event(cls, event):
+        return cls(event.event_id, str(event.type))
 
 
-# from tide_tooling.tooling_core.engine.tide_logging import Actor
+@dataclass(frozen=True)
 class Event:
+    source: str
+    source_id: int | str
+    type: StrEnum
+    cause: Cause
 
-    _event_counter = 0 
-    
-    def __init__(self, source:str=None, source_id:int=None, target_runner_id:int=None, event_type:Event=None, payload:Any=None, exec_id:int=None):
-        try:
-            self.id = Event._event_counter 
-            Event._event_counter  += 1
+    _: KW_ONLY
+    ocean_id: int | str
 
-            self.source = source
-            self.source_id = source_id
+    target_runner_id: int | str | None = None
+    payload: Any = None
+    exec_id: str | None = None
+    host: str | None = None
 
-            self.target_runner_id = target_runner_id
-            # if not self.target_runner_id:
-            #     raise RuntimeError()
-           
-            self.event_type = event_type
-            self.payload = payload
-            self.exec_id = exec_id
-            self.creation_time = time.time()
-        except Exception:
-            print(f"EventInitError({source},{source_id},{target_runner_id},{event_type})")
-            raise 
+    event_id: str = field(init=False, default_factory=lambda: uuid4().hex)
+    creation_time: float = field(init=False, default_factory=time.time)
 
-@dataclass
-class ExecEvent:
-    id: int = field(init=False)
 
-    actor: str | Callable
-    reads: dict[str, Any]          # ref -> value
-    writes: dict[str, Any]         # ref -> value
-    uuid: str = field(init=False, default_factory=lambda:uuid4().hex)
-    source: str = "TIDE: .trace()"
-    cause: str = "unknown"
-    status: str = "succeeded"
-    effects: list[Any] = field(default_factory=list)
-    emitted: list[Any] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    seq_id: int = None
+def _causal_events(events, root):
+    # Select the root and every Event causally descended from it.
+    causal_ids = {root.event_id}
+    selected = []
+
+    for event in events:
+        if (
+            event.event_id == root.event_id
+            or event.cause.event_id in causal_ids
+        ):
+            causal_ids.add(event.event_id)
+            selected.append(event)
+
+    return tuple(selected)
 
 class OceanEvents(StrEnum):
     # Pipeline Controls
     REGISTER_PIPELINE = "register_pipeline"
     RUN_PIPELINE = "start_runner"
-    KILL_PIPELINE = "kill_pipeline"
-
-    # Store controls
-    SET = "set"
-    DELETE = "delete"
+    KILL_RUNNER = "kill_runner"
 
     # Ocean controls
     QUIT = "quit"
@@ -86,11 +74,6 @@ class PipelineEvents(StrEnum):
     RUN_NODE = "run_node"
             
     RESULT_READY = "result_ready"
-    
-    PRINT = "print"
-    WAITING = "print_waiting"
-    DONE = "done"
-    KILL = "kill"
 
 class ExecutorEvents(StrEnum):
     NODE_READY = "node_ready"
@@ -101,13 +84,14 @@ class RouterEvents(StrEnum):
     DELETE = "delete_target"
 
 class LogEvents(StrEnum):
+    RUNNER_PLAN = "runner_plan"
     NODE_EMITTED = "node_emitted"
     NODE_BLOCKED = "node_blocked"
+    RUNNER_DEADLOCK = "runner_deadlock"
     DEP_CONCRETISED = "dep_concretised"
     EFFECT = "effect"
     EVENT_EXEC = "event_exec"
     MISSING_REFS = "missing_ref_error"
-    READ='read'
 
 class Effects(StrEnum):
     END = "END"
@@ -117,7 +101,3 @@ class Effects(StrEnum):
     READ = "read"
     EMIT = "emit"
     RAISE = "raise"
-    
-class Causes(StrEnum):
-    NODE = "cause:node"
-    EFFECT = "cause:effect"

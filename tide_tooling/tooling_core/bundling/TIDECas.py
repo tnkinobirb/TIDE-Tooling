@@ -23,7 +23,7 @@ class TIDECas:
         if not isinstance(record, dict):
             raise TypeError("CAS records must be dicts")
 
-        content = self._canonical_bytes(record)
+        content = self.canonical_bytes(record)
         reference = self.value_hasher(content)
         self.records.setdefault(reference, content)
         return reference
@@ -120,7 +120,7 @@ class TIDECas:
     def __len__(self):
         return len(self.records)
 
-    def _canonical_bytes(self, value):
+    def canonical_bytes(self, value):
         return json.dumps(
             self._canonicalise(value),
             sort_keys=True,

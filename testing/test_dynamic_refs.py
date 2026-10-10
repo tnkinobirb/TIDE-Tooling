@@ -3,15 +3,14 @@ import pytest
 from tide_tooling import DataRef, Ocean, TIDE, Trace, node, pipeline
 from tide_tooling.tooling_core.engine.tide_logging import DependencyUseRecord, ExecRecord, ExpandedDepRecord, WriteRecord
 from tide_tooling.tooling_core.engine.errors import DataRefInitError, NoExecRecordError
+from tide_tooling.tooling_core.engine.DependencyTools import DependencyTools
 from tide_tooling.tooling_core.engine.utils import tide_snapshot_value
 
 import threading
 import time
 
-from tide_tooling.tooling_core.engine.classes import Event
-
-
-from tide_tooling.tooling_core.engine.events import LogEvents, RouterEvents
+from tide_tooling.tooling_core.engine.event_payloads import State
+from tide_tooling.tooling_core.engine.events import Cause, Event, LogEvents, RouterEvents
 
 def dynamic_pattern(
     pattern: str,
@@ -28,7 +27,7 @@ def dynamic_pattern(
     return f"@{value}"
 
 def make_exec(seq_id, name, deps=None, writes=None):
-    return ExecRecord(
+    execution = ExecRecord(
         seq_id=seq_id,
         exec_id=f"{seq_id:032x}",
         ocean_id=0,
@@ -54,6 +53,7 @@ def make_exec(seq_id, name, deps=None, writes=None):
         node_options={},
         writes=writes or [],
     )
+    return execution
 
 
 def create_dynamic_index_trace(returned_refs):
@@ -69,7 +69,7 @@ def create_dynamic_index_trace(returned_refs):
             make_exec(
                 seq_id,
                 name,
-                writes=[WriteRecord("test", value, 0, ref)],
+                writes=[WriteRecord(Cause(description="test"), value, 0, ref)],
             )
         )
 
@@ -108,10 +108,10 @@ def create_dynamic_index_trace(returned_refs):
     consumer = make_exec(len(producers), "Consumer", deps=[dynamic])
 
     return Trace(
-        event_log=None,
-        exec_log=[*producers, consumer],
+        log=[*producers, consumer],
         runner="tests",
         ocean_id=0,
+        host="tests",
     )
 
 
@@ -123,7 +123,7 @@ def test_dynamic_parent_preserves_only_returned_expansions():
     }
 
     trace = create_dynamic_index_trace(returned)
-    dynamic = trace.exec_log[-1].deps[0]
+    dynamic = trace.log[-1].deps[0]
 
     assert {
         expanded.unscoped_reference
@@ -137,10 +137,10 @@ def test_dynamic_return_count_is_preserved_by_index():
         "global:@alpha_one",
     })
 
-    dynamic = trace.exec_log[-1].deps[0]
+    dynamic = trace.log[-1].deps[0]
 
     assert len(dynamic.expanded_to) == 2
-    assert len(trace.index.consumer_exec_id_to_producer_input_edges[trace.exec_log[-1].exec_id]) == 2
+    assert len(trace.index.producer_edges_by_exec_id[trace.log[-1].exec_id]) == 2
 
 
 def test_dynamic_expansions_are_indexed_as_exact_ref_version_facts():
@@ -151,12 +151,13 @@ def test_dynamic_expansions_are_indexed_as_exact_ref_version_facts():
 
     trace = create_dynamic_index_trace(returned)
     index = trace.index
-    consumer_id = trace.exec_log[-1].exec_id
-
-    assert list(index.reads_by_exec_id[consumer_id]) == [trace.exec_log[-1].deps[0]]
+    consumer_id = trace.log[-1].exec_id
 
     for ref in returned:
-        assert consumer_id in index.ref_version_to_consumer_exec_ids[(ref, 0)]
+        reads = list(index.read_records_by_ref_version[(ref, 0)])
+        assert len(reads) == 1
+        assert reads[0] in trace.log[-1].deps[0].expanded_to
+        assert consumer_id in index.consumer_exec_ids_by_ref_version[(ref, 0)]
 
 
 def test_dynamic_unreturned_candidates_are_not_indexed_as_consumed():
@@ -165,14 +166,14 @@ def test_dynamic_unreturned_candidates_are_not_indexed_as_consumed():
     })
 
     index = trace.index
-    consumer_id = trace.exec_log[-1].exec_id
+    consumer_id = trace.log[-1].exec_id
 
     for ref in {
         "global:@alpha_one",
         "global:@beta_alpha",
         "global:@beta",
     }:
-        assert consumer_id not in index.ref_version_to_consumer_exec_ids[(ref, 0)]
+        assert consumer_id not in index.consumer_exec_ids_by_ref_version[(ref, 0)]
 
 
 def test_dynamic_forward_and_reverse_edges_match_exactly():
@@ -183,13 +184,13 @@ def test_dynamic_forward_and_reverse_edges_match_exactly():
     })
 
     index = trace.index
-    consumer_id = trace.exec_log[-1].exec_id
-    reverse_edges = index.consumer_exec_id_to_producer_input_edges[consumer_id]
+    consumer_id = trace.log[-1].exec_id
+    reverse_edges = index.producer_edges_by_exec_id[consumer_id]
 
     assert len(reverse_edges) == 3
 
     for edge in reverse_edges:
-        forward_edges = index.producer_exec_id_to_consumer_input_edges[edge.producer_exec_id]
+        forward_edges = index.consumed_edges_by_exec_id[edge.producer_exec_id]
         assert any(forward_edge is edge for forward_edge in forward_edges)
 
 
@@ -321,7 +322,7 @@ def test_dynamic_runtime_returns_exact_declared_count():
     }
 
 
-def test_dynamic_numeric_star_resolves_exactly_the_numeric_count():
+def test_dynamic_numeric_star_waits_for_minimum_and_returns_all_matches():
     tide = TIDE()
     seed_dynamic_store(tide)
     calls = []
@@ -332,7 +333,7 @@ def test_dynamic_numeric_star_resolves_exactly_the_numeric_count():
     tide.exec(consume_dynamic, reads=["global:*alpha*:2:*"])
 
     assert len(calls) == 1
-    assert calls[0] == ["!alpha", "!alpha_one"]
+    assert calls[0] == ["!alpha", "!alpha_one", "!beta_alpha"]
 
 
 def test_dynamic_runtime_default_minimum_is_one_and_max_is_unbounded():
@@ -359,10 +360,10 @@ def test_dynamic_runtime_default_minimum_is_one_and_max_is_unbounded():
         ("mem:csv:*", "csv", 1, None),
         ("mem:csv:*:*", "csv", 1, None),
         ("mem:csv*:*:*", "csv*", 1, None),
-        ("mem:csv:1:*", "csv", 1, 1),
+        ("mem:csv:1:*", "csv", 1, None),
         ("mem:csv:*:1", "csv", 1, 1),
         ("mem:csv:5", "csv", 5, 5),
-        ("mem:csv:5:*", "csv", 5, 5),
+        ("mem:csv:5:*", "csv", 5, None),
         ("mem:csv:*:5", "csv", 5, 5),
         ("mem:csv:5:3", "csv", 5, 3),
     ],
@@ -382,7 +383,7 @@ def test_dynamic_count_syntax_keeps_store_and_key_boundary(
     assert ref.dynamic is True
 
     reparsed = DataRef.from_string(
-        DataRef.to_string(ref, strip_leading=True)
+        DataRef.to_string(ref, prefix=False)
     )
     assert reparsed.store == ref.store
     assert reparsed.key == ref.key
@@ -391,31 +392,61 @@ def test_dynamic_count_syntax_keeps_store_and_key_boundary(
 
 
 @pytest.mark.parametrize(
-    ("text", "canonical"),
+    "text",
     [
-        ("mem:csv:*", "mem:csv:*"),
-        ("mem:csv:*:*", "mem:csv:*"),
-        ("mem:csv*:*:*", "mem:csv*:*"),
-        ("mem:csv*:1", "mem:csv*:1"),
-        ("mem:csv*:1:*", "mem:csv*:1"),
-        ("mem:csv*:*:1", "mem:csv*:1"),
-        ("mem:csv:5", "mem:csv:5"),
-        ("mem:csv:5:*", "mem:csv:5"),
-        ("mem:csv:*:5", "mem:csv:5"),
-        ("mem:csv:5:3", "mem:csv:5:3"),
-        ("mem:csv*", "mem:csv*"),
-        ("mem:*csv", "mem:*csv"),
-        ("mem:*csv*", "mem:*csv*"),
+        "mem:csv:*",
+        "mem:csv:*:*",
+        "mem:csv*:*:*",
+        "mem:csv*:1",
+        "mem:csv*:1:*",
+        "mem:csv*:*:1",
+        "mem:csv:5",
+        "mem:csv:5:*",
+        "mem:csv:*:5",
+        "mem:csv:5:3",
+        "mem:csv*",
+        "mem:*csv",
+        "mem:*csv*",
     ],
 )
-def test_dynamic_reference_serialisation_uses_compact_public_grammar(
-    text,
-    canonical,
-):
-    assert DataRef.to_string(
-        DataRef.from_string(text),
-        strip_leading=True,
-    ) == canonical
+def test_parsed_dynamic_reference_formats_its_resolved_fields(text):
+    ref = DataRef.from_string(text)
+    rebuilt = DataRef.from_string(DataRef.to_string(ref, prefix=False))
+    assert (rebuilt.store, rebuilt.key, rebuilt.count, rebuilt.max) == (
+        ref.store, ref.key, ref.count, ref.max
+    )
+
+
+@pytest.mark.parametrize(("text", "store", "key", "count", "rendered"), [
+    ("csv:*", "global", "csv", 1, "global:csv:1:*"),
+    ("csv:5:3", "global", "csv", 5, "global:csv:5:3"),
+    ("mem:*", "global", "mem", 1, "global:mem:1:*"),
+    ("!", "global", "!", None, "global:!"),
+    ("mem:!", "mem", "!", None, "mem:!"),
+    ("mem:*csv", "mem", "*csv", None, "mem:*csv"),
+    ("mem:csv:*", "mem", "csv", 1, "mem:csv:1:*"),
+])
+def test_key_wildcard_and_dynamic_suffix_are_distinct(text, store, key, count, rendered):
+    token = DataRef.set_default_store("global")
+    try:
+        ref = DataRef.from_string(text)
+        assert (ref.store, ref.key, ref.count) == (store, key, count)
+        assert DataRef.to_string(ref, prefix=False) == rendered
+        rebuilt = DataRef.from_string(rendered)
+        assert (rebuilt.store, rebuilt.key, rebuilt.count, rebuilt.max) == (
+            ref.store, ref.key, ref.count, ref.max
+        )
+    finally:
+        DataRef.reset_default_store(token)
+
+
+def test_direct_all_keys_reference_uses_unambiguous_spelling():
+    ref = DataRef("*", "mem")
+    assert ref.key == "!"
+    assert ref.dynamic is True
+    assert DataRef.to_string(ref, prefix=False) == "mem:!"
+    assert DependencyTools.matches("csv_a", ref.key)
+    assert DependencyTools.matches("other", ref.key)
 
 
 @pytest.mark.parametrize(
@@ -433,7 +464,7 @@ def test_dynamic_count_syntax_rejects_extra_wildcard_field(text):
 def test_dynamic_count_syntax_rejects_maximum_above_minimum():
     with pytest.raises(
         DataRefInitError,
-        match=r"MAX 10 > MIN 5",
+        match="DataRef max cannot exceed count",
     ):
         DataRef.from_string("mem:csv:5:10")
 
@@ -441,7 +472,7 @@ def test_dynamic_count_syntax_rejects_maximum_above_minimum():
 def test_direct_dynamic_reference_rejects_maximum_above_default_minimum():
     with pytest.raises(
         DataRefInitError,
-        match=r"MAX 2 > MIN 1",
+        match="DataRef max cannot exceed count",
     ):
         DataRef(key="csv*", store="mem", max=2)
 
@@ -465,12 +496,12 @@ def test_dynamic_runtime_waits_for_minimum_then_resolves_only_maximum():
 
     tide.exec(consume_dynamic, reads=["global:*alpha*:5:3"])
     trace = tide.trace()
-    dynamic_read = trace.exec_log[-1].deps[0]
+    dynamic_read = trace.log[-1].deps[0]
 
     assert len(calls) == 1
     assert calls[0] == ["!alpha-0", "!alpha-1", "!alpha-2"]
     assert len(dynamic_read.expanded_to) == 3
-    assert len(trace.concretisations["global:*alpha*:5:3"]) == 3
+    assert all(read.resolved_version == 0 for read in dynamic_read.expanded_to)
 
 
 def test_dynamic_star_star_resolves_and_concretises_every_found_match():
@@ -491,7 +522,7 @@ def test_dynamic_star_star_resolves_and_concretises_every_found_match():
 
     tide.exec(consume_dynamic, reads=["global:*alpha*:*:*"])
     trace = tide.trace()
-    dynamic_read = trace.exec_log[-1].deps[0]
+    dynamic_read = trace.log[-1].deps[0]
 
     assert calls == [[
         "!alpha-0",
@@ -500,23 +531,23 @@ def test_dynamic_star_star_resolves_and_concretises_every_found_match():
         "!alpha-3",
     ]]
     assert len(dynamic_read.expanded_to) == 4
-    assert trace.concretisations["global:*alpha*:*"] == (
-        ("global:@alpha_0", 0),
-        ("global:@alpha_1", 0),
-        ("global:@alpha_2", 0),
-        ("global:@alpha_3", 0),
+    assert tuple(read.unscoped_reference for read in dynamic_read.expanded_to) == (
+        "global:@alpha_0",
+        "global:@alpha_1",
+        "global:@alpha_2",
+        "global:@alpha_3",
     )
 
 
 @pytest.mark.parametrize(
-    "selector",
+    ("selector", "selected"),
     [
-        "global:*alpha*:1",
-        "global:*alpha*:1:*",
-        "global:*alpha*:*:1",
+        ("global:*alpha*:1", 1),
+        ("global:*alpha*:1:*", 3),
+        ("global:*alpha*:*:1", 1),
     ],
 )
-def test_dynamic_exact_one_forms_resolve_only_one(selector):
+def test_dynamic_selection_obeys_explicit_max(selector, selected):
     tide = TIDE()
     seed_dynamic_store(tide)
     calls = []
@@ -527,9 +558,8 @@ def test_dynamic_exact_one_forms_resolve_only_one(selector):
     tide.exec(consume_dynamic, reads=[selector])
     trace = tide.trace()
 
-    assert calls == [["!alpha"]]
-    assert len(trace.exec_log[-1].deps[0].expanded_to) == 1
-    assert len(trace.concretisations["global:*alpha*:1"]) == 1
+    assert calls == [["!alpha", "!alpha_one", "!beta_alpha"][:selected]]
+    assert len(trace.log[-1].deps[0].expanded_to) == selected
 
 
 @pytest.mark.parametrize("key", ["csv*", "*csv", "*csv*"])
@@ -547,7 +577,7 @@ def test_dynamic_default_minimum_reference_resolves_exact_key():
     ocean = Ocean()
     calls = []
 
-    @node(targets=DataRef.literal("csv", "mem"))
+    @node(targets=DataRef("csv", "mem", literal=True))
     def write_one():
         return "one"
 
@@ -605,9 +635,9 @@ def test_dynamic_ref_deleted_after_concretisation_before_resolution_does_not_exe
     def intercept_event(event):
         original_emit_event_to_ocean(event)
 
-        if event.event_type == LogEvents.DEP_CONCRETISED and not deleted.is_set():
+        if event.type == LogEvents.DEP_CONCRETISED and not deleted.is_set():
             deleted.set()
-            tide.ocean.store_registry.get("global").delete("@alpha_one")
+            tide.ocean.store_registry.get("global").pop("@alpha_one")
 
     monkeypatch.setattr(
         tide.ocean.event_interface,
@@ -678,19 +708,13 @@ def wait_until(
 
 def emit_store_write(tide, key, value):
     tide.ocean.event_interface.emit_event_to_ocean(
-        Event(
+        Event(ocean_id=tide.ocean.id,
             source="tests",
             source_id="tests",
             target_runner_id=None,
-            event_type=RouterEvents.STORE_WRITE,
-            payload=(
-                "global",
-                key,
-                value,
-                "tests",
-                "dynamic ref runtime test",
-                tide_snapshot_value(value, boundary="write")
-            ),
+            type=RouterEvents.STORE_WRITE,
+            cause=Cause(description="dynamic ref runtime test"),
+            payload=State(DataRef(key, "global"), value, tide_snapshot_value(value, boundary="write")),
         )
     )
 
@@ -714,7 +738,7 @@ def start_waiting_dynamic_consumer(
     def intercept_start_runner(runner_id, stay_alive=True):
         original_start_runner(
             runner_id,
-            stay_alive=stay_alive,
+            stay_alive=True,
         )
 
         runner = tide.ocean._get_runner(runner_id)
@@ -781,7 +805,7 @@ def start_waiting_dynamic_consumer(
 
     dynamic_dep = dynamic_deps[0]
 
-    assert runner.stay_alive is False
+    assert runner.stay_alive is True
     assert node.dynamic_to_static_deps[dynamic_dep] == []
 
     return (
@@ -818,7 +842,7 @@ def test_dynamic_runtime_live_writes_execute_only_after_minimum(monkeypatch):
     global_store = tide.ocean.store_registry.get("global")
 
     wait_until(
-        lambda: "@beta" in global_store.store,
+        lambda: global_store.exists("@beta"),
         message="non-matching write was not processed",
     )
 
@@ -891,7 +915,7 @@ def test_dynamic_runtime_duplicate_live_key_does_not_increase_match_count(monkey
     global_store = tide.ocean.store_registry.get("global")
 
     wait_until(
-        lambda: global_store.store.get("@alpha") == "!alpha-v2",
+        lambda: global_store.get("@alpha") == "!alpha-v2",
         message="updated store value was not processed",
     )
 
@@ -943,10 +967,11 @@ def test_dynamic_runtime_trace_builds_exact_expanded_records_and_edges():
     assert len(calls) == 1
 
     trace = tide.trace()
+    index = trace.index
 
     consumer = next(
         record
-        for record in trace.exec_log
+        for record in trace.log
         if record.func_name == "consume_dynamic"
     )
 
@@ -972,7 +997,7 @@ def test_dynamic_runtime_trace_builds_exact_expanded_records_and_edges():
         assert expanded.resolved_version == 0
         assert expanded.producer_exec_id is not None
 
-        producer = trace.index.exec_by_exec_id[expanded.producer_exec_id]
+        producer = index.exec_by_exec_id[expanded.producer_exec_id]
 
         assert any(
             write.stored_target == expanded.unscoped_reference
@@ -982,19 +1007,19 @@ def test_dynamic_runtime_trace_builds_exact_expanded_records_and_edges():
 
     consumer_id = consumer.exec_id
 
-    reverse_edges = trace.index.consumer_exec_id_to_producer_input_edges[consumer_id]
+    reverse_edges = index.producer_edges_by_exec_id[consumer_id]
 
     assert len(reverse_edges) == 2
     assert {
-        edge.produced_ref
+        edge.read.unscoped_reference
         for edge in reverse_edges
     } == expanded_refs
 
     for edge in reverse_edges:
         assert edge.consumer_exec_id == consumer_id
-        assert edge.produced_ver == 0
+        assert edge.read.resolved_version == 0
 
-        forward_edges = trace.index.producer_exec_id_to_consumer_input_edges[
+        forward_edges = index.consumed_edges_by_exec_id[
             edge.producer_exec_id
         ]
 
@@ -1003,8 +1028,8 @@ def test_dynamic_runtime_trace_builds_exact_expanded_records_and_edges():
             for forward_edge in forward_edges
         )
 
-        assert consumer_id in trace.index.ref_version_to_consumer_exec_ids[
-            (edge.produced_ref, edge.produced_ver)
+        assert consumer_id in index.consumer_exec_ids_by_ref_version[
+            (edge.read.unscoped_reference, edge.read.resolved_version)
         ]
 
 
@@ -1015,7 +1040,7 @@ def test_to_model_exports_every_dynamic_expansion_and_round_trips_them():
     ])
 
     model = trace.to_model(
-        include_hashes=False,
+        enrich=False,
         incidence_format="compact",
     )
 
@@ -1023,10 +1048,10 @@ def test_to_model_exports_every_dynamic_expansion_and_round_trips_them():
         edge["e"]: edge["s"]
         for edge in model["O"]
     }
-    consumer_exec_id = trace.exec_log[-1].exec_id
+    consumer_exec_id = trace.log[-1].exec_id
     expected_inputs = {
-        (consumer_exec_id, output_state_by_exec[trace.exec_log[0].exec_id]),
-        (consumer_exec_id, output_state_by_exec[trace.exec_log[1].exec_id]),
+        (consumer_exec_id, output_state_by_exec[trace.log[0].exec_id]),
+        (consumer_exec_id, output_state_by_exec[trace.log[1].exec_id]),
     }
 
     assert {
@@ -1037,7 +1062,7 @@ def test_to_model_exports_every_dynamic_expansion_and_round_trips_them():
     restored = TIDE.from_model(model)
     restored_consumer = next(
         record
-        for record in restored.exec_log
+        for record in restored.log
         if record.exec_id == consumer_exec_id
     )
 
@@ -1081,7 +1106,7 @@ def dynamic_runtime_expanded_trace():
 def dynamic_runtime_consumer(trace):
     return next(
         record
-        for record in trace.exec_log
+        for record in trace.log
         if record.func_name == "consume_dynamic"
     )
 
@@ -1175,7 +1200,7 @@ def test_dynamic_runtime_expanded_records_are_indexed_as_exact_consumed_versions
     consumer = dynamic_runtime_consumer(trace)
 
     for expanded in dynamic_runtime_expanded_records(trace):
-        consumers = trace.index.ref_version_to_consumer_exec_ids[
+        consumers = trace.index.consumer_exec_ids_by_ref_version[
             (
                 expanded.unscoped_reference,
                 expanded.resolved_version,
@@ -1189,14 +1214,14 @@ def test_dynamic_runtime_expanded_records_match_reverse_edges(dynamic_runtime_ex
     trace = dynamic_runtime_expanded_trace
     consumer = dynamic_runtime_consumer(trace)
 
-    reverse_edges = trace.index.consumer_exec_id_to_producer_input_edges[
+    reverse_edges = trace.index.producer_edges_by_exec_id[
         consumer.exec_id
     ]
 
     assert {
         (
-            edge.produced_ref,
-            edge.produced_ver,
+            edge.read.unscoped_reference,
+            edge.read.resolved_version,
         )
         for edge in reverse_edges
     } == {

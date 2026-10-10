@@ -1,68 +1,79 @@
 import io
 import sys
-from types import SimpleNamespace
 import types
 from contextlib import redirect_stdout
+
+import pytest
 
 from tide_tooling.tooling_core.bundling import TIDEBundle
 from tide_tooling.tooling_core.bundling.TIDEBundler import TIDEBundler
 from tide_tooling.tooling_core.bundling.TIDEOpaqueValue import TIDEOpaqueValue
+from tide_tooling.tooling_core.engine.events import Cause
+from tide_tooling.tooling_core.engine.tide_logging import (
+    DependencyUseRecord,
+    ExecRecord,
+    InputUseRecord,
+    Inputs,
+    Trace,
+    WriteRecord,
+)
 from tide_tooling.tooling_core.engine.utils import tide_value_hasher
 
 
 def make_trace(values, ref_versions, exec_log):
-    return SimpleNamespace(
+    trace = Trace(
         name="TIDE: .trace()",
         ocean_id="ocean",
-        run="run_1",
-        pipeline="TIDE: UNKNOWN",
-        index=SimpleNamespace(
-            value_by_hash=values,
-            value_hash_by_ref_version=ref_versions,
-        ),
-        exec_log=exec_log,
+        log=exec_log,
     )
+    # Synthetic fixture evidence: public Trace indexes are deliberately sealed.
+    object.__setattr__(trace._index, "value_by_hash", dict(values))
+    object.__setattr__(
+        trace._index,
+        "value_hash_by_ref_version",
+        dict(ref_versions),
+    )
+    return trace
 
 
 def unsupported_value():
     return "not portable"
 
 
-def make_actor(name):
-    return SimpleNamespace(
-        source_ocean="ocean",
-        source_runner="run_1",
-        source_actor=name,
-    )
-
-
 def make_exec_record(seq_id, exec_id, name, deps=(), writes=()):
-    return SimpleNamespace(
+    return ExecRecord(
         seq_id=seq_id,
         exec_id=exec_id,
-        source_ocean_id="ocean",
+        ocean_id="ocean",
         runner_id="run_1",
         pipeline_id="pipeline_1",
         node_id=name,
+        func=None,
         func_name=name,
+        inputs=Inputs({}),
+        deps=list(deps),
+        effects=[],
+        declared_effects=[],
+        declared_targets=[],
+        runtime_effects=[],
+        runtime_targets=[],
+        declared_deps=[],
+        unscoped_store_refs=[],
         content_id=b"content",
         status="succeeded",
         started_at=1,
         finished_at=2,
         duration_ms=1,
         error=None,
-        node_options={"resolve_output": False},
-        deps=list(deps),
+        node_options={"preserve_exec_id": True},
         writes=list(writes),
-        effects=[],
         emitted_nodes=[],
-        producer_id=make_actor(name),
     )
 
 
 def make_write(target, version, value, cause):
-    return SimpleNamespace(
-        cause=cause,
+    return WriteRecord(
+        cause=Cause(description=cause),
         stored_result=value,
         stored_version=version,
         stored_target=target,
@@ -70,17 +81,28 @@ def make_write(target, version, value, cause):
 
 
 def make_read(reference, version, value, producer):
-    return SimpleNamespace(
+    input_record = InputUseRecord(
+        "args",
+        None,
+        None,
+        None,
+        None,
+        [],
+    )
+    dependency = DependencyUseRecord(
+        associated_input=("args", input_record),
+        dep=None,
         type="static",
-        unscoped_reference=reference,
-        resolved_version=version,
-        resolved_value=value,
+        unscoped_ref=reference,
+        resolved_ver=version,
+        resolved_val=value,
         producer_source="run_1",
         producer_actor=producer.producer_id,
         producer_exec_id=producer.exec_id,
-        associated_input=("args", SimpleNamespace()),
         input_index=0,
     )
+    input_record.dependencies.append(dependency)
+    return dependency
 
 
 def restored_trace():
@@ -128,24 +150,24 @@ def restored_trace():
 def test_trace_from_bundle_preserves_execs_refs_values_and_provenance():
     trace = restored_trace()
 
-    assert [record.func_name for record in trace.exec_log] == ["A", "B", "C"]
+    assert {record.func_name for record in trace.log} == {"A", "B", "C"}
     assert len(trace.reads) == 1
     assert len(trace.writes) == 3
-    assert [(write.stored_target, write.stored_version) for write in trace.writes] == [
+    assert {(write.stored_target, write.stored_version) for write in trace.writes} == {
         ("global:@seed", 0),
         ("global:@result", 0),
         ("global:@seed", 1),
-    ]
+    }
 
     read = trace.reads[0]
     assert read.unscoped_reference == "global:@seed"
     assert read.resolved_version == 0
     assert read.producer_exec_id == "TIDE_EXEC:writer"
     assert read.resolved_value == {"seed": [b"tide", 0]}
-    assert trace.index.ref_version_to_producer_exec_id[
+    assert list(trace.index.producer_exec_ids_by_ref_version[
         ("global:@result", 0)
-    ] == "TIDE_EXEC:consumer"
-    assert "TIDE_EXEC:consumer" in trace.index.ref_version_to_consumer_exec_ids[
+    ]) == ["TIDE_EXEC:consumer"]
+    assert "TIDE_EXEC:consumer" in trace.index.consumer_exec_ids_by_ref_version[
         ("global:@seed", 0)
     ]
 
@@ -156,7 +178,7 @@ def test_trace_from_bundle_keeps_the_trace_query_surface_inspectable():
 
     inspected_value = trace.inspect(seed_hash, "hash")
     inspected_ref = trace.inspect("global:@seed", "reference", version=0)
-    shown = trace.show()
+    shown = trace.show(color=False)
 
     assert inspected_value.object.object == {"seed": [b"tide", 0]}
     assert inspected_ref.object.version == 0
@@ -166,7 +188,7 @@ def test_trace_from_bundle_keeps_the_trace_query_surface_inspectable():
         {"seed": [b"tide", 0]},
         {"seed": [b"tide", 1]},
     ]
-    assert "3 executions found | 3 writes | 1 read" in shown
+    assert "3 executions shown | 3 writes | 1 read" in shown
 
 
 def test_value_of_can_show_single_and_versioned_values_without_wrapping_them():
@@ -191,64 +213,6 @@ def test_value_of_can_show_single_and_versioned_values_without_wrapping_them():
     assert "VERSIONS" in versions_output.getvalue()
     assert "[v0]" in versions_output.getvalue()
     assert "[v1]" in versions_output.getvalue()
-
-
-def test_bundle_rekeys_a_pre_upgrade_trace_index_from_serialised_values():
-    value = {"value": [b"tide"]}
-    complete = TIDEBundler().bundle_trace(
-        make_trace(
-            {"sha3_512_tide:legacy": value},
-            {("global:@A", 0): "sha3_512_tide:legacy"},
-            [],
-        )
-    )
-    value_hash = tide_value_hasher(value)
-
-    assert complete["manifest"]["value_hash_codec"] == (
-        "tide_serialised_bytes_v1"
-    )
-    assert complete["manifest"]["ref_index"]["global:@A"]["versions"]["0"][
-        "value_hash"
-    ] == value_hash
-    assert complete["manifest"]["values"][value_hash]["root_cas_ref"] in complete[
-        "cas"
-    ]
-
-
-def test_load_trace_bundle_migrates_legacy_repr_value_hashes():
-    value = {"value": [b"tide"]}
-    complete = TIDEBundler().bundle_trace(
-        make_trace(
-            {tide_value_hasher(value): value},
-            {("global:@A", 0): tide_value_hasher(value)},
-            [],
-        )
-    )
-    manifest = complete["manifest"]
-    value_hash = tide_value_hasher(value)
-    legacy_hash = "sha3_512_tide:legacy"
-    manifest["values"][legacy_hash] = manifest["values"].pop(value_hash)
-    manifest["value_index"][legacy_hash] = manifest["value_index"].pop(
-        value_hash
-    )
-    manifest["cas_index"] = {
-        cas_ref: [legacy_hash if item == value_hash else item for item in items]
-        for cas_ref, items in manifest["cas_index"].items()
-    }
-    manifest["ref_index"]["global:@A"]["versions"]["0"][
-        "value_hash"
-    ] = legacy_hash
-    manifest.pop("value_hash_codec")
-
-    loaded = TIDEBundler().load_trace_bundle(complete)
-
-    assert loaded["manifest"]["value_hash_codec"] == (
-        "tide_serialised_bytes_v1"
-    )
-    assert loaded["ref_index"]["global:@A"]["versions"]["0"][
-        "value_hash"
-    ] == value_hash
-    assert loaded["values"] == {value_hash: value}
 
 
 def test_trace_from_bundle_restores_and_displays_opaque_values():
@@ -277,16 +241,18 @@ def test_trace_from_bundle_restores_and_displays_opaque_values():
     bundle = TIDEBundle.from_dict(TIDEBundle.from_trace(source).to_dict())
     value = bundle.value_at("global:@opaque", 0)
     trace = bundle.trace()
-    shown = trace.show()
+    shown = trace.show(color=False)
+    shown_with_values = trace.show(values=True, color=False)
 
     assert isinstance(value, TIDEOpaqueValue)
     assert value.value_hash == value_hash
     assert value.type_name == "function"
     assert trace.from_cas is True
-    assert trace.bundle_context["value_count"] == 1
-    assert trace.bundle_context["opaque_value_hashes"] == [value_hash]
-    assert trace.writes[0].stored_result is value
-    assert "opaque<function>[sha3_512_tide:" in shown
+    assert "codec_version" not in trace.bundle_context
+    assert trace.writes[0].stored_result is not value
+    assert trace.writes[0].stored_result.value_hash == value.value_hash
+    assert "wrote: function as global:@opaque[v0]" in shown
+    assert "function opaque<function>[sha3_512_tide:" in shown_with_values
 
 
 def test_trace_bundle_preserves_multiple_exec_source_names():
@@ -304,13 +270,16 @@ def test_trace_bundle_preserves_multiple_exec_source_names():
 
     rebuilt = TIDE.from_bundle(tide.trace().to_bundle())
 
-    assert rebuilt.run == "MULTIPLE (2)"
-    assert rebuilt.pipeline == "MULTIPLE (2)"
+    assert rebuilt.runs == (0, 1)
+    assert rebuilt._sources() == (
+        (0, 0),
+        (1, 1),
+    )
     assert [
-        source["pipeline"] for source in rebuilt.execution_sources
+            pipeline for pipeline in rebuilt.pipelines.values()
     ] == [
-        "TIDE: .exec(first[0])",
-        "TIDE: .exec(second[1])",
+        "TIDE: .run_node(first)",
+        "TIDE: .run_node(second)",
     ]
 
 
@@ -330,26 +299,29 @@ def test_nested_node_bundle_restores_runtime_scoped_references():
     source = tide.trace()
     rebuilt = TIDE.from_bundle(source.to_bundle())
 
-    assert [record.func_name for record in rebuilt.exec_log] == [
+    assert [record.func_name for record in rebuilt.log] == [
         "create_data",
         "process_data",
     ]
-    assert rebuilt.exec_log[1].deps[0].dep.store == "__tide___TIDE: .exec(0)"
-    assert rebuilt.exec_log[1].deps[0].dep.key == (
-        "@tmp_node_link.create_data"
+    assert rebuilt.log[1].deps[0].dep.store == "__tide__"
+    assert rebuilt.log[1].deps[0].unscoped_reference.startswith(
+        "__tide___0:"
     )
-    assert rebuilt.value_of("mem_TIDE: .exec(0):result", 0) == 2
+    expected_key = source.log[1].deps[0].dep.key
+    assert rebuilt.log[1].deps[0].dep.key == expected_key
+    assert rebuilt.value_of("mem_0:result", 0) == 2
 
 
 def test_effect_evidence_survives_json_bundle_round_trip(capsys):
-    from tide_tooling import DELETE, READ, Effects, TIDE, WRITE, node
+    from tide_tooling import DELETE, READ, READ_EFFECT, Effects, TIDE, WRITE, node
+    from tide_tooling.tooling_core.engine.classes import __fallback__
 
     prepared_value = {"status": "prepared", "count": 3}
     audit_value = {"event": "prepare", "accepted": True}
 
     @node(effects=[
-        WRITE("global:prepared", preserve_output=prepared_value),
-        WRITE("global:audit", preserve_output=audit_value),
+        WRITE("global:prepared", prepared_value),
+        WRITE("global:audit", audit_value),
     ])
     def prepare(source):
         return {"received": source}
@@ -373,11 +345,11 @@ def test_effect_evidence_survives_json_bundle_round_trip(capsys):
     assert rebuilt_write["history"] == source_write["history"]
 
     prepare_record = next(
-        record for record in rebuilt.exec_log
+        record for record in rebuilt.execs.values()
         if record.func_name == "prepare"
     )
     consume_record = next(
-        record for record in rebuilt.exec_log
+        record for record in rebuilt.execs.values()
         if record.func_name == "consume"
     )
 
@@ -385,16 +357,17 @@ def test_effect_evidence_survives_json_bundle_round_trip(capsys):
         "WRITE",
         "WRITE",
     ]
-    assert prepare_record.declared_effects[0].preserve_output == prepared_value
-    assert consume_record.runtime_effects[0]["effect"] == Effects.READ
-    assert consume_record.runtime_effects[0]["value"] == prepared_value
+    assert isinstance(prepare_record.declared_effects[0].output, __fallback__)
+    assert isinstance(consume_record.runtime_effects[0], READ_EFFECT)
+    runtime_read = next(effect for effect in consume_record.effects if effect.effect == Effects.READ)
+    assert runtime_read.output == prepared_value
 
     prepared_effect = rebuilt.inspect(
         (Effects.WRITE, ("global:prepared", 0)),
         "effect",
     )
     effect_record = prepared_effect.object.effects[0]
-    assert effect_record.output == prepared_value
+    assert isinstance(effect_record.output, __fallback__)
 
     path = rebuilt.path(
         (Effects.WRITE, ("global:prepared", 0)),
@@ -404,7 +377,7 @@ def test_effect_evidence_survives_json_bundle_round_trip(capsys):
     )
     assert path.exists()
     path.show(color=False)
-    assert "affected by WRITE effect" in capsys.readouterr().out
+    assert "WRITE at global:prepared[v0]" in capsys.readouterr().out
 
     compared = rebuilt.diff(
         (Effects.WRITE, ("global:prepared", 0)),
@@ -413,9 +386,51 @@ def test_effect_evidence_survives_json_bundle_round_trip(capsys):
     assert not compared.same
 
 
+def test_declared_write_value_uses_cas_and_preserves_cycles_and_aliases():
+    from tide_tooling import TIDE, WRITE, node
+
+    value = []
+    value.append(value)
+
+    @node(effects=WRITE("global:cycle", value))
+    def write_cycle():
+        return "done"
+
+    tide = TIDE()
+    tide.exec(write_cycle)
+    bundle = tide.trace().to_bundle()
+
+    rebuilt_record = TIDE.from_bundle(bundle).log[0]
+    rebuilt_declared = rebuilt_record.declared_effects[0].targets[0][1]
+    rebuilt_written = rebuilt_record.writes[0].stored_result
+
+    assert rebuilt_declared[0] is rebuilt_declared
+    assert rebuilt_written[0] is rebuilt_written
+    assert tide_value_hasher(rebuilt_declared) == tide_value_hasher(rebuilt_written)
+
+
+def test_runtime_read_fallback_uses_cas_and_preserves_cycles():
+    from tide_tooling import READ, TIDE
+
+    fallback = []
+    fallback.append(fallback)
+
+    def read_missing():
+        READ("global:missing", fallback=fallback)
+        return "done"
+
+    tide = TIDE()
+    tide.exec(read_missing)
+    rebuilt = TIDE.from_bundle(tide.trace().to_bundle())
+    execution = next(iter(rebuilt.execs.values()))
+    rebuilt_fallback = execution.runtime_effects[0].fallback
+
+    assert rebuilt_fallback[0] is rebuilt_fallback
+
+
 def test_deleted_reference_read_remains_effect_evidence_without_fake_dependency():
     from tide_tooling import DELETE, READ, Effects, TIDE
-    from tide_tooling.tooling_core.engine.classes import __TIDE_TEMPLATE_VALUE__
+    from tide_tooling.tooling_core.engine.classes import __fallback__
 
     tide = TIDE()
     tide.declare("temporary", {"available": True})
@@ -426,41 +441,44 @@ def test_deleted_reference_read_remains_effect_evidence_without_fake_dependency(
 
     result = tide.exec(read_deleted, writes="fallback")
     source = tide.trace()
-    read_record = source.exec_log[-1]
+    read_record = source.log[-1]
 
-    assert isinstance(result, __TIDE_TEMPLATE_VALUE__)
+    assert isinstance(result, __fallback__)
     assert not any(
         dependency.associated_input[0] == "runtime_read"
         for dependency in read_record.deps
     )
-    assert read_record.runtime_effects[0]["found"] is False
+    assert read_record.runtime_effects[0].kind == Effects.READ
+    runtime_read = next(effect for effect in read_record.effects if effect.effect == Effects.READ)
+    assert runtime_read.target_existed is False
     source_delete = source.investigate(Effects.DELETE, "effect").to_dict()
     assert source_delete["summary"]["effect_count"] == 1
-    assert source_delete["summary"]["affected_execution_count"] == 1
+    assert source_delete["summary"]["affected_execution_count"] == 0
     assert source.investigate(Effects.READ, "effect").to_dict()[
         "summary"
     ]["effect_count"] == 1
 
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
-    rebuilt_read = rebuilt.exec_log[-1]
+    rebuilt_read = rebuilt.log[-1]
     rebuilt_effect = rebuilt_read.effects[0]
 
-    assert rebuilt_read.runtime_effects[0]["found"] is False
+    assert rebuilt_read.runtime_effects[0].kind == Effects.READ
+    assert rebuilt_effect.target_existed is False
     assert not rebuilt_read.deps
     assert len(rebuilt_read.writes) == 1
     assert isinstance(
         rebuilt_read.writes[0].stored_result,
-        __TIDE_TEMPLATE_VALUE__,
+        __fallback__,
     )
     assert rebuilt_effect.effect == Effects.READ
-    assert isinstance(rebuilt_effect.output, __TIDE_TEMPLATE_VALUE__)
+    assert isinstance(rebuilt_effect.output, __fallback__)
     assert rebuilt.investigate(Effects.DELETE, "effect").to_dict()[
         "summary"
     ]["effect_count"] == 1
     assert rebuilt.investigate(Effects.DELETE, "effect").to_dict()[
         "summary"
-    ]["affected_execution_count"] == 1
-    assert rebuilt.path(
+    ]["affected_execution_count"] == 0
+    assert not rebuilt.path(
         (Effects.DELETE, ("global:temporary", 0)),
         rebuilt_read.exec_id,
         "effect",
@@ -478,8 +496,8 @@ def test_trace_show_colours_effect_references_by_availability_and_usage():
     from tide_tooling import DELETE, READ, Effects, TIDE, WRITE, node
 
     @node(effects=[
-        WRITE("global:prepared", preserve_output={"status": "prepared"}),
-        WRITE("global:audit", preserve_output={"status": "live"}),
+        WRITE("global:prepared", {"status": "prepared"}),
+        WRITE("global:audit", {"status": "live"}),
         DELETE("global:prepared"),
     ])
     def prepare():
@@ -495,6 +513,7 @@ def test_trace_show_colours_effect_references_by_availability_and_usage():
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
 
     red_prepared = "\x1b[31mglobal:prepared[v0]\x1b[0m"
+    red_missing_prepared = "\x1b[31mglobal:prepared\x1b[0m"
     green_prepared = "\x1b[32mglobal:prepared[v0]\x1b[0m"
     red_audit = "\x1b[31mglobal:audit[v0]\x1b[0m"
     green_audit = "\x1b[32mglobal:audit[v0]\x1b[0m"
@@ -503,7 +522,8 @@ def test_trace_show_colours_effect_references_by_availability_and_usage():
         shown = trace.show(color=True)
 
         # prepared: write line, WRITE effect, DELETE effect, failed READ.
-        assert shown.count(red_prepared) == 4
+        assert shown.count(red_prepared) == 3
+        assert shown.count(red_missing_prepared) == 1
         assert green_prepared not in shown
 
         # audit: write line and WRITE effect; available but unused is red.
@@ -520,7 +540,7 @@ def test_trace_show_colours_effect_references_by_availability_and_usage():
         ).show(color=True)
         consumer = next(
             record
-            for record in trace.exec_log
+            for record in trace.execs.values()
             if record.func_name == "consume_deleted"
         )
         delete_path = trace.path(
@@ -533,4 +553,4 @@ def test_trace_show_colours_effect_references_by_availability_and_usage():
         assert red_prepared in write_evidence
         assert red_audit in write_evidence
         assert red_prepared in delete_evidence
-        assert red_prepared in delete_path
+        assert "No paths found" in delete_path

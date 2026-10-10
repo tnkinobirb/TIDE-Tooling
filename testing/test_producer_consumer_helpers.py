@@ -159,7 +159,7 @@ def test_consumed_by_reference_returns_actors_that_read_ref_version(producer_con
 
     assert actor_set(consumed) == {
         Actor(producer_consumer_trace.ocean_id, "TIDE: .event()", "B"),
-        Actor(producer_consumer_trace.ocean_id, "TIDE: .exec(0)", "C"),
+        Actor(producer_consumer_trace.ocean_id, 0, "C"),
     }
 
 
@@ -170,7 +170,7 @@ def test_reference_with_single_producer_and_single_consumer_stays_directional(pr
     consumed = producer_consumer_trace.consumed_by(c_ref)
 
     assert actor_set(produced) == {
-        Actor(producer_consumer_trace.ocean_id, "TIDE: .exec(0)", "C")
+        Actor(producer_consumer_trace.ocean_id, 0, "C")
     }
     assert actor_set(consumed) == {
         Actor(producer_consumer_trace.ocean_id, "TIDE: .event()", "D")
@@ -221,6 +221,42 @@ def test_produced_by_reference_version_one_does_not_return_version_zero_producer
     assert actor_set(produced_v1) == {
         Actor(trace.ocean_id, "TIDE: .event()", "A1")
     }
+
+
+def test_exact_unversioned_reference_uses_every_state_occurrence():
+    tide = TIDE()
+
+    tide.event("A0", writes={"@A": "A-v0"})
+    tide.event("UseA0", reads={"@A": "A-v0"})
+    tide.event("A1", writes={"@A": "A-v1"})
+    tide.event("UseA1", reads={"@A": "A-v1"})
+
+    trace = tide.trace()
+    exact = trace.inspect("global:@A", "reference")
+
+    assert trace.produced_by(exact).refs == [
+        ("global:@A", 0),
+        ("global:@A", 1),
+    ]
+    assert trace.consumed_by(exact).refs == [
+        ("global:@A", 0),
+        ("global:@A", 1),
+    ]
+
+
+def test_exact_versioned_reference_uses_only_selected_state_occurrence():
+    tide = TIDE()
+
+    tide.event("A0", writes={"@A": "A-v0"})
+    tide.event("UseA0", reads={"@A": "A-v0"})
+    tide.event("A1", writes={"@A": "A-v1"})
+    tide.event("UseA1", reads={"@A": "A-v1"})
+
+    trace = tide.trace()
+    exact = trace.inspect("global:@A", "reference", version=1)
+
+    assert trace.produced_by(exact).refs == [("global:@A", 1)]
+    assert trace.consumed_by(exact).refs == [("global:@A", 1)]
 
 
 def test_produced_by_value_preserves_multiple_producer_refs():

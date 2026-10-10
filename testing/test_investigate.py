@@ -7,7 +7,7 @@ import pytest
 
 from tide_tooling import TIDE
 from tide_tooling.core import Actor, tide_value_hasher
-from tide_tooling.tooling_core.engine.events import Effects
+from tide_tooling.tooling_core.engine.events import Cause, Effects
 from tide_tooling.tooling_core.engine.tide_logging import (
     DependencyUseRecord,
     EffectRecord,
@@ -79,7 +79,7 @@ def effect_trace():
     writer = make_effect_exec(
         0,
         "Writer",
-        writes=[WriteRecord("test", "!A", 0, "global:@A")],
+        writes=[WriteRecord(Cause(description="test"), "!A", 0, "global:@A")],
     )
 
     input_use = InputUseRecord(
@@ -112,7 +112,9 @@ def effect_trace():
     effect = EffectRecord(
         Effects.WRITE,
         ("global:@A", 0),
+        event_id="test-effect",
         origin="declared",
+        immediate=False,
         output="!A",
     )
     effect_producer = make_effect_exec(
@@ -122,8 +124,7 @@ def effect_trace():
     )
 
     return Trace(
-        event_log=None,
-        exec_log=[writer, consumer, effect_producer],
+        log=[writer, consumer, effect_producer],
         runner="tests",
         ocean_id=0,
     )
@@ -287,7 +288,7 @@ def test_investigate_grouped_actor_to_dict(trace):
         for appearance in data["appearances"]
     ] == [
         f"Actor({trace.ocean_id}, 'TIDE: .event()', 'B')",
-        f"Actor({trace.ocean_id}, 'TIDE: .exec(0)', 'B')",
+        f"Actor({trace.ocean_id}, 0, 'B')",
     ]
 
     assert [
@@ -310,10 +311,10 @@ def test_investigate_reference_version_to_dict(trace):
     assert data["object"]["grouped"] is False
 
     assert data["summary"] == {
-        "version_count": 2,
-        "used_version_count": 2,
-        "unused_version_count": 0,
-        "all_consumed": True,
+        "version_count": 4,
+        "used_version_count": 3,
+        "unused_version_count": 1,
+        "all_consumed": False,
         "none_consumed": False,
         "read_count": 1,
         "write_count": 1,
@@ -325,6 +326,8 @@ def test_investigate_reference_version_to_dict(trace):
     ] == [
         "global:@B[v0]",
         "global:@B[v1]",
+        "global:@B[v2]",
+        "global:@B[v3]",
     ]
 
     assert_version_entry(
@@ -390,16 +393,19 @@ def test_investigate_grouped_reference_version_to_dict(trace):
     assert data["object"]["grouped"] is True
     assert data["object"]["version"] == 0
 
-    assert data["summary"]["version_count"] == 2
-    assert data["summary"]["used_version_count"] == 2
-    assert data["summary"]["unused_version_count"] == 0
-    assert data["summary"]["all_consumed"] is True
+    assert data["summary"]["version_count"] == 5
+    assert data["summary"]["used_version_count"] == 4
+    assert data["summary"]["unused_version_count"] == 1
+    assert data["summary"]["all_consumed"] is False
 
     assert [
         entry["id"]
         for entry in data["history"]
     ] == [
         "global:@B[v0]",
+        "global:@B[v1]",
+        "global:@B[v2]",
+        "global:@B[v3]",
         "testing:@B[v0]",
     ]
 
@@ -616,9 +622,9 @@ def test_investigate_show_with_input_positions(trace):
         )
     )
 
-    assert "global:@C[v1] via args[0] from EXEC_RECORD[5] X" in exec_output
-    assert "testing:@B[v0] via args[1] from EXEC_RECORD[1] B" in exec_output
-    assert "testing:@B[v0] via args[2] from EXEC_RECORD[1] B" in exec_output
+    assert "global:@C[v1] as str via args[0] from EXEC_RECORD[5] X" in exec_output
+    assert "testing:@B[v0] as str via args[1] from EXEC_RECORD[1] B" in exec_output
+    assert "testing:@B[v0] as str via args[2] from EXEC_RECORD[1] B" in exec_output
 
     actor_output = strip_ansi(
         trace.investigate(
@@ -630,9 +636,9 @@ def test_investigate_show_with_input_positions(trace):
         )
     )
 
-    assert "consumed by EXEC_RECORD[6] X via args[1, 2]" in actor_output
+    assert "consumed by EXEC_RECORD[6] X as str via args[1, 2]" in actor_output
     assert actor_output.count(
-        "consumed by EXEC_RECORD[6] X via args[1, 2]"
+        "consumed by EXEC_RECORD[6] X as str via args[1, 2]"
     ) == 1
 
 
@@ -648,7 +654,7 @@ def test_investigate_show_without_input_positions_keeps_read_occurrences(trace):
 
     assert "via args" not in exec_output
     assert exec_output.count(
-        "testing:@B[v0] from EXEC_RECORD[1] B"
+        "testing:@B[v0] as str from EXEC_RECORD[1] B"
     ) == 2
 
     actor_output = strip_ansi(

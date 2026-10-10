@@ -130,11 +130,7 @@ def test_grouped_actor_path_show_uses_kind_and_grouped_identity(
     source = ref(grouped_actor_trace, "global:@A", version=0)
     target = actor(grouped_actor_trace, "UseTwice", grouped=True)
 
-    output = strip_ansi(
-        grouped_actor_trace.path(source, target).show(
-            explore_tool_tips=False,
-        )
-    )
+    output = strip_ansi(grouped_actor_trace.path(source, target).show())
 
     assert "ACTOR GROUPED[UseTwice]" in output
 
@@ -177,7 +173,7 @@ def test_scoped_ref_inspect_is_exact_identity_not_grouped(grouped_ref_trace):
     ]
 
 
-def test_exact_scoped_ref_version_history_is_up_to_inspected_version(grouped_ref_trace):
+def test_exact_scoped_ref_version_keeps_complete_reference_history(grouped_ref_trace):
     global_v0 = ref(grouped_ref_trace, "global:@A", version=0)
     global_v1 = ref(grouped_ref_trace, "global:@A", version=1)
 
@@ -185,6 +181,7 @@ def test_exact_scoped_ref_version_history_is_up_to_inspected_version(grouped_ref
     assert global_v0.version == 0
     assert global_v0.history == [
         0,
+        1,
     ]
 
     assert global_v1.id == "global:@A"

@@ -1,4 +1,5 @@
 from tide_tooling.tooling_core.bundling.TIDEBundler import TIDEBundler
+from tide_tooling import DataRef
 
 
 class Handle:
@@ -31,6 +32,22 @@ def test_bundle_reuses_a_local_id_for_an_aliased_value():
     root = bundle["records"][bundle["root"]]
 
     assert root["items"][0] == root["items"][1]
+
+
+def test_data_ref_is_safe_structural_data_in_untrusted_bundles():
+    reference = DataRef(
+        ("key", 1),
+        "global",
+        count=2,
+        max=1,
+        literal=True,
+    )
+    bundler = TIDEBundler()
+
+    restored = bundler.deserialise(bundler.bundle(reference))
+
+    assert restored == reference
+    assert isinstance(restored, DataRef)
 
 
 def test_bundle_accepts_handle_metadata_without_leaking_it_into_records():

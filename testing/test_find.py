@@ -4,6 +4,7 @@ from tide_tooling import TIDE
 from tide_tooling.core import Actor, tide_value_hasher
 
 
+
 def B(a, b, separate_b):
     return "!B"
 
@@ -48,6 +49,18 @@ def test_find_exact_scoped_reference_version(trace):
     assert searched.exists("ref")[0] is True
 
 
+def test_find_accepts_exact_state_identity(trace):
+    searched = trace.find("global:@B[v1]")
+
+    assert ids(searched.refs) == ["global:@B"]
+    assert searched.refs[0].version == 1
+
+
+def test_find_rejects_conflicting_state_versions(trace):
+    with pytest.raises(ValueError, match="conflicts"):
+        trace.find("global:@B[v1]", version=2)
+
+
 def test_find_missing_reference_version_does_not_fall_back(trace):
     searched = trace.find("global:@B", version=999)
 
@@ -76,10 +89,69 @@ def test_find_actor_name_is_nearby_only_and_deduped(trace):
     assert searched.actors == []
     assert set(ids(searched.nearby.actors)) == {
         Actor(trace.ocean_id, "TIDE: .event()", "B"),
-        Actor(trace.ocean_id, "TIDE: .exec(0)", "B"),
+        Actor(trace.ocean_id, 0, "B"),
     }
     assert len(searched.nearby.actors) == 2
     assert searched.exists("actor") == (False, True)
+
+
+def test_find_accepts_actor_occurrence_identity(trace):
+    searched = trace.find("B[0]")
+
+    assert len(searched.nearby.actors) == 1
+    assert searched.nearby.actors[0].version == 0
+    assert len(searched.nearby.actors[0].history) == 1
+
+
+def test_actor_occurrences_are_trace_wide_across_runners(trace):
+    b_executions = [record for record in trace.log if record.func_name == "B"]
+
+    assert [repr(record.producer_occurrence_id) for record in b_executions] == [
+        "B[0]",
+        "B[1]",
+        "B[2]",
+    ]
+    assert [identity for identity in trace.to_model(enrich=False)["E"] if identity.startswith("B[")] == [
+        "B[0]",
+        "B[1]",
+        "B[2]",
+    ]
+
+
+def test_inspect_accepts_actor_occurrence_identity(trace):
+    inspected = trace.inspect("B[0]", "actor")
+
+    assert inspected.exists
+    assert inspected.version == 0
+    assert len(inspected.history) == 1
+
+
+def test_why_shows_the_investigated_object(trace):
+    shown = trace.why("B[0]", "actor", color=False)
+
+    assert "INVESTIGATE" in shown
+    assert "B[0]" in shown
+
+
+def test_explicit_reference_occurrence_uses_exact_then_nearby(trace):
+    exact = trace.inspect("global:@B[v1]", "reference")
+    nearby = trace.inspect("@B[v1]", "reference")
+
+    assert exact.exists
+    assert exact.id == "global:@B"
+    assert nearby.exists
+    assert nearby.id == "global:@B"
+
+
+def test_find_function_name_retains_nearby_execution_occurrences(trace):
+    searched = trace.find("B")
+
+    assert ids(searched.nearby.execs) == [
+        execution.exec_id
+        for execution in trace.log
+        if "B" in execution.func_name
+    ]
+    assert searched.exists("exec_record") == (False, True)
 
 
 def test_find_exact_actor_object(trace):
@@ -93,7 +165,7 @@ def test_find_exact_actor_object(trace):
 
 
 def test_find_exact_actor_tuple(trace):
-    actor_tuple = (trace.ocean_id, "TIDE: .exec(0)", "B")
+    actor_tuple = (trace.ocean_id, 0, "B")
     searched = trace.find(actor_tuple)
 
     assert ids(searched.actors) == [Actor(*actor_tuple)]
@@ -103,16 +175,16 @@ def test_find_exact_actor_tuple(trace):
 def test_find_exec_by_sequence_id(trace):
     searched = trace.find(2)
 
-    assert len(searched.exec) == 1
-    assert searched.exec[0].object.object.seq_id == 2
+    assert len(searched.execs) == 1
+    assert searched.execs[0].object.object.seq_id == 2
     assert searched.exists("seq_id") == (True, False)
 
 
 def test_find_exec_by_canonical_exec_id(trace):
-    exec_id = trace.exec_log[2].exec_id
+    exec_id = trace.log[2].exec_id
     searched = trace.find(exec_id)
 
-    assert ids(searched.exec) == [exec_id]
+    assert ids(searched.execs) == [exec_id]
     assert searched.exists("exec_record") == (True, False)
 
 
@@ -217,9 +289,9 @@ def test_find_any_false_for_missing_search(trace):
         ("ref", "refs", "refs"),
         ("refs", "refs", "refs"),
         ("reference", "refs", "refs"),
-        ("exec", "exec", None),
-        ("execs", "exec", None),
-        ("exec_record", "exec", None),
+        ("exec", "execs", "execs"),
+        ("execs", "execs", "execs"),
+        ("exec_record", "execs", "execs"),
         ("value", "values", None),
         ("values", "values", None),
         ("hash", "values", None),
@@ -311,7 +383,11 @@ def test_find_to_dict_preserves_current_object_structure(trace):
         "exact": [match.to_dict() for match in searched.values],
     }
     assert data["execs"] == {
-        "exact": [match.to_dict() for match in searched.exec],
+        "exact": [match.to_dict() for match in searched.execs],
+        "nearby": [
+            match.to_dict()
+            for match in searched.nearby.execs
+        ],
     }
     assert data["effects"] == {
         "exact": [match.to_dict() for match in searched.effects],
@@ -328,7 +404,7 @@ def test_find_exact_reference_version_is_not_duplicated_in_nearby(trace):
 
 def test_find_show_can_render_only_nearby_results_for_one_type(trace):
     shown = trace.find("@B").show(
-        type="reference",
+        kind="reference",
         exact=False,
         nearby=True,
     )
@@ -342,7 +418,7 @@ def test_find_show_can_render_only_nearby_results_for_one_type(trace):
 
 def test_find_show_can_render_all_exact_result_types(trace):
     shown = trace.find("global:@B").show(
-        type="all",
+        kind="all",
         exact=True,
         nearby=False,
     )
@@ -358,5 +434,5 @@ def test_find_actor_nearby_order_is_stable_for_fixture(trace):
 
     assert ids(searched.nearby.actors) == [
         Actor(trace.ocean_id, "TIDE: .event()", "B"),
-        Actor(trace.ocean_id, "TIDE: .exec(0)", "B"),
+        Actor(trace.ocean_id, 0, "B"),
     ]

@@ -174,8 +174,6 @@ def show_query_display(
 ):
     if grouped:
         identity = f"GROUPED[{identifier}]"
-        if version is not None:
-            identity += f"[v{version}]"
         return f"{str(kind).upper()} {identity}"
 
     if display is not None:

@@ -1,10 +1,12 @@
+import pytest
+
 from tide_tooling import DELETE, DELETE_NOW, READ, TIDE, WRITE, Effects, node
 
 
 def _effect_signature(record):
     output = (
         "<template>"
-        if record.output.__class__.__name__ == "__TIDE_TEMPLATE_VALUE__"
+        if record.output.__class__.__name__ == "__fallback__"
         else record.output
     )
     return (
@@ -29,14 +31,14 @@ def test_repeated_effects_are_ordered_realised_occurrences():
 
     result = tide.exec(exercise_effects, writes="result")
     source = tide.trace()
-    record = source.exec_log[-1]
+    record = source.log[-1]
 
     assert result == ("present", True, "missing", False)
     assert [_effect_signature(effect) for effect in record.effects] == [
         (Effects.READ, ("global:source", 0), "present", "runtime", True),
-        (Effects.DELETE, ("global:source", 0), "<template>", "runtime", True),
-        (Effects.READ, ("global:source", 0), "missing", "runtime", False),
-        (Effects.DELETE, ("global:source", 0), "<template>", "runtime", False),
+        (Effects.DELETE, ("global:source", 0), True, "runtime", True),
+        (Effects.READ, ("global:source", None), "missing", "runtime", False),
+        (Effects.DELETE, ("global:source", None), False, "runtime", False),
     ]
     assert [
         dependency.associated_input[0]
@@ -51,11 +53,45 @@ def test_repeated_effects_are_ordered_realised_occurrences():
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
     assert [
         _effect_signature(effect)
-        for effect in rebuilt.exec_log[-1].effects
+        for effect in rebuilt.log[-1].effects
     ] == [
         _effect_signature(effect)
         for effect in record.effects
     ]
+
+
+def test_delete_effect_retains_every_affected_occurrence_of_one_actor():
+    tide = TIDE()
+    tide.declare("source", "present")
+
+    def remove():
+        DELETE_NOW("global:source")
+
+    def observe_missing():
+        return READ("global:source", fallback="missing")
+
+    tide.exec(remove)
+    tide.exec(observe_missing)
+    tide.exec(observe_missing)
+    trace = tide.trace()
+    executions = tuple(trace.execs.values())
+    delete = executions[1].effects[0]
+
+    assert {
+        affected.affected_exec_id
+        for affected in delete.affected.values()
+    } == {executions[2].exec_id, executions[3].exec_id}
+
+    restored = TIDE.from_bundle(trace.to_bundle())
+    restored_executions = tuple(restored.execs.values())
+    restored_delete = restored_executions[1].effects[0]
+    assert {
+        affected.affected_exec_id
+        for affected in restored_delete.affected.values()
+    } == {
+        restored_executions[2].exec_id,
+        restored_executions[3].exec_id,
+    }
 
 
 def test_duplicate_declared_effects_survive_bundle_round_trip():
@@ -63,24 +99,24 @@ def test_duplicate_declared_effects_survive_bundle_round_trip():
     tide.event(
         "repeat writes",
         effects=[
-            WRITE("global:result", preserve_output="first"),
-            WRITE("global:result", preserve_output="second"),
+            WRITE("global:result", "first"),
+            WRITE("global:result", "second"),
         ],
     )
 
     source = tide.trace()
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
 
-    assert [_effect_signature(effect) for effect in source.exec_log[0].effects] == [
-        (Effects.WRITE, ("global:result", 0), "first", "declared", None),
-        (Effects.WRITE, ("global:result", 0), "second", "declared", None),
+    assert [_effect_signature(effect) for effect in source.log[0].effects] == [
+        (Effects.WRITE, ("global:result", 0), "<template>", "declared", None),
+        (Effects.WRITE, ("global:result", 0), "<template>", "declared", None),
     ]
     assert [
         _effect_signature(effect)
-        for effect in rebuilt.exec_log[0].effects
+        for effect in rebuilt.log[0].effects
     ] == [
         _effect_signature(effect)
-        for effect in source.exec_log[0].effects
+        for effect in source.log[0].effects
     ]
 
 
@@ -94,30 +130,31 @@ def test_identical_node_effect_declarations_are_not_deduplicated():
     tide = TIDE()
     tide.declare("source", "present")
     tide.exec(remove_twice)
-    effects = tide.trace().exec_log[-1].effects
+    effects = tide.trace().log[-1].effects
 
     assert [_effect_signature(effect) for effect in effects] == [
         (
             Effects.DELETE,
-            ("global:source", 0),
+                ("global:source", 0),
             "<template>",
             "declared",
             True,
         ),
         (
             Effects.DELETE,
-            ("global:source", 0),
+                ("global:source", None),
             "<template>",
             "declared",
             False,
         ),
     ]
+    assert "\x1b[33mglobal:source\x1b[0m" in tide.trace().show(color=True)
 
 
 def test_declared_effect_output_does_not_replace_node_output():
     @node(
         effects=[
-            WRITE("global:effect_output", preserve_output="effect"),
+            WRITE("global:effect_output", "effect"),
         ]
     )
     def produce():
@@ -133,7 +170,7 @@ def test_declared_effect_output_does_not_replace_node_output():
 
 def test_returned_effect_can_still_supply_the_node_output():
     def produce_effect():
-        return WRITE("global:effect_output", preserve_output="effect")
+        return WRITE("global:effect_output", "effect", output="effect")
 
     tide = TIDE()
     tide.exec(produce_effect, writes="ordinary_output")
@@ -146,14 +183,14 @@ def test_returned_effect_can_still_supply_the_node_output():
 def test_mixed_effects_preserve_occurrence_and_post_result_write_order():
     @node(
         effects=[
-            WRITE("global:collision", preserve_output="declared"),
+            WRITE("global:collision", "declared"),
             DELETE("global:declared_delete"),
         ]
     )
     def exercise_every_effect_phase():
         READ("global:source")
         DELETE_NOW("global:runtime_delete")
-        return WRITE("global:collision", preserve_output="returned")
+        return WRITE("global:collision", "returned", output="returned")
 
     tide = TIDE()
     tide.declare("source", "present")
@@ -161,21 +198,21 @@ def test_mixed_effects_preserve_occurrence_and_post_result_write_order():
     tide.declare("declared_delete", "present")
     tide.exec(exercise_every_effect_phase, writes="collision")
     source = tide.trace()
-    record = source.exec_log[-1]
+    record = source.log[-1]
 
     assert [_effect_signature(effect) for effect in record.effects] == [
         (Effects.READ, ("global:source", 0), "present", "runtime", True),
         (
             Effects.DELETE,
             ("global:runtime_delete", 0),
-            "<template>",
+            True,
             "runtime",
             True,
         ),
         (
             Effects.WRITE,
             ("global:collision", 1),
-            "declared",
+            "<template>",
             "declared",
             None,
         ),
@@ -202,7 +239,7 @@ def test_mixed_effects_preserve_occurrence_and_post_result_write_order():
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
     assert [
         _effect_signature(effect)
-        for effect in rebuilt.exec_log[-1].effects
+        for effect in rebuilt.log[-1].effects
     ] == [
         _effect_signature(effect)
         for effect in record.effects
@@ -222,8 +259,8 @@ def test_none_read_fallback_is_not_confused_with_missing_output():
     source = tide.trace()
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
 
-    source_effect = source.exec_log[-1].effects[0]
-    rebuilt_effect = rebuilt.exec_log[-1].effects[0]
+    source_effect = source.log[-1].effects[0]
+    rebuilt_effect = rebuilt.log[-1].effects[0]
     assert source_effect.output is None
     assert source_effect.target_existed is False
     assert rebuilt_effect.output is None
