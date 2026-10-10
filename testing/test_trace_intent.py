@@ -35,7 +35,7 @@ def test_trace_init_builds_intent_and_exact_total_maps():
     )
     assert trace.intent.map.plan_only == {"executions": (), "states": ()}
     assert trace.intent.map.actual_only == {"executions": (), "states": ()}
-    assert trace.intent.map.compare().whole_kernel_equal is True
+    assert trace.intent.map.compare().complete_agreement is True
 
 
 def test_total_identity_map_retains_both_kinds_of_unpaired_identity():
@@ -91,7 +91,7 @@ def test_dynamic_selector_keeps_expected_and_actual_state_parentage():
     assert trace.concretisations == {
         "mem:csv:*": (("mem:csv", 0),),
     }
-    assert trace.intent.map.compare().whole_kernel_equal is True
+    assert trace.intent.map.compare().complete_agreement is True
 
 
 def test_intent_and_actual_concretisations_apply_max_after_minimum():
@@ -191,7 +191,12 @@ def test_numeric_star_uses_numeric_bound_for_plan_and_actual_selection():
 def test_imported_trace_has_no_invented_intent_but_is_inspectable():
     from tide_tooling import TIDE
 
-    trace = TIDE.from_model({"I": [["c", "s"]], "O": [["p", "s"]]})
+    trace = TIDE.from_model({
+        "E": ["p", "c"],
+        "S": ["s"],
+        "I": [["c", "s"]],
+        "O": [["p", "s"]],
+    })
 
     assert trace.intent is None
     assert trace.concretisations == {}
@@ -271,7 +276,7 @@ def test_failed_planned_write_remains_on_the_plan_side_of_total_state_map():
     )
     assert trace.intent.map.states.actual_only == ()
     report = trace.intent.map.compare()
-    assert report["whole_kernel_equal"] is False
+    assert report["complete_agreement"] is False
     assert report["identity_alignment_complete"] is False
     assert report["intent_equal"] is False
 

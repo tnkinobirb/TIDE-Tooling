@@ -8,6 +8,11 @@ from tide_tooling import TIDE
 
 BASE_MODEL = {
     "host": "left-host",
+    "E": ["source", "left", "right", "merge", "analyse", "archive"],
+    "S": [
+        "source-left", "source-right", "ready-left", "ready-right",
+        "merged", "analysis", "archive-record",
+    ],
     "I": [
         {"e": "left", "s": "source-left"},
         {"e": "right", "s": "source-right"},
@@ -60,6 +65,8 @@ def _renamed(model):
 
     renamed = {
         "host": "right-host",
+        "E": [exec_map[exec_id] for exec_id in reversed(model["E"])],
+        "S": [state_map[state_id] for state_id in reversed(model["S"])],
         "I": [
             [exec_map[exec_id], state_map[state_id]]
             for exec_id, state_id in reversed(tuple(_pairs(model["I"])))
@@ -97,7 +104,7 @@ def test_structural_model_is_invariant_to_ids_order_duplicates_and_enrichment():
 
     assert left["I"] == right["I"]
     assert left["O"] == right["O"]
-    assert set(left) == {"schema", "schema_version", "host", "I", "O"}
+    assert set(left) == {"schema", "schema_version", "host", "E", "S", "I", "O"}
     assert "host_record" not in right
     assert "executions" not in right
     assert "states" not in right
@@ -141,6 +148,8 @@ def test_structural_import_builds_only_canonical_trace_identities():
 
 def test_symmetric_branches_do_not_need_host_identity_tie_breaking():
     first = {
+        "E": ["source", "sink-left", "sink-right"],
+        "S": ["left", "right"],
         "I": [
             ["sink-left", "left"],
             ["sink-right", "right"],
@@ -151,6 +160,8 @@ def test_symmetric_branches_do_not_need_host_identity_tie_breaking():
         ],
     }
     second = {
+        "E": ["producer-z", "consumer-a", "consumer-b"],
+        "S": ["state-a", "state-b"],
         "I": [
             ["consumer-b", "state-b"],
             ["consumer-a", "state-a"],
@@ -177,6 +188,10 @@ def test_symmetric_branches_do_not_need_host_identity_tie_breaking():
 def test_large_symmetric_fan_out_is_pruned_by_proven_interchangeability():
     branch_count = 12
     model = {
+        "E": ["producer"] + [
+            f"consumer-{index}" for index in range(branch_count)
+        ],
+        "S": [f"state-{index}" for index in range(branch_count)],
         "I": [
             [f"consumer-{index}", f"state-{index}"]
             for index in range(branch_count)
@@ -214,7 +229,12 @@ def test_structural_view_is_stable_across_relabelled_dag_cases():
                 if random_source.random() < 0.35:
                     inputs.append([f"exec-{consumer}", state_id])
 
-        original = {"I": inputs, "O": outputs}
+        original = {
+            "E": [f"exec-{index}" for index in range(execution_count)],
+            "S": [f"state-{index}" for index in range(execution_count)],
+            "I": inputs,
+            "O": outputs,
+        }
         permutation = list(range(execution_count))
         random_source.shuffle(permutation)
         exec_map = {
@@ -226,6 +246,8 @@ def test_structural_view_is_stable_across_relabelled_dag_cases():
             for index in range(execution_count)
         }
         relabelled = {
+            "E": [exec_map[exec_id] for exec_id in original["E"]],
+            "S": [state_map[state_id] for state_id in original["S"]],
             "I": [
                 [exec_map[exec_id], state_map[state_id]]
                 for exec_id, state_id in reversed(inputs)
@@ -267,7 +289,7 @@ def test_structural_comparison_still_distinguishes_different_relations():
 
 
 def test_empty_relation_kernel_has_a_stable_structural_view():
-    canonical = TIDE.from_model({"I": [], "O": []}).to_model(
+    canonical = TIDE.from_model({"E": [], "S": [], "I": [], "O": []}).to_model(
         include_hashes=False,
         identity_mode="structural",
     )
@@ -284,6 +306,8 @@ def test_structural_import_keeps_tool_assigned_producer_explicit():
     with pytest.warns(RuntimeWarning, match="does not establish host provenance"):
         trace = TIDE.from_model(
             {
+                "E": ["consumer"],
+                "S": ["boundary"],
                 "I": [["consumer", "boundary"]],
                 "O": [],
             },

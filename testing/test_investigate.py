@@ -41,7 +41,7 @@ def make_effect_exec(seq_id, name, deps=None, writes=None, effects=None, inputs=
         func_name=name,
         inputs=inputs or {},
         deps=deps or [],
-        effects=effects or {},
+        effects=effects or [],
         declared_effects=[],
         declared_targets=[],
         runtime_effects=[],
@@ -112,12 +112,13 @@ def effect_trace():
     effect = EffectRecord(
         Effects.WRITE,
         ("global:@A", 0),
-        preserved_output="!A",
+        origin="declared",
+        output="!A",
     )
     effect_producer = make_effect_exec(
         2,
         "EffectProducer",
-        effects={(Effects.WRITE, ("global:@A", 0)): effect},
+        effects=[effect],
     )
 
     return Trace(

@@ -27,7 +27,7 @@ cd TIDE-Tooling
 python -m pip install .
 ```
 
-This README introduces the current prototype rather than serving as a complete manual. Supporting examples and documentation will expand as the project develops.
+This README describes the implemented prototype and its current public interfaces.
 
 ### Example
 
@@ -65,7 +65,6 @@ The complete example includes exploratory queries and advanced Reference notes:
 python demos/start_here/shortest_route.py
 ```
 
-The project is still under active development, so interfaces may change.
 Usage of TIDE-Tooling requires adherence to [LICENCE.md](LICENCE.md). 
 For general usage or licensing questions, contact `tidetooling@gmail.com`.
 
@@ -80,6 +79,7 @@ The README introduces the project in stages. These are the complete executable e
 | Passive values | [`demos/readme/passive_tide.py`](demos/readme/passive_tide.py) | `python demos/readme/passive_tide.py` |
 | Execution relationships | [`demos/readme/exec_relationships.py`](demos/readme/exec_relationships.py) | `python demos/readme/exec_relationships.py` |
 | Effects | [`demos/effects/effects_demo.py`](demos/effects/effects_demo.py) | `python demos/effects/effects_demo.py` |
+| Emission | [`demos/effects/emission_demo.py`](demos/effects/emission_demo.py) | `python demos/effects/emission_demo.py` |
 | TIDE Model import | [`demos/model/from_model.py`](demos/model/from_model.py) | `python demos/model/from_model.py` |
 | Basic Trace and export | [`demos/trace/basic_trace.py`](demos/trace/basic_trace.py) | `python demos/trace/basic_trace.py` |
 | Basic Trace import | [`demos/trace/from_bundle.py`](demos/trace/from_bundle.py) | `python demos/trace/from_bundle.py` |
@@ -297,8 +297,8 @@ trace.produced_by("load", "actor").show()
 trace.consumed_by("clean", "actor").show()
 
 # Upstream/Downstream
-trace.upstream("load", "actor").show()
-trace.downstream("clean", "actor").show()
+trace.upstream("clean", "actor").show()
+trace.downstream("load", "actor").show()
 
 # Path downstream
 trace.path(
@@ -310,14 +310,19 @@ trace.path(
 
 # Path upstream
 trace.path(
-    source="load",
-    target="clean",
+    source="clean",
+    target="load",
     source_type="actor",
     target_type="actor",
     direction="upstream",
 ).show()
 
 ```
+
+`trace.path()` follows the recorded directed relationships. It does not select
+a shortest path by default. A query from an object to itself is allowed when a
+recorded relationship chain returns to that object; the query does not itself
+decide whether the represented execution structure is semantically valid.
 
 Complete example: [`demos/readme/exec_relationships.py`](demos/readme/exec_relationships.py) (`python demos/readme/exec_relationships.py`)
 
@@ -327,6 +332,58 @@ This keeps the Reference Version which connects the Executions visible rather th
 ```text
 load → clean
 ```
+
+---
+
+### Effects
+
+An **Effect** is a realised operation associated with an Execution. Effects may
+be declared on a Node or returned while that Node executes.
+
+`ExecRecord.effects` preserves realised effect occurrences as an ordered list:
+
+- every realised target produces one effect record;
+- equal effects are not deduplicated;
+- declared effects occur in declaration order;
+- returned runtime effects follow in occurrence order;
+- `origin` records whether an occurrence was `declared` or `runtime`;
+- `output` records the realised effect value;
+- READ and DELETE records include `target_existed` when that runtime evidence
+  is available.
+
+Normal-result writes occur before declared and returned runtime WRITE effects.
+Filtering the resulting writes for one target gives that target's recorded
+version trajectory.
+
+Effects can be searched and inspected through the same Trace interface:
+
+```python
+from tide_tooling import Effects
+
+trace.find(Effects.WRITE).show(type="effect")
+trace.investigate(Effects.WRITE, "effect").show()
+```
+
+Complete example: [`demos/effects/effects_demo.py`](demos/effects/effects_demo.py) (`python demos/effects/effects_demo.py`)
+
+---
+
+### Emission
+
+Emission records one relationship:
+
+```text
+emitter → emitted Node
+```
+
+Every emitted list item is retained as an ordered occurrence. Declared
+emissions precede returned runtime emissions. Repeated emission of the same
+Node preserves repeated relationship evidence without executing that DAG Node
+more than once. The relationship participates in Trace history and path queries
+whether or not the emitted Node later executes, and bundle restoration preserves
+its order, duplicates, and origin.
+
+Complete example: [`demos/effects/emission_demo.py`](demos/effects/emission_demo.py) (`python demos/effects/emission_demo.py`)
 
 ---
 
@@ -410,7 +467,12 @@ The **TIDE Model** is different from a Bundle.
 
 A Bundle aims to preserve the richer TIDE Trace.
 
-The TIDE Model intentionally reduces a Trace to Executions and the States they consumed or produced.
+The TIDE Model intentionally reduces a Trace to the candidate structure
+`K=(E,S,I,O)`: represented Execution identities `E`, represented State
+identities `S`, input incidence `I`, and output incidence `O`. `E` and `S`
+are authoritative; the tooling does not reconstruct them from incidence.
+Occurrence identities are non-empty strings, matching the artifact's JSON
+model and executable reference comparator.
 
 ```text
 Trace
@@ -430,10 +492,16 @@ A Model can be validated:
 
 ```python
 report = TIDE.validate_model(model)
-assert report["conforms"], report["errors"]
+assert report["semantically_valid"], report["errors"]
 ```
 
-A conforming Model can also be projected into an inspectable Trace:
+Structural validity checks that every incidence endpoint belongs to its
+declared carrier. Semantic validity separately checks unique State creation
+and acyclic Execution ancestry. Handoff and non-empty reachability judgments
+remain determined and reportable when a structurally valid Model is
+semantically invalid.
+
+A semantically valid Model can also be projected into an inspectable Trace:
 
 ```python
 model_trace = TIDE.from_model(model)
@@ -442,6 +510,25 @@ model_trace = TIDE.from_model(model)
 The TIDE Model does not attempt to preserve every piece of information held by a Trace.
 
 Its purpose is to preserve a smaller shared execution-relationship structure with fixed validity and query rules.
+
+Two Models can be compared under supplied one-to-one identity maps:
+
+```python
+from tide_tooling import comparator
+
+comparison = comparator(
+    source_model,
+    target_model,
+    execution_map={"source-exec": "target-exec"},
+    state_map={"source-state": "target-state"},
+)
+```
+
+`comparison.conformant` means mapped input and output incidence agrees.
+Outside identities/incidence, mapped identities absent from a structure, and
+semantic validity are reported separately. `comparison.complete_agreement`
+requires conformance and exact identity coverage on both sides. The maps are
+never inferred, repaired, or extended.
 
 Complete import example: [`demos/model/from_model.py`](demos/model/from_model.py) (`python demos/model/from_model.py`)
 

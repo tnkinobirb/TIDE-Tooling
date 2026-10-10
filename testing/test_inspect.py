@@ -149,7 +149,6 @@ def create_exec_record(
     output_value=__TEMPLATE_VALUE__,
     resolve_output="unknown",
     writes=None,
-    emitted_by=None,
     emitted_nodes=None,
     base_node_id="unknown",
     base_node_content_id="unknown",
@@ -192,7 +191,6 @@ def create_exec_record(
         ),
         resolve_output=resolve_output or unknown_repr,
         writes=writes or [],
-        emitted_by=emitted_by or [],
         emitted_nodes=emitted_nodes or [],
         base_node_id=base_node_id or unknown_repr,
         base_node_content_id=base_node_content_id or unknown_repr,
@@ -343,7 +341,6 @@ def assert_exec_record(
             exec_from_inspect.resolve_output
             == expected_exec.resolve_output
         )
-        assert exec_from_inspect.emitted_by == expected_exec.emitted_by
         assert (
             exec_from_inspect.emitted_nodes
             == expected_exec.emitted_nodes

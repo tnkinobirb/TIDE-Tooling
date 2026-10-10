@@ -379,9 +379,6 @@ class RunnerNode:
     end_time: float = None
     duration: float = None
 
-    emitted: bool = False
-    emitted_by: DedupedList = field(default_factory=DedupedList)
-
     # Task name 
     original_node_name: str | None = None # if route is a duplicate, node_name is appended with _id so maintain original for traceability
 
@@ -394,10 +391,8 @@ class RunnerNode:
     
     touched_nodes: DedupedList[Node] = field(default_factory=DedupedList)
     released_nodes: DedupedList[Node] = field(default_factory=DedupedList)
-    emitted_nodes: DedupedList[Node] = field(default_factory=DedupedList)
-
     runtime_targets: DedupedList[DataRef] = field(default_factory=DedupedList)
-    runtime_effects: DedupedList[DataRef] = field(default_factory=DedupedList)
+    runtime_effects: list[Effect] = field(default_factory=list)
 
     resolve_output: bool = False
     resolved_output: Any = None
@@ -417,7 +412,7 @@ class RunnerNode:
 
         # Node function / Task
         self.func: Callable = self.node.func
-        self.effects: DedupedList[Effect] = self.node.effects
+        self.effects: list[Effect] = self.node.effects
         self.targets: DedupedList[DataRef] = self.node.targets # TODO-NOTE: Support targets DedupedLists [X]
 
         # Primary Inputs satisfied_nodes = DedupedList(dependent_node_id)
@@ -469,9 +464,6 @@ class RunnerNode:
 
         self.touched_nodes.clear()
         self.released_nodes.clear()
-        self.emitted_nodes = DedupedList()
-
-
     def _reset_runtime_state(self):
 
         self._reset_execution_state()
@@ -628,14 +620,14 @@ class Node:
         self.k_kwargs = NodeInput(raw=self.k_kwargs if self.k_kwargs is not None else {})
         
         if self.effects is None:
-            self.effects = DedupedList()
+            self.effects = []
         elif isinstance(self.effects, Effect) or (
             isinstance(self.effects, type)
             and issubclass(self.effects, Effect)
         ):
-            self.effects = DedupedList([self.effects])
+            self.effects = [self.effects]
         elif isinstance(self.effects, (list, tuple, set, DedupedList)):
-            self.effects = DedupedList(self.effects)
+            self.effects = list(self.effects)
         else:
             raise NodeDefinitionError(
                 "EffectDefError | effects must be an Effect or an iterable "
@@ -739,10 +731,8 @@ class RuntimeDag:
         if not isinstance(deps, list):
             warn(f"Register_node Error! Deps must be a LIST. Was {type(deps)}", UserWarning)
             raise NodeToDagRegistrationError(f"Error registering node to DAG! [{node.id} | {node.node_name}] Deps must be a DedupedList. Was {type(deps)}!")
-        if self.forward_map[node.id]:
-            warn(f"Register_node id:[{node.id}] ALREADY has an existing Dep DedupedList! Is this a duplicate Node!?")
-            return
-            raise NodeToDagRegistrationError(f"Error registering node to DAG! [{node.id} | {node.node_name}] already has an existing entry!")
+        if node.id in self.forward_map:
+            return False
         
         #register node
         try:
@@ -760,6 +750,7 @@ class RuntimeDag:
                 self.release_node(node.id)
 
             print(f"Registered Node [{node.id}]!")
+            return True
             
         except Exception as e:
             raise NodeToDagRegistrationError(f"Error registering node to DAG! [{node.id} | {node.node_name}] : {e}") from e

@@ -52,8 +52,7 @@ def make_exec_record(
         node_options={"resolve_output": False},
         deps=list(deps),
         writes=list(writes),
-        effects={},
-        emitted_by=None,
+        effects=[],
         emitted_nodes=[],
         producer_id=actor,
     )
@@ -296,7 +295,7 @@ def test_bundle_trace_rebuilds_portable_static_and_dynamic_exec_evidence():
     restored_consumer = loaded["exec_logs"][1]
 
     assert run["kind"] == "tide_run"
-    assert run["codec_version"] == 2
+    assert "codec_version" not in run
     assert run["exec_records"][1]["reads"][0]["value_hash"] == seed_hash
     assert "resolved_value" not in run["exec_records"][1]["reads"][0]
     assert run["exec_records"][1]["reads"][1]["expanded"][0][
@@ -310,14 +309,15 @@ def test_bundle_trace_rebuilds_portable_static_and_dynamic_exec_evidence():
     assert restored_consumer.writes[0].stored_result == result
 
 
-def test_tide_run_v1_is_rejected_instead_of_silently_degrading():
+def test_tide_run_identity_does_not_depend_on_a_codec_version():
     complete = TIDEBundler().bundle_trace(
         make_trace({}, {})
     )
     complete["manifest"]["run"]["codec_version"] = 1
 
-    with pytest.raises(ValueError, match="codec version"):
-        TIDEBundler().load_trace_bundle(complete)
+    loaded = TIDEBundler().load_trace_bundle(complete)
+
+    assert loaded["exec_logs"] == []
 
 
 def test_loaded_exec_logs_rebuild_real_trace_index():
@@ -454,7 +454,8 @@ def test_large_trace_paths_and_tide_run_v2_survive_round_trip():
 
     assert len(trace.exec_log) == final_step + 1
     assert path.exists()
-    assert bundle.manifest["run"]["codec_version"] == 2
+    assert bundle.manifest["run"]["kind"] == "tide_run"
+    assert "codec_version" not in bundle.manifest["run"]
     assert len(bundle.manifest["run"]["exec_records"]) == final_step + 1
     assert imported.value_of(f"global:step_{final_step}", 0) == final_step
     assert imported.path(

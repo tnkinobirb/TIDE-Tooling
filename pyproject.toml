@@ -1,6 +1,6 @@
 [project]
 name = "tide-tooling"
-version = "0.0.1"
+version = "0.0.2"
 description = "Queryable execution provenance for Python"
 readme = "README.md"
 authors = [

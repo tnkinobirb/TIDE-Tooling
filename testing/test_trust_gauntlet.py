@@ -33,11 +33,7 @@ def _relation(model, name):
 
 
 def _carriers(model):
-    incidence = _relation(model, "I") | _relation(model, "O")
-    return (
-        {execution for execution, _ in incidence},
-        {state for _, state in incidence},
-    )
+    return set(model["E"]), set(model["S"])
 
 
 def _model(trace):
@@ -85,6 +81,11 @@ def _state_id(model, reference, version=0):
 
 def _replace_identity(model, old, new, *, carrier):
     position = 0 if carrier == "execution" else 1
+    field = "E" if carrier == "execution" else "S"
+    model[field] = sorted({
+        new if identity == old else identity
+        for identity in model[field]
+    })
     for relation in ("I", "O"):
         replaced = []
         for entry in model[relation]:
@@ -208,7 +209,7 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
     assert set(producers) == states
     assert set(producers.values()) == {1}
     validation = TIDE.validate_model(model)
-    assert validation["conforms"] is True
+    assert validation["semantically_valid"] is True
 
     execution_map, state_map = _identity_maps(model)
     self_report = comparator(
@@ -288,7 +289,7 @@ def test_gauntlet_declared_store_event_trace_and_model_agree(gauntlet_run):
     delete_effects = [
         effect
         for record in trace.exec_log
-        for effect in record.effects.values()
+        for effect in record.effects
         if effect.effect == Effects.DELETE
     ]
     assert len(delete_effects) == 2
@@ -320,7 +321,7 @@ def test_gauntlet_model_and_bundle_round_trips_preserve_answers(gauntlet_run):
         execution_map=execution_map,
         state_map=state_map,
     )
-    assert model_report.whole_kernel_equal is True
+    assert model_report.complete_agreement is True
     assert model_report["judgments"]["mapped_correspond"] is True
 
     # Bundle keeps values, aliases, metadata, and structure.
@@ -332,7 +333,7 @@ def test_gauntlet_model_and_bundle_round_trips_preserve_answers(gauntlet_run):
         execution_map=execution_map,
         state_map=state_map,
     )
-    assert bundle_report.whole_kernel_equal is True
+    assert bundle_report.complete_agreement is True
     seed = restored.value_of("csv_a")[0]
     assert seed["left"] is seed["right"]
     assert [record.status for record in restored.exec_log] == [
@@ -359,7 +360,7 @@ def test_gauntlet_reconstructing_the_same_events_is_idempotent(gauntlet_run):
         state_map=state_map,
     )
 
-    assert report.whole_kernel_equal is True
+    assert report.complete_agreement is True
     assert [record.exec_id for record in first.exec_log] == [
         record.exec_id for record in second.exec_log
     ]
@@ -526,7 +527,7 @@ def test_gauntlet_mutation_merge_executions_reports_absent_identity(gauntlet_run
     assert report.assessable is True
     assert report["validity"]["K2"]["valid"] is True
     assert len(report["mapped_identities_absent"]["K2"]["Executions"]) == 1
-    assert report.whole_kernel_equal is False
+    assert report.complete_agreement is False
 
 
 def test_gauntlet_mutation_reuse_state_id_breaks_unique_creation(gauntlet_run):
@@ -601,7 +602,7 @@ def test_gauntlet_mutation_duplicate_incidence_is_setwise_equal(gauntlet_run):
     report = _mutation_report(trace, mutate)
     assert report["validity"]["K2"]["valid"] is True
     assert report.conformant is True
-    assert report.whole_kernel_equal is True
+    assert report.complete_agreement is True
 
 
 def test_gauntlet_mutation_metadata_is_outside_the_kernel(gauntlet_run):
@@ -616,21 +617,23 @@ def test_gauntlet_mutation_metadata_is_outside_the_kernel(gauntlet_run):
     report = _mutation_report(trace, mutate)
     assert report["validity"]["K2"]["valid"] is True
     assert report.conformant is True
-    assert report.whole_kernel_equal is True
+    assert report.complete_agreement is True
 
 
 def test_gauntlet_mutation_unmapped_path_is_visible_outside_scope(gauntlet_run):
     _, trace, _ = gauntlet_run
 
     def mutate(target, _, __):
+        target["E"].extend(["extra-producer", "extra-consumer"])
+        target["S"].append("extra-state")
         target["O"].append(["extra-producer", "extra-state"])
         target["I"].append(["extra-consumer", "extra-state"])
 
     report = _mutation_report(trace, mutate)
     assert report["validity"]["K2"]["valid"] is True
     assert report.conformant is True
-    assert report["carrier_coverage"] == {"K1": True, "K2": False}
-    assert report.whole_kernel_equal is False
+    assert report["identity_coverage"] == {"K1": True, "K2": False}
+    assert report.complete_agreement is False
     assert report["outside"]["K2"] == {
         "I": (("extra-consumer", "extra-state"),),
         "O": (("extra-producer", "extra-state"),),
@@ -663,7 +666,7 @@ def test_gauntlet_mutation_noninjective_map_is_unassessable(gauntlet_run):
     report = _mutation_report(trace, mutate)
     assert report.assessable is False
     assert report.conformant is None
-    assert report.whole_kernel_equal is None
+    assert report.complete_agreement is None
     assert report["mapping_errors"] == (
         "Execution map must be one-to-one",
     ) or report["mapping_errors"] == [

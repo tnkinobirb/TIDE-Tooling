@@ -32,35 +32,6 @@ from tide_tooling.tooling_core.engine.tide_rendering import (
 __all__ = ["TIDEComparatorReport", "comparator"]
 
 
-def _identity(value, location):
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{location} must be a non-empty string")
-    return value
-
-
-def _incidence_pair(entry, relation, index, name):
-    location = f"{name}.{relation}[{index}]"
-    if isinstance(entry, dict):
-        if "exec_id" in entry and "state_id" in entry:
-            execution, state = entry["exec_id"], entry["state_id"]
-        elif "e" in entry and "s" in entry:
-            execution, state = entry["e"], entry["s"]
-        else:
-            raise ValueError(
-                f"{location} must contain exec_id/state_id or e/s"
-            )
-    elif isinstance(entry, (list, tuple)) and len(entry) == 2:
-        execution, state = entry
-    else:
-        raise ValueError(
-            f"{location} must be [execution, state] or an incidence object"
-        )
-    return (
-        _identity(execution, f"{location} Execution"),
-        _identity(state, f"{location} State"),
-    )
-
-
 def _call_to_model(candidate):
     to_model = candidate.to_model
     try:
@@ -140,18 +111,40 @@ def _import_structure(candidate, name):
         raise ValueError(
             f"{name} must be a Trace, TIDE Model dictionary, or JSON input"
         )
-    if "I" not in candidate or "O" not in candidate:
-        raise ValueError(f"{name} must contain I and O")
+    missing = [field for field in ("E", "S", "I", "O") if field not in candidate]
+    if missing:
+        raise ValueError(
+            f"{name} must contain E, S, I and O; missing {', '.join(missing)}"
+        )
 
-    structure = {}
-    for relation in ("I", "O"):
-        entries = candidate[relation]
-        if not isinstance(entries, list):
-            raise ValueError(f"{name}.{relation} must be a JSON list")
-        structure[relation] = {
-            _incidence_pair(entry, relation, index, name)
-            for index, entry in enumerate(entries)
+    from tide_tooling.core import TIDE
+
+    try:
+        structure = {
+            "E": set(TIDE._normalise_model_carrier(candidate["E"], "E")),
+            "S": set(TIDE._normalise_model_carrier(candidate["S"], "S")),
+            "I": set(TIDE._normalise_model_incidence(
+                TIDE._model_list(candidate["I"], "I"),
+                "I",
+            )),
+            "O": set(TIDE._normalise_model_incidence(
+                TIDE._model_list(candidate["O"], "O"),
+                "O",
+            )),
         }
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name}: {error}") from error
+
+    for relation in ("I", "O"):
+        for execution, state in structure[relation]:
+            if execution not in structure["E"]:
+                raise ValueError(
+                    f"{name}.{relation} references Execution {execution!r} outside E"
+                )
+            if state not in structure["S"]:
+                raise ValueError(
+                    f"{name}.{relation} references State {state!r} outside S"
+                )
     return structure, candidate.get("host")
 
 
@@ -160,24 +153,21 @@ def _map_errors(mapping, name):
         return [f"{name} map must be a dictionary"]
     errors = []
     targets = []
+    from tide_tooling.core import TIDE
+
     for source, target in mapping.items():
-        if not isinstance(source, str) or not source:
-            errors.append(f"{name} map source must be a non-empty string")
-        if not isinstance(target, str) or not target:
-            errors.append(f"{name} map target must be a non-empty string")
-        else:
+        try:
+            TIDE._model_identifier(source, f"{name} map source")
+        except ValueError as error:
+            errors.append(str(error))
+        try:
+            TIDE._model_identifier(target, f"{name} map target")
             targets.append(target)
+        except ValueError as error:
+            errors.append(str(error))
     if len(set(targets)) != len(targets):
         errors.append(f"{name} map must be one-to-one")
     return errors
-
-
-def _carriers(structure):
-    incidence = structure["I"] | structure["O"]
-    return (
-        {execution for execution, _ in incidence},
-        {state for _, state in incidence},
-    )
 
 
 def _judgment_sets(inputs, outputs):
@@ -206,22 +196,34 @@ def _judgment_sets(inputs, outputs):
     return handoffs, reachability
 
 
+def _identity_sort_key(value):
+    return type(value).__name__, repr(value)
+
+
 def _ordered(values):
-    return tuple(sorted(values))
+    return tuple(sorted(
+        values,
+        key=lambda value: tuple(
+            _identity_sort_key(item)
+            for item in value
+        ),
+    ))
 
 
-def _validity_report(structure):
-    executions, states = _carriers(structure)
+def _validity_report(structure, handoffs, reachability):
+    executions, states = structure["E"], structure["S"]
     producers = defaultdict(set)
     for execution, state in structure["O"]:
         producers[state].add(execution)
     producer_counts = {state: len(producers[state]) for state in states}
     unique_creation = all(count == 1 for count in producer_counts.values())
-    handoffs, reachability = _judgment_sets(structure["I"], structure["O"])
     cyclic_executions = tuple(sorted(
-        execution
-        for execution in executions
-        if (execution, execution) in reachability
+        (
+            execution
+            for execution in executions
+            if (execution, execution) in reachability
+        ),
+        key=_identity_sort_key,
     ))
     return {
         "valid": unique_creation and not cyclic_executions,
@@ -229,7 +231,10 @@ def _validity_report(structure):
         "acyclic_ancestry": not cyclic_executions,
         "producer_count_errors": {
             state: count
-            for state, count in sorted(producer_counts.items())
+            for state, count in sorted(
+                producer_counts.items(),
+                key=lambda item: _identity_sort_key(item[0]),
+            )
             if count != 1
         },
         "cyclic_executions": cyclic_executions,
@@ -244,8 +249,7 @@ def _validity_report(structure):
     }
 
 
-def _judgment_report(structure):
-    handoffs, reachability = _judgment_sets(structure["I"], structure["O"])
+def _judgment_report(handoffs, reachability):
     return {
         "direct_handoffs": _ordered(handoffs),
         "reachability": _ordered(reachability),
@@ -274,8 +278,8 @@ class TIDEComparatorReport(dict):
         return self["conformant"]
 
     @property
-    def whole_kernel_equal(self):
-        return self["whole_kernel_equal"]
+    def complete_agreement(self):
+        return self["complete_agreement"]
 
     @property
     def mapped_judgments_correspond(self):
@@ -358,9 +362,9 @@ class TIDEComparatorReport(dict):
                 f"  mapped judgments: "
                 f"{green if self.mapped_judgments_correspond else yellow}"
                 f"{'correspond' if self.mapped_judgments_correspond else 'differ'}{reset}",
-                f"  whole kernel: "
-                f"{green if self.whole_kernel_equal else dim}"
-                f"{'equal' if self.whole_kernel_equal else 'not established'}{reset}",
+                f"  complete agreement: "
+                f"{green if self.complete_agreement else dim}"
+                f"{'yes' if self.complete_agreement else 'no'}{reset}",
             ])
 
         if not self.assessable:
@@ -430,8 +434,16 @@ def comparator(source, target, *, execution_map, state_map):
     """
     k1, source_host = _import_structure(source, "K1")
     k2, target_host = _import_structure(target, "K2")
-    validity = {"K1": _validity_report(k1), "K2": _validity_report(k2)}
-    judgments = {"K1": _judgment_report(k1), "K2": _judgment_report(k2)}
+    k1_handoffs, k1_reachability = _judgment_sets(k1["I"], k1["O"])
+    k2_handoffs, k2_reachability = _judgment_sets(k2["I"], k2["O"])
+    validity = {
+        "K1": _validity_report(k1, k1_handoffs, k1_reachability),
+        "K2": _validity_report(k2, k2_handoffs, k2_reachability),
+    }
+    judgments = {
+        "K1": _judgment_report(k1_handoffs, k1_reachability),
+        "K2": _judgment_report(k2_handoffs, k2_reachability),
+    }
     mapping_errors = [
         *_map_errors(execution_map, "Execution"),
         *_map_errors(state_map, "State"),
@@ -450,13 +462,13 @@ def comparator(source, target, *, execution_map, state_map):
     if mapping_errors:
         base.update({
             "conformant": None,
-            "carrier_coverage": {"K1": None, "K2": None},
-            "whole_kernel_equal": None,
+            "identity_coverage": {"K1": None, "K2": None},
+            "complete_agreement": None,
         })
         return TIDEComparatorReport(base)
 
-    e1, s1 = _carriers(k1)
-    e2, s2 = _carriers(k2)
+    e1, s1 = k1["E"], k1["S"]
+    e2, s2 = k2["E"], k2["S"]
     d_e, r_e = set(execution_map), set(execution_map.values())
     d_s, r_s = set(state_map), set(state_map.values())
     e1_m, e2_m = e1 & d_e, e2 & r_e
@@ -486,8 +498,8 @@ def comparator(source, target, *, execution_map, state_map):
         (execution_map[source_id], execution_map[target_id])
         for source_id, target_id in r1_m
     }
-    k1_covered = e1 <= d_e and s1 <= d_s
-    k2_covered = e2 <= r_e and s2 <= r_s
+    k1_covered = e1 == d_e and s1 == d_s
+    k2_covered = e2 == r_e and s2 == r_s
 
     judgments.update({
         "mapped_correspond": f_h1_m == h2_m and f_r1_m == r2_m,
@@ -502,6 +514,16 @@ def comparator(source, target, *, execution_map, state_map):
         "mapped_scope": {
             "K1": {"Executions": tuple(sorted(e1_m)), "States": tuple(sorted(s1_m))},
             "K2": {"Executions": tuple(sorted(e2_m)), "States": tuple(sorted(s2_m))},
+        },
+        "outside_identities": {
+            "K1": {
+                "Executions": tuple(sorted(e1 - d_e)),
+                "States": tuple(sorted(s1 - d_s)),
+            },
+            "K2": {
+                "Executions": tuple(sorted(e2 - r_e)),
+                "States": tuple(sorted(s2 - r_s)),
+            },
         },
         "mapped_identities_absent": {
             "K1": {"Executions": tuple(sorted(d_e - e1)), "States": tuple(sorted(d_s - s1))},
@@ -520,7 +542,7 @@ def comparator(source, target, *, execution_map, state_map):
             "K2": {"I": _ordered(i2_out), "O": _ordered(o2_out)},
         },
         "conformant": conformant,
-        "carrier_coverage": {"K1": k1_covered, "K2": k2_covered},
-        "whole_kernel_equal": conformant and k1_covered and k2_covered,
+        "identity_coverage": {"K1": k1_covered, "K2": k2_covered},
+        "complete_agreement": conformant and k1_covered and k2_covered,
     })
     return TIDEComparatorReport(base)

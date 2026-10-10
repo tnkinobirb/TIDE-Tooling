@@ -4,6 +4,7 @@ from tide_tooling.tooling_core.engine.tide_logging import (
     AffectedStackLink,
     DependencyUseRecord,
     EffectRecord,
+    EmittedNodeRecord,
     ExecRecord,
     ExpandedDepRecord,
     InputUseRecord,
@@ -40,7 +41,7 @@ def make_exec(seq_id: int, name: str, deps=None, writes=None, effects=None, inpu
         func_name=name,
         inputs=inputs or {},
         deps=deps or [],
-        effects=effects or {},
+        effects=effects or [],
         declared_effects=[],
         declared_targets=[],
         runtime_effects=[],
@@ -55,6 +56,52 @@ def make_exec(seq_id: int, name: str, deps=None, writes=None, effects=None, inpu
         node_options={},
         writes=writes or [],
     )
+
+
+def test_emission_path_exists_without_an_emitted_execution():
+    emitted = EmittedNodeRecord(
+        ocean_id=0,
+        runner_id="tests",
+        pipeline_id="tests",
+        node_id="child-node",
+        func=lambda: None,
+        func_name="Child",
+        inputs={},
+        deps=[],
+        declared_targets=[],
+        declared_effects=[],
+        origin="runtime",
+        content_id=b"child-content",
+        base_node="child-base",
+        base_node_content_id=b"child-base-content",
+    )
+    emitter = make_exec(0, "Emitter")
+    emitter.emitted_nodes = [emitted]
+
+    trace = Trace(
+        event_log=None,
+        exec_log=[emitter],
+        runner="tests",
+        ocean_id=0,
+    )
+
+    assert trace.inspect(
+        emitted.producer_id,
+        "actor",
+        grouped=False,
+    ).exists
+    path = trace.path(
+        emitter.producer_id,
+        emitted.producer_id,
+        "actor",
+        "actor",
+        group=False,
+    )
+
+    assert path.exists()
+    rendered = path.show(color=False, explore_tool_tips=False)
+    assert "Child" in rendered
+    assert "emitted by" in rendered
 
 
 def create_dynamic_trace() -> Trace:
@@ -190,13 +237,14 @@ def create_effect_trace() -> Trace:
     effect = EffectRecord(
         Effects.WRITE,
         ("global:@A", 0),
-        preserved_output="!A",
+        origin="declared",
+        output="!A",
     )
 
     effect_producer = make_exec(
         2,
         "EffectProducer",
-        effects={(Effects.WRITE, ("global:@A", 0)): effect},
+        effects=[effect],
     )
 
     return Trace(
@@ -412,7 +460,7 @@ def test_trace_index_effect_truth_and_affected_link_are_consistent():
     assert edge.produced_ref == "global:@A"
     assert edge.produced_ver == 0
     assert edge.cause_effect == Effects.WRITE
-    assert [name for name, _ in edge.consumer_inputs] == ["payload"]
+    assert edge.consumer_inputs == [{"name": "payload", "index": None}]
     assert edge in index.consumer_exec_id_to_producer_input_edges[affected_exec_id]
 
 

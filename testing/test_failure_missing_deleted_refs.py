@@ -149,7 +149,7 @@ def test_raise_dispatches_effects_and_returns_fallback_without_stopping():
     ]
     assert {
         effect_record.effect
-        for effect_record in handled_record.effects.values()
+        for effect_record in handled_record.effects
     } == {"write", "DELETE"}
 
     imported = TIDE.from_bundle(trace.to_bundle().to_dict())
@@ -570,13 +570,6 @@ def test_exec_deleted_after_dynamic_concretisation_before_resolution_does_not_ex
     assert not trace.find("consume_dynamic").exists("actor")[0]
     assert trace.find("global:@out").exists("reference") == (False, False)
 
-# @pytest.mark.xfail(
-#     reason=(
-#         "Desired future contract: missing static refs should expose a structured "
-#         "failure/fallback event in trace/stream, not only a Python exception."
-#     ),
-#     strict=False,
-# )
 def test_exec_missing_static_ref_records_failure_or_fallback_event():
     def UseMissing(value):
         return value
@@ -586,26 +579,6 @@ def test_exec_missing_static_ref_records_failure_or_fallback_event():
     with pytest.raises(NoExecRecordError):
         tide.exec(UseMissing, args=["@@missing"], writes=["@out"])
 
-    # trace = tide.trace()
-    # assert trace.events
-    
-    # event_names = [
-    #     event["event_type"]
-    #     for event in trace.events
-    # ]
-    # print(event_names)
-
-    # assert LogEvents.MISSING_REFS in event_names
-
-
-# @pytest.mark.xfail(
-#     reason=(
-#         "Desired future contract: inspect missing exact reference returns a "
-#         "structured nonexistent inspected object instead of raising or behaving "
-#         "like a normal ref."
-#     ),
-#     strict=False,
-# )
 def test_inspect_missing_ref_returns_structured_nonexistent_object():
     tide = TIDE()
 
@@ -619,13 +592,6 @@ def test_inspect_missing_ref_returns_structured_nonexistent_object():
     assert inspected.id == "global:@missing"
 
 
-# @pytest.mark.xfail(
-#     reason=(
-#         "Desired future contract: path(missing_ref, actor) should return a "
-#         "Pathed no-path object rather than requiring caller-side None checks."
-#     ),
-#     strict=False,
-# )
 def test_path_from_structured_missing_ref_to_actor_returns_no_path():
     tide = TIDE()
 

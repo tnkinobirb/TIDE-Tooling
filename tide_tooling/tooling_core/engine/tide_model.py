@@ -17,7 +17,7 @@ from tide_tooling.tooling_core.engine.tide_query_results import TIDEModelCompare
 
 def _is_tide_model_operand(value):
     if isinstance(value, dict):
-        return all(field in value for field in ("I", "O"))
+        return all(field in value for field in ("E", "S", "I", "O"))
 
     return hasattr(value, "to_model") and callable(value.to_model)
 
@@ -26,7 +26,7 @@ def _tide_model_document(value, identity_mode="host"):
     if isinstance(value, dict):
         if not _is_tide_model_operand(value):
             raise TypeError(
-                "A TIDE Model diff dict must contain I and O"
+                "A TIDE Model diff dict must contain E, S, I and O"
             )
         document = copy.deepcopy(value)
         if identity_mode == "structural":
@@ -135,14 +135,8 @@ def _canonical_tide_structure(
     """
     inputs = _tide_incidence_set(model["I"])
     outputs = _tide_incidence_set(model["O"])
-    executions = list(_sorted_tide_items({
-        exec_id
-        for exec_id, _ in inputs | outputs
-    }))
-    states = list(_sorted_tide_items({
-        state_id
-        for _, state_id in inputs | outputs
-    }))
+    executions = list(_sorted_tide_items(set(model["E"])))
+    states = list(_sorted_tide_items(set(model["S"])))
     exec_nodes = [("E", index) for index in range(len(executions))]
     state_nodes = [("S", index) for index in range(len(states))]
     nodes = exec_nodes + state_nodes
@@ -465,6 +459,14 @@ def _canonical_tide_structure(
         "schema": "TIDE-Model",
         "schema_version": 1,
         "host": model.get("host", "TIDE"),
+        "E": [
+            exec_alias[node]
+            for node in best["exec_order"]
+        ],
+        "S": [
+            state_alias[node]
+            for node in best["state_order"]
+        ],
         "I": [
             _tide_incidence_entry(
                 exec_id,
@@ -509,26 +511,15 @@ def _build_tide_model_compared(
     before_report = TIDE.validate_model(before)
     after_report = TIDE.validate_model(after)
 
-    invalid = []
-    if not before_report["conforms"]:
-        invalid.append(
-            "before: " + "; ".join(before_report["errors"])
-        )
-    if not after_report["conforms"]:
-        invalid.append(
-            "after: " + "; ".join(after_report["errors"])
-        )
-    if invalid:
-        raise ValueError(
-            "TIDE Model diff requires conforming models: "
-            + " | ".join(invalid)
-        )
-
     before_kernel = {
+        "E": set(before["E"]),
+        "S": set(before["S"]),
         "I": _tide_incidence_set(before["I"]),
         "O": _tide_incidence_set(before["O"]),
     }
     after_kernel = {
+        "E": set(after["E"]),
+        "S": set(after["S"]),
         "I": _tide_incidence_set(after["I"]),
         "O": _tide_incidence_set(after["O"]),
     }
@@ -543,7 +534,7 @@ def _build_tide_model_compared(
                 before_kernel[field] - after_kernel[field]
             ),
         }
-        for field in ("I", "O")
+        for field in ("E", "S", "I", "O")
     }
 
     before_handoffs = set(before_report.direct_handoffs)

@@ -1085,7 +1085,7 @@ def test_reference_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="wrote global:@B[v1]",
             )
         ],
@@ -1334,7 +1334,7 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="written as global:@B[v0]",
             )
         ],
@@ -1387,7 +1387,7 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="written as global:@B[v0]",
             )
         ],
@@ -1440,12 +1440,12 @@ def test_value_source_paths(path_context):
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver, producer)
+                expected_type=str,
                 string_match="written as global:@B[v0]",
             ),
             ExpectedHop(
                 pos=(1, 0, 0),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver, producer)
+                expected_type=str,
                 string_match="written as global:@B[v1]",
             ),
         ],
@@ -1454,14 +1454,6 @@ def test_value_source_paths(path_context):
         expected_path_counts=[1, 1],
         expected_hop_counts=[[1], [1]],
     )
-
-    # --------------------------------------- #
-    # VALUE -> VALUE
-    # N/A / DEFINE SELF-PATH SEMANTICS LATER
-    # --------------------------------------- #
-
-    # TODO: Decide whether this should be direct, expanded through appearances,
-    # or intentionally unsupported.
 
     # ================================================================ #
 
@@ -1507,7 +1499,7 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=StackLink,
                 assert_attrs=[
                     ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Seed")), # is ocean two as is a new instance of TIDE()
                     ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
@@ -1517,7 +1509,7 @@ def test_repeated_actor_paths():
             ),
             ExpectedHop(
                 pos=(0, 0, 1),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="read global:@x[v0] from Seed",
             )
         ],
@@ -1534,7 +1526,7 @@ def test_repeated_actor_paths():
         [
             ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=StackLink,
                 assert_attrs=[
                     ("producer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "Update")), # is ocean two as is a new instance of TIDE()
                     ("consumer_actor", Actor(repeated_trace.ocean_id, "TIDE: .event()", "repeated_actor")),
@@ -1544,7 +1536,7 @@ def test_repeated_actor_paths():
             ), 
             ExpectedHop(
                 pos=(0, 0, 1),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="read global:@x[v1] from Update",
             ), 
         ],
@@ -1758,7 +1750,7 @@ def test_branching_paths():
         direct_diamond_path,
         [   ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=StackLink,
                 assert_attrs=[
                     ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
                     ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
@@ -1768,7 +1760,7 @@ def test_branching_paths():
             ), 
             ExpectedHop(
                 pos=(0, 0, 1),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="read global:@A[v0] from A",
             ), 
         ],
@@ -1785,7 +1777,7 @@ def test_branching_paths():
         deep_diamond_path,
         [   ExpectedHop(
                 pos=(0, 0, 0),
-                expected_type=StackLink, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=StackLink,
                 assert_attrs=[
                     ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
                     ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "B")),
@@ -1795,7 +1787,7 @@ def test_branching_paths():
             ), 
             ExpectedHop(
                 pos=(0, 0, 1),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="read global:@A[v0] from A",
             ), 
             ExpectedHop(
@@ -1816,7 +1808,7 @@ def test_branching_paths():
 
             ExpectedHop(
                 pos=(0, 1, 0),
-                expected_type=StackLink, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=StackLink,
                 assert_attrs=[
                     ("producer_actor", Actor(branch_ocean_id, "TIDE: .event()", "A")), # is ocean two as is a new instance of TIDE()
                     ("consumer_actor", Actor(branch_ocean_id, "TIDE: .event()", "C")),
@@ -1826,7 +1818,7 @@ def test_branching_paths():
             ), 
             ExpectedHop(
                 pos=(0, 1, 1),
-                expected_type=str, # TODO: Change str into ReadWriteLink(type='read'|'write', ref, ver , producer) 
+                expected_type=str,
                 string_match="read global:@A[v0] from A",
             ), 
 
@@ -2757,3 +2749,77 @@ def test_nested_node_path_uses_producer_name_instead_of_internal_node_id():
     assert stack_links[0].producer_actor.source_actor == "create_data"
     assert "read __tide___0:@tmp_node_link.create_data[v0] from create_data" in output
     assert re.search(r" from \d+(?:\n|$)", output) is None
+
+
+def test_path_handles_chain_beyond_python_recursion_limit():
+    tide = TIDE()
+    chain_length = 1050
+
+    tide.event("node_0", writes={"state_0": 0})
+    for index in range(1, chain_length):
+        tide.event(
+            f"node_{index}",
+            reads={f"state_{index - 1}": index - 1},
+            writes={f"state_{index}": index},
+        )
+
+    trace = tide.trace()
+    pathed = trace.path(
+        "node_0",
+        f"node_{chain_length - 1}",
+        "actor",
+        "actor",
+    )
+
+    assert pathed.exists()
+    assert pathed.count() == 1
+    assert len(path_edges(pathed)) == chain_length - 1
+
+
+def test_path_reports_a_closing_cycle_without_expanding_it_forever():
+    tide = TIDE()
+    tide.event("A", writes={"state_a": "a"})
+    tide.event("B", reads={"state_a": "a"}, writes={"state_b": "b"})
+    trace = tide.trace()
+
+    source_exec = trace.exec_log[0]
+    target_exec = trace.exec_log[1]
+    closing_edge = StackLink({
+        "affected_input": ("cycle",),
+        "affected_input_index": 0,
+        "affected_actor": source_exec.producer_id,
+        "affected_exec_id": source_exec.exec_id,
+        "producer_actor": target_exec.producer_id,
+        "producer_exec_id": target_exec.exec_id,
+        "produced_ref": "global:state_b",
+        "produced_ref_version": 0,
+    })
+    trace.index.producer_exec_id_to_consumer_input_edges[
+        target_exec.exec_id
+    ].append(closing_edge)
+    trace.index.consumer_exec_id_to_producer_input_edges[
+        source_exec.exec_id
+    ].append(closing_edge)
+
+    pathed = trace.path(
+        source_exec.exec_id,
+        source_exec.exec_id,
+        "exec_record",
+        "exec_record",
+    )
+    edge_paths = [
+        [edge for edge in path if isinstance(edge, StackLink)]
+        for paths in pathed.paths.values()
+        for path in paths
+    ]
+
+    assert any(
+        [
+            (edge.producer_exec_id, edge.consumer_exec_id)
+            for edge in path
+        ] == [
+            (source_exec.exec_id, target_exec.exec_id),
+            (target_exec.exec_id, source_exec.exec_id),
+        ]
+        for path in edge_paths
+    )

@@ -148,7 +148,7 @@ def test_read_effect_returns_value_and_records_runtime_evidence(capsys):
 
     output = tide.exec(copy_source, writes="copied")
     trace = tide.trace()
-    effects = list(trace.exec_log[-1].effects.values())
+    effects = trace.exec_log[-1].effects
 
     assert output == 41
     assert trace.value_of("global:copied", 0) == 41
@@ -212,7 +212,7 @@ def test_read_effect_requeues_explicit_process_execution_to_thread_pool():
     assert record.status == "succeeded"
     assert trace.value_of("global:copied", 0) == 41
     assert record.deps[-1].unscoped_reference == "global:source"
-    assert next(iter(record.effects.values())).effect == Effects.READ
+    assert record.effects[0].effect == Effects.READ
 
 
 def test_read_effect_uses_template_fallback_and_still_records_attempt():
@@ -225,7 +225,7 @@ def test_read_effect_uses_template_fallback_and_still_records_attempt():
     tide = TIDE()
     output = tide.exec(read_missing, writes="fallback")
     trace = tide.trace()
-    effect = next(iter(trace.exec_log[-1].effects.values()))
+    effect = trace.exec_log[-1].effects[0]
 
     assert isinstance(output, __TIDE_TEMPLATE_VALUE__)
     assert isinstance(
@@ -567,7 +567,7 @@ def test_single_decorator_effect_is_inherited_by_tide_exec():
     assert output == 5
     assert trace.value_of("global:effect_output", 0) == 7
     assert record.declared_effects[0].targets[0].key == "effect_output"
-    assert next(iter(record.effects.values())).effect == Effects.WRITE
+    assert record.effects[0].effect == Effects.WRITE
 
 
 def test_tide_exec_accepts_an_explicit_effect():
@@ -589,7 +589,7 @@ def test_tide_exec_accepts_an_explicit_effect():
     trace = tide.trace()
     producer_record = trace.exec_log[0]
     consumer_record = trace.exec_log[1]
-    effect_record = next(iter(producer_record.effects.values()))
+    effect_record = producer_record.effects[0]
 
     assert output == "ordinary output"
     assert trace.value_of("global:effect_output", 0) == 11
@@ -649,14 +649,14 @@ def test_tide_event_accepts_and_applies_reference_effects():
 
     assert write_trace.value_of("global:event_effect", 0) == 13
     assert write_record.declared_effects[0].preserve_output == 13
-    assert next(iter(write_record.effects.values())).effect == Effects.WRITE
+    assert write_record.effects[0].effect == Effects.WRITE
 
     tide.event("effect deleter", effects=DELETE("global:event_effect"))
     delete_trace = tide.trace()
     delete_record = delete_trace.exec_log[-1]
 
     assert not tide.ocean.store_router.exists("global", "event_effect")
-    assert next(iter(delete_record.effects.values())).effect == Effects.DELETE
+    assert delete_record.effects[0].effect == Effects.DELETE
 
 
 def test_effect_lists_support_investigate_path_and_diff(capsys):

@@ -17,8 +17,8 @@ def main():
 
     trace.produced_by("load", "actor").show()
     trace.consumed_by("clean", "actor").show()
-    trace.upstream("load", "actor").show()
-    trace.downstream("clean", "actor").show()
+    trace.upstream("clean", "actor").show()
+    trace.downstream("load", "actor").show()
     trace.path(
         source="load",
         target="clean",
@@ -26,8 +26,8 @@ def main():
         target_type="actor",
     ).show()
     trace.path(
-        source="load",
-        target="clean",
+        source="clean",
+        target="load",
         source_type="actor",
         target_type="actor",
         direction="upstream",

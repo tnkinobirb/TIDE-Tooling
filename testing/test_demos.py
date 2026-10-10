@@ -28,6 +28,7 @@ DEMO_ORDER = (
     "readme/register_stores.py",
     "readme/exec_relationships.py",
     "effects/effects_demo.py",
+    "effects/emission_demo.py",
     "model/from_model.py",
     "pipeline/functions.py",
     "pipeline/data_pipeline.py",

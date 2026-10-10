@@ -39,7 +39,7 @@ def make_exec(seq_id, name, deps=None, writes=None):
         func_name=name,
         inputs={},
         deps=deps or [],
-        effects={},
+        effects=[],
         declared_effects=[],
         declared_targets=[],
         runtime_effects=[],
@@ -1228,4 +1228,3 @@ def test_dynamic_runtime_expanded_records_link_back_to_declared_dynamic_dep(dyna
 
     for expanded in dynamic.expanded_to:
         assert expanded_from_of(expanded) == dynamic.dep
-

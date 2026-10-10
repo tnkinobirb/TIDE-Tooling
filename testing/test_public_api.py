@@ -482,8 +482,8 @@ def test_from_model_structural_identity_is_explicit_and_reversible():
         "exec_0",
         "exec_1",
     ]
-    assert "E" not in literal.to_model()
-    assert "S" not in literal.to_model()
+    assert set(literal.to_model()["E"]) == set(model["E"])
+    assert set(literal.to_model()["S"]) == set(model["S"])
     assert structural.to_model() == structural.to_model(
         identity_mode="structural",
     )
@@ -578,7 +578,7 @@ def test_trace_show_structural_reuses_trace_layout_with_canonical_identities():
 
 
 def test_trace_show_structural_requires_bool():
-    trace = TIDE.from_model({"I": [], "O": []})
+    trace = TIDE.from_model({"E": [], "S": [], "I": [], "O": []})
 
     with pytest.raises(TypeError, match="show structural must be a bool"):
         trace.show(structural="yes")
@@ -692,6 +692,8 @@ def test_from_model_display_uses_seq_locator_and_supplied_actor_name():
 def test_from_model_without_actor_shortens_only_the_displayed_id_fallback():
     exec_id = "018f0f00-0000-7000-8000-000000000001"
     trace = TIDE.from_model({
+        "E": [exec_id],
+        "S": ["ready"],
         "I": [],
         "O": [[exec_id, "ready"]],
     })
@@ -709,6 +711,8 @@ def test_from_model_without_actor_shortens_only_the_displayed_id_fallback():
 def test_from_model_shortens_only_a_long_actor_display_name():
     actor = "actor-with-a-very-long-host-supplied-display-name"
     trace = TIDE.from_model({
+        "E": ["host-execution-id"],
+        "S": ["ready"],
         "I": [],
         "O": [["host-execution-id", "ready"]],
         "executions": {
@@ -728,7 +732,7 @@ def test_from_model_rejects_unknown_identity_mode():
         match="identity_mode must be 'host' or 'structural'",
     ):
         TIDE.from_model(
-            {"I": [], "O": []},
+            {"E": [], "S": [], "I": [], "O": []},
             identity_mode="invented",
         )
 
@@ -743,6 +747,8 @@ def test_from_model_attaches_schema_host_and_host_record_to_trace_and_model(
     model = {
         "host": "Example",
         "host_record": host_record,
+        "E": ["exec"],
+        "S": ["state"],
         "I": [],
         "O": [["exec", "state"]],
     }
@@ -770,6 +776,8 @@ def test_model_host_record_survives_bundle_round_trip():
             "kind": "native-event",
             "payload": [1, {"two": 2}],
         },
+        "E": ["exec"],
+        "S": ["state"],
         "I": [],
         "O": [["exec", "state"]],
     }
@@ -809,7 +817,7 @@ def test_model_host_record_requires_a_json_compatible_dict(
 
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is False
+    assert report["semantically_valid"] is False
     assert any(message in error for error in report["errors"])
     with pytest.raises(ValueError, match=message):
         TIDE.from_model(model)
@@ -831,6 +839,8 @@ def test_trace_host_record_rejects_recursive_json_containers():
 
 def test_trace_without_schema_host_record_defaults_to_none():
     trace = TIDE.from_model({
+        "E": [],
+        "S": [],
         "I": [],
         "O": [],
     })
@@ -876,7 +886,7 @@ def test_model_incidence_accepts_explicit_compact_and_pair_forms(
     report = TIDE.validate_model(model)
     trace = TIDE.from_model(model)
 
-    assert report["conforms"] is True
+    assert report["semantically_valid"] is True
     assert set(report.direct_handoffs) == {
         ("produce", "shared", "consume"),
     }
@@ -922,7 +932,7 @@ def test_to_model_emits_each_supported_incidence_format(
 
     assert exported["I"] == [input_edge]
     assert exported["O"] == [output_edge]
-    assert TIDE.validate_model(exported)["conforms"] is True
+    assert TIDE.validate_model(exported)["semantically_valid"] is True
 
 
 def test_tide_to_model_forwards_compact_incidence_format():
@@ -942,7 +952,7 @@ def test_tide_to_model_forwards_compact_incidence_format():
         exported["I"][0]["e"],
         exported["O"][0]["e"],
     }
-    assert TIDE.validate_model(exported)["conforms"] is True
+    assert TIDE.validate_model(exported)["semantically_valid"] is True
 
 
 @pytest.mark.parametrize(
@@ -967,7 +977,7 @@ def test_model_incidence_rejects_mixed_compact_and_explicit_keys(edge):
 
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is False
+    assert report["semantically_valid"] is False
     assert any("cannot mix compact" in error for error in report["errors"])
     with pytest.raises(ValueError, match="cannot mix compact"):
         TIDE.from_model(model)
@@ -976,6 +986,8 @@ def test_model_incidence_rejects_mixed_compact_and_explicit_keys(edge):
 @pytest.mark.parametrize("incidence_format", [None, "tuple", "short"])
 def test_to_model_rejects_unknown_incidence_format(incidence_format):
     trace = TIDE.from_model({
+        "E": [],
+        "S": [],
         "I": [],
         "O": [],
     })
@@ -1045,8 +1057,8 @@ def test_from_model_preserves_explicit_unknown_producer():
         include_hashes=False,
     )
     assert exported["host"] == model["host"]
-    assert "E" not in exported
-    assert "S" not in exported
+    assert set(exported["E"]) == set(model["E"])
+    assert set(exported["S"]) == set(model["S"])
     assert exported["I"] == [
         {"exec_id": "exec0", "state_id": "state0"},
     ]
@@ -1142,8 +1154,8 @@ def test_from_model_every_state_reference_has_a_tool_producer():
             ) in trace.index.ref_version_to_producer_exec_id
 
     exported = trace.to_model()
-    assert "E" not in exported
-    assert "S" not in exported
+    assert set(exported["E"]) == set(model["E"])
+    assert set(exported["S"]) == set(model["S"])
     assert exported["I"] == [
         {"exec_id": "exec0", "state_id": "boundary"},
     ]
@@ -1191,15 +1203,15 @@ def test_from_model_preserves_literal_host_state_ids_through_bundle():
     assert _model_carriers(restored.to_model())[1] == set(model["S"])
 
 
-def test_from_model_rejects_state_ids_that_collapse_to_one_trace_reference():
+def test_from_model_rejects_non_string_occurrence_ids():
     model = {
         "E": ["unknown"],
-        "S": [1, "1"],
+        "S": [1],
         "I": [],
-        "O": [["unknown", 1], ["unknown", "1"]],
+        "O": [["unknown", 1]],
     }
 
-    with pytest.raises(ValueError, match="project to the same Trace reference"):
+    with pytest.raises(ValueError, match="must be a non-empty string"):
         TIDE.from_model(model)
 
 
@@ -1212,11 +1224,11 @@ def test_from_model_preserves_optional_metadata_values_and_hashes():
         "schema_version": 1,
         "host": "OPM",
         "E": ["E1", "E2"],
-        "S": ["raw-state", 7],
+        "S": ["raw-state", "7"],
         "I": [{"exec_id": "E2", "state_id": "raw-state"}],
         "O": [
             {"exec_id": "E1", "state_id": "raw-state"},
-            {"exec_id": "E2", "state_id": 7},
+            {"exec_id": "E2", "state_id": "7"},
         ],
         "executions": {
             "E1": {
@@ -1236,7 +1248,7 @@ def test_from_model_preserves_optional_metadata_values_and_hashes():
                 "value": raw_value,
                 "value_hash": raw_hash,
             },
-            7: {
+            "7": {
                 "value_hash": result_hash,
             },
         },
@@ -1259,7 +1271,7 @@ def test_from_model_preserves_optional_metadata_values_and_hashes():
 
     exported = trace.to_model(include_values=True, include_metadata=True)
     assert exported["host"] == "OPM"
-    assert _model_carriers(exported)[1] == {"raw-state", 7}
+    assert _model_carriers(exported)[1] == {"raw-state", "7"}
     assert exported["states"]["raw-state"]["value"] == raw_value
     assert exported["executions"]["E1"]["actor"]["name"] == "load"
 
@@ -1278,8 +1290,8 @@ def test_minimal_model_round_trip_does_not_fabricate_enrichment():
         include_hashes=True,
     )
 
-    assert "E" not in exported
-    assert "S" not in exported
+    assert set(exported["E"]) == set(model["E"])
+    assert set(exported["S"]) == set(model["S"])
     assert "executions" not in exported
     assert "states" not in exported
 
@@ -1306,7 +1318,7 @@ def test_model_enrichment_must_annotate_declared_ids(
 
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is False
+    assert report["semantically_valid"] is False
     assert any(message in error for error in report["errors"])
     with pytest.raises(ValueError, match=message):
         TIDE.from_model(model)
@@ -1315,10 +1327,10 @@ def test_model_enrichment_must_annotate_declared_ids(
 def test_model_ids_survive_bundle_round_trip_without_exposing_trace_refs():
     model = {
         "host": "MLMD",
-        "E": [1, "1"],
-        "S": ["artifact-A", 99],
-        "I": [["1", "artifact-A"]],
-        "O": [[1, "artifact-A"], ["1", 99]],
+        "E": ["1", "2"],
+        "S": ["artifact-A", "99"],
+        "I": [["2", "artifact-A"]],
+        "O": [["1", "artifact-A"], ["2", "99"]],
     }
 
     restored = TIDE.from_bundle(TIDE.from_model(model).to_bundle())
@@ -1330,10 +1342,9 @@ def test_model_ids_survive_bundle_round_trip_without_exposing_trace_refs():
     ]
 
     assert exported["host"] == "MLMD"
-    assert _model_carriers(exported)[0] == {1, "1"}
-    assert [record.exec_id for record in imported_records] == [1, "1"]
-    assert [type(record.exec_id) for record in imported_records] == [int, str]
-    assert _model_carriers(exported)[1] == {"artifact-A", 99}
+    assert _model_carriers(exported)[0] == {"1", "2"}
+    assert [record.exec_id for record in imported_records] == ["1", "2"]
+    assert _model_carriers(exported)[1] == {"artifact-A", "99"}
     assert all(
         "__model__" not in repr(section)
         for section in (
@@ -1343,7 +1354,7 @@ def test_model_ids_survive_bundle_round_trip_without_exposing_trace_refs():
     )
 
 
-def test_validate_model_reports_projection_relative_conformance():
+def test_validate_model_reports_semantic_validity_and_judgments():
     model = {
         "E": ["produce", "consume"],
         "S": ["state"],
@@ -1353,7 +1364,7 @@ def test_validate_model_reports_projection_relative_conformance():
 
     report = TIDE.validate_model(model, host="OPM")
 
-    assert report["conforms"] is True
+    assert report["semantically_valid"] is True
     assert report["host"] == "OPM"
     assert all(report["checks"].values())
     assert report["counts"]["direct_handoffs"] == 1
@@ -1415,7 +1426,7 @@ def test_validate_model_reports_projection_relative_conformance():
 def test_tide_model_explicit_validity_cases_pass(case, model):
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is True, case
+    assert report["semantically_valid"] is True, case
     assert report["errors"] == []
     assert all(report["checks"].values())
     assert isinstance(TIDE.from_model(model), Trace)
@@ -1432,7 +1443,7 @@ def test_tide_model_explicit_validity_cases_pass(case, model):
                 "I": [["consumer", "boundary"]],
                 "O": [],
             },
-            "every_state_has_producer",
+            "unique_creation",
         ),
         (
             "two distinct creators for one State",
@@ -1452,7 +1463,7 @@ def test_tide_model_explicit_validity_cases_pass(case, model):
                 "I": [["self", "loop"]],
                 "O": [["self", "loop"]],
             },
-            "acyclic_occurrence_ancestry",
+            "acyclic_ancestry",
         ),
         (
             "multi-Execution cycle",
@@ -1470,7 +1481,7 @@ def test_tide_model_explicit_validity_cases_pass(case, model):
                     ["e3", "s31"],
                 ],
             },
-            "acyclic_occurrence_ancestry",
+            "acyclic_ancestry",
         ),
         (
             "read-modify-write with one State identity",
@@ -1480,7 +1491,7 @@ def test_tide_model_explicit_validity_cases_pass(case, model):
                 "I": [["update", "same-state"]],
                 "O": [["update", "same-state"]],
             },
-            "acyclic_occurrence_ancestry",
+            "acyclic_ancestry",
         ),
     ],
 )
@@ -1491,7 +1502,7 @@ def test_tide_model_explicit_invalidity_cases_fail(
 ):
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is False, case
+    assert report["semantically_valid"] is False, case
     assert any(message in error for error in report["errors"])
     with pytest.raises(ValueError, match=message):
         TIDE.from_model(model)
@@ -1622,7 +1633,7 @@ def test_tide_and_trace_to_model_export_native_execution_evidence():
     from_trace = tide.trace().to_model(include_values=True)
 
     assert from_instance == from_trace
-    assert TIDE.validate_model(from_instance)["conforms"] is True
+    assert TIDE.validate_model(from_instance)["semantically_valid"] is True
     assert _model_carriers(from_instance)[1] == {"state_0", "state_1"}
     assert from_instance["states"]["state_0"]["value"] == {"ok": True}
     assert from_instance["I"][0]["state_id"] == "state_0"
@@ -1670,8 +1681,8 @@ def test_to_model_collapses_external_observations_to_unknown_producer():
         for edge in exported["I"]
     }
     assert unknown_outputs == consumed_states
-    assert report["conforms"] is True
-    assert report["checks"]["every_state_has_producer"] is True
+    assert report["semantically_valid"] is True
+    assert report["checks"]["unique_creation"] is True
 
 
 def test_model_rejects_state_without_represented_producer():
@@ -1684,15 +1695,50 @@ def test_model_rejects_state_without_represented_producer():
 
     report = TIDE.validate_model(model)
 
-    assert report["conforms"] is False
-    assert report["checks"]["unique_creation"] is True
-    assert report["checks"]["every_state_has_producer"] is False
+    assert report["semantically_valid"] is False
+    assert report["checks"]["unique_creation"] is False
     assert any(
         "has no represented producer in O" in error
         for error in report["errors"]
     )
-    with pytest.raises(ValueError, match="every_state_has_producer"):
+    with pytest.raises(ValueError, match="unique_creation"):
         TIDE.from_model(model)
+
+
+def test_declared_execution_without_incidence_remains_represented():
+    model = {"E": ["idle"], "S": [], "I": [], "O": []}
+
+    report = TIDE.validate_model(model)
+    trace = TIDE.from_model(model)
+    exported = trace.to_model(include_hashes=False)
+
+    assert report["structurally_valid"] is True
+    assert report["semantically_valid"] is True
+    assert report["counts"]["executions"] == 1
+    assert [record.exec_id for record in trace.exec_log] == ["idle"]
+    assert exported["E"] == ["idle"]
+    assert exported["I"] == exported["O"] == []
+
+
+def test_semantic_invalidity_does_not_erase_determined_judgments():
+    model = {
+        "E": ["a", "b"],
+        "S": ["a-to-b", "b-to-a"],
+        "I": [["a", "b-to-a"], ["b", "a-to-b"]],
+        "O": [["a", "a-to-b"], ["b", "b-to-a"]],
+    }
+
+    report = TIDE.validate_model(model)
+
+    assert report["structurally_valid"] is True
+    assert report["semantically_valid"] is False
+    assert set(report.direct_handoffs) == {
+        ("a", "a-to-b", "b"),
+        ("b", "b-to-a", "a"),
+    }
+    assert set(report.reachability) == {
+        ("a", "a"), ("a", "b"), ("b", "a"), ("b", "b"),
+    }
 
 
 def test_from_model_assign_unknown_is_explicit_warned_and_not_host_evidence():
@@ -1734,8 +1780,8 @@ def test_from_model_assign_unknown_is_explicit_warned_and_not_host_evidence():
         "exec_id": "unknown",
         "state_id": "boundary",
     }]
-    assert TIDE.validate_model(model)["conforms"] is False
-    assert TIDE.validate_model(exported)["conforms"] is True
+    assert TIDE.validate_model(model)["semantically_valid"] is False
+    assert TIDE.validate_model(exported)["semantically_valid"] is True
 
     restored = TIDE.from_bundle(trace.to_bundle())
     assert restored.model_context["assigned_unknown_states"] == ["boundary"]
@@ -1744,7 +1790,7 @@ def test_from_model_assign_unknown_is_explicit_warned_and_not_host_evidence():
         restored.to_model(include_hashes=False)
 
 
-def test_model_relations_are_sets_and_compatibility_carriers_are_set_assertions():
+def test_model_carriers_and_relations_use_set_semantics():
     model = {
         "E": ["produce", "consume", "produce"],
         "S": ["shared", "shared"],
@@ -1761,7 +1807,7 @@ def test_model_relations_are_sets_and_compatibility_carriers_are_set_assertions(
     report = TIDE.validate_model(model)
     exported = TIDE.from_model(model).to_model(include_hashes=False)
 
-    assert report["conforms"] is True
+    assert report["semantically_valid"] is True
     assert report["counts"]["inputs"] == 1
     assert report["counts"]["outputs"] == 1
     assert exported["I"] == [{
@@ -1772,8 +1818,8 @@ def test_model_relations_are_sets_and_compatibility_carriers_are_set_assertions(
         "exec_id": "produce",
         "state_id": "shared",
     }]
-    assert "E" not in exported
-    assert "S" not in exported
+    assert set(exported["E"]) == {"produce", "consume"}
+    assert exported["S"] == ["shared"]
 
 
 @pytest.mark.parametrize("entrypoint", ["import", "export"])
@@ -1803,7 +1849,7 @@ def test_assign_unknown_requires_bool(entrypoint):
                 "I": [["missing", "state"]],
                 "O": [],
             },
-            "E compatibility carrier",
+            "references Execution",
         ),
         (
             {
@@ -1821,7 +1867,7 @@ def test_assign_unknown_requires_bool(entrypoint):
                 "I": [["a", "b-to-a"], ["b", "a-to-b"]],
                 "O": [["a", "a-to-b"], ["b", "b-to-a"]],
             },
-            "acyclic_occurrence_ancestry",
+            "acyclic_ancestry",
         ),
         (
             {
@@ -1842,7 +1888,7 @@ def test_assign_unknown_requires_bool(entrypoint):
 )
 def test_from_model_rejects_nonconforming_documents(model, message):
     report = TIDE.validate_model(model)
-    assert report["conforms"] is False
+    assert report["semantically_valid"] is False
     assert any(message in error for error in report["errors"])
 
     with pytest.raises(ValueError, match=message):

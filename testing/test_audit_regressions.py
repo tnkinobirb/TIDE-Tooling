@@ -79,7 +79,7 @@ def make_exec_record(*, exec_id, effects=None, writes=None):
         func_name="source",
         inputs={},
         deps=[],
-        effects=effects or {},
+        effects=effects or [],
         declared_effects=[],
         declared_targets=[],
         runtime_effects=[],
@@ -804,7 +804,7 @@ def test_capture_model_query_and_bundle_preserve_exact_relationships():
         for handoff in handoffs
     )
 
-    assert report["conforms"]
+    assert report["semantically_valid"]
     assert len(report.direct_handoffs) == 2
     assert projected.path(
         producer_id,
@@ -863,10 +863,10 @@ def test_blocked_missing_ref_builds_affected_record_before_attaching_it():
     cause = ("MissingRefFallback",)
     blocked_ref = DataRef(key="@A", store="global")
     versioned_blocker = ("global:@A", 0)
-    effect = EffectRecord(cause, versioned_blocker)
+    effect = EffectRecord(cause, versioned_blocker, origin="runtime")
     record = make_exec_record(
         exec_id="blocked-source",
-        effects={(cause, versioned_blocker): effect},
+        effects=[effect],
         writes=[WriteRecord("audit", "a", 0, "global:@A")],
     )
     events = [
@@ -900,4 +900,6 @@ def test_blocked_missing_ref_builds_affected_record_before_attaching_it():
         "blocked-node",
     )
     assert affected[0].targets == versioned_blocker
-    assert affected[0].affected_inputs == {"args": "input"}
+    assert affected[0].affected_inputs == [
+        {"name": "args", "index": None}
+    ]

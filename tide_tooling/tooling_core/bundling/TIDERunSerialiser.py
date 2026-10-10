@@ -22,7 +22,6 @@ class TIDERunSerialiser:
 
         return {
             "kind": "tide_run",
-            "codec_version": 2,
             "trace": self._trace_metadata(trace),
             "exec_records": [
                 self._serialise_exec_record(record)
@@ -108,9 +107,6 @@ class TIDERunSerialiser:
                 self._serialise_effect_descriptor(effect)
                 for effect in getattr(record, "runtime_effects", ()) or ()
             ],
-            "emitted_by": self._serialise_emitted_by(
-                getattr(record, "emitted_by", None)
-            ),
             "emitted_nodes": [
                 self._serialise_emitted_node(node)
                 for node in getattr(record, "emitted_nodes", ()) or ()
@@ -198,23 +194,29 @@ class TIDERunSerialiser:
                 }
             )
 
-        return {
-            "effect": self._effect_value(getattr(effect, "effect", None)),
+        output = getattr(effect, "output", None)
+        effect_value = self._effect_value(getattr(effect, "effect", None))
+        entry = {
+            "effect": effect_value,
             "reference": target_ref,
             "version": target_version,
-            "output_value_hash": self._value_hash(
-                getattr(effect, "output", None)
-            ) if not self._is_template(getattr(effect, "output", None)) else None,
-            "preserved_output_value_hash": self._value_hash(
-                getattr(effect, "preserved_output", None)
-            ) if not self._is_template(
-                getattr(effect, "preserved_output", None)
-            ) else None,
-            "preserved": not self._is_template(
-                getattr(effect, "preserved_output", None)
+            "output_value_hash": (
+                self._value_hash(output)
+                if not self._is_template(output)
+                else None
             ),
+            "output_value_available": not self._is_template(output),
+            "origin": getattr(effect, "origin", None),
             "affected": affected,
         }
+        if effect_value in {"read", "DELETE"}:
+            target_existed = getattr(effect, "target_existed", None)
+            if target_existed is None:
+                raise ValueError(
+                    f"{effect_value} effect is missing target existence evidence"
+                )
+            entry["target_existed"] = bool(target_existed)
+        return entry
 
     def _serialise_effect_descriptor(self, effect):
         if isinstance(effect, type):
@@ -280,6 +282,7 @@ class TIDERunSerialiser:
             "pipeline_id": getattr(node, "pipeline_id", None),
             "node_id": getattr(node, "node_id", None),
             "func_name": getattr(node, "func_name", None),
+            "origin": getattr(node, "origin", None),
             "content_id": self._content_id_value(
                 getattr(node, "content_id", None)
             ),
@@ -301,18 +304,6 @@ class TIDERunSerialiser:
             "base_node_content_id": self._content_id_value(
                 getattr(node, "base_node_content_id", None)
             ),
-            "emitted_by": self._serialise_emitted_by(
-                getattr(node, "emitted_by", None)
-            ),
-        }
-
-    def _serialise_emitted_by(self, emitted_by):
-        if not isinstance(emitted_by, (list, tuple)) or len(emitted_by) != 2:
-            return None
-
-        return {
-            "actor": self._actor_value(emitted_by[0]),
-            "exec_id": emitted_by[1],
         }
 
     @staticmethod
@@ -400,10 +391,11 @@ class TIDERunSerialiser:
 
     @staticmethod
     def _effect_values(effects):
-        if hasattr(effects, "values"):
-            return effects.values()
-
-        return effects or ()
+        if effects is None:
+            return ()
+        if not isinstance(effects, (list, tuple)):
+            raise TypeError("ExecRecord.effects must be an ordered list")
+        return effects
 
     @staticmethod
     def _effect_target(targets):
@@ -418,17 +410,7 @@ class TIDERunSerialiser:
 
     @staticmethod
     def _affected_inputs(record):
-        inputs = getattr(record, "affected_inputs", None)
-
-        if isinstance(inputs, dict):
-            return list(inputs)
-
-        return [
-            input_value[0]
-            if isinstance(input_value, tuple) and input_value
-            else str(input_value)
-            for input_value in inputs or ()
-        ]
+        return [dict(item) for item in record.affected_inputs or ()]
 
     def _value_hash(self, value):
         if self._is_template(value):

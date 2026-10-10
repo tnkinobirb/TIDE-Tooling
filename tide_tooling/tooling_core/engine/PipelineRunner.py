@@ -272,6 +272,40 @@ class PipelineRunner:
 
         return found
 
+    def _emit_delete_occurrence(
+        self,
+        node,
+        exec_id,
+        target,
+        output,
+        origin,
+    ):
+        """Record one DELETE in order, then route its atomic mutation."""
+        metadata = {"origin": origin}
+        source = f"{node.func.__name__}[{node.id}]"
+        self.event_emitter(Event(
+            source="runner",
+            source_id=self.id,
+            event_type=LogEvents.EFFECT,
+            payload=(Effects.DELETE, exec_id, [target], output, metadata),
+            exec_id=exec_id,
+        ))
+        self.event_emitter(Event(
+            source="store_router",
+            source_id=self.id,
+            target_runner_id=self.id,
+            event_type=RouterEvents.DELETE,
+            payload=(
+                target.store,
+                target.key,
+                source,
+                Effects.DELETE,
+                output,
+                metadata,
+            ),
+            exec_id=exec_id,
+        ))
+
     def _emit_in_function_effects(self, node, exec_id, effects):
         for effect in effects or ():
             if not isinstance(effect, dict):
@@ -302,6 +336,7 @@ class PipelineRunner:
                     {
                         "found": effect.get("found", False),
                         "immediate": effect_kind == Effects.DELETE,
+                        "origin": "runtime",
                     },
                 ),
                 exec_id=exec_id,
@@ -538,21 +573,30 @@ class PipelineRunner:
 
         
 
-        def _store_preserved_output(preserved_output):
-            if not isinstance(preserved_output, __TIDE_TEMPLATE_VALUE__):
-                emitted_nodes = self.node_processor._extract_nodes_from_result(preserved_output)
-                node.emitted_nodes.extend(DedupedList(emitted_nodes))
-                if preserve_effect_output_to_node_targets:
-                    self._store_node_result(node, exec_id, preserved_output)
+        emitted_occurrences = []
+        returned_nodes = []
+
+        def _record_effect_output(output, origin):
+            if not isinstance(output, __TIDE_TEMPLATE_VALUE__):
+                emitted_occurrences.extend(
+                    (emitted_node, origin)
+                    for emitted_node in (
+                        self.node_processor._extract_nodes_from_result(
+                            output
+                        )
+                    )
+                )
             
 
 
         
-        to_handle = (
-            DedupedList(node.effects)
-            if effects is None
-            else DedupedList(effects)
-        )
+        to_handle = [
+            (effect, "declared")
+            for effect in node.effects
+        ] if effects is None else [
+            (effect, "runtime")
+            for effect in effects
+        ]
         if store_result:
             node_result = (
                 node.resolved_output
@@ -564,33 +608,61 @@ class PipelineRunner:
                 isinstance(node_result, type)
                 and issubclass(node_result, Effect)
             ) or isinstance(node_result, Effect):
-                to_handle.append(node_result)
+                to_handle.append((node_result, "runtime"))
+                # A returned effect can supply the execution's normal result.
+                # Route that result before any post-result declared or runtime
+                # effects so intentional target collisions have one explicit
+                # version order: normal, declared, then returned runtime.
+                if (
+                    not isinstance(node_result, type)
+                    and preserve_effect_output_to_node_targets
+                    and not isinstance(
+                        node_result.preserve_output,
+                        __TIDE_TEMPLATE_VALUE__,
+                    )
+                ):
+                    self._store_node_result(
+                        node,
+                        exec_id,
+                        node_result.preserve_output,
+                    )
             else:
                 self._store_node_result(node, exec_id)
+                returned_nodes = list(
+                    self.node_processor._extract_nodes_from_result(
+                        node.result
+                    )
+                )
 
         if not to_handle:
-            return
-        die = False
-        for effect in to_handle:
-            if effect not in node.effects:
+            return [
+                (emitted_node, "runtime")
+                for emitted_node in returned_nodes
+            ]
+        for effect, origin in to_handle:
+            if origin == "runtime":
                 node.runtime_effects.append(effect)
             if isinstance(effect, type):
                 if effect == END:
-                    self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, [self.id], __TIDE_TEMPLATE_VALUE__()), exec_id=exec_id))
+                    self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, [self.id], __TIDE_TEMPLATE_VALUE__(), {"origin": origin}), exec_id=exec_id))
                     self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=OceanEvents.KILL_PIPELINE, exec_id=exec_id)) # make EFFECT handler for DELETE and END etc
                     
-                    die = True
                 # delete node.target 
                 elif effect == DELETE:
                     
                     if node.targets: # TODO-NOTE: support target DedupedLists [X]
                         unscoped_targets = [self._unscope_data_ref(target) for target in node.targets]
-                        self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.DELETE, exec_id, unscoped_targets,  __TIDE_TEMPLATE_VALUE__()), exec_id=exec_id))
                         for unscoped_target in unscoped_targets:
-                            self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=self.id, event_type=RouterEvents.DELETE, payload=(unscoped_target.store, unscoped_target.key, f"{node.func.__name__}[{node.id}]", Effects.DELETE), exec_id=exec_id))
+                            self._emit_delete_occurrence(
+                                node,
+                                exec_id,
+                                unscoped_target,
+                                __TIDE_TEMPLATE_VALUE__(),
+                                origin,
+                            )
                 # delete specified target | default node.target
             elif isinstance(effect, DELETE): # TODO-NOTE: WRAP IN ISINSTANCE Effect
-                
+
                 targets = effect.targets if effect.targets else node.targets  
                 unscoped_targets = []
                 
@@ -599,41 +671,43 @@ class PipelineRunner:
                     unscoped_targets.append(self._unscope_data_ref(target))
             
                 
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.DELETE, exec_id, unscoped_targets, effect.preserve_output), exec_id=exec_id))
-
                 for unscoped_target in unscoped_targets:
-                    self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=self.id, event_type=RouterEvents.DELETE, payload=(unscoped_target.store, unscoped_target.key, f"{node.func.__name__}[{node.id}]", Effects.DELETE), exec_id=exec_id))
+                    self._emit_delete_occurrence(
+                        node,
+                        exec_id,
+                        unscoped_target,
+                        effect.preserve_output,
+                        origin,
+                    )
 
                 # TODO-NOTE: add end.targets = [runner_id], for runner_id, end.
 
-                _store_preserved_output(effect.preserve_output)
+                _record_effect_output(effect.preserve_output, origin)
             
             elif isinstance(effect, END): # if an instance of delete, check preserve_output and save it to the store if preserve has a value
                 
                 
-                _store_preserved_output(effect.preserve_output)
+                _record_effect_output(effect.preserve_output, origin)
                 
 
                 targets = effect.targets
                 if isinstance(targets, __TIDE_TEMPLATE_VALUE__):
                     targets = [self.id]
 
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, targets, effect.preserve_output), exec_id=exec_id))
+                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.END, exec_id, targets, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
                 
                 for target_id in targets:
-                    if target_id == self.id:
-                        die = True
                     self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=target_id, event_type=OceanEvents.KILL_PIPELINE, exec_id=exec_id)) # make EFFECT handler for DELETE and EN
 
         
             elif isinstance(effect, WRITE):   
                 to_write = []
 
-                preserved_output: Any = __TIDE_TEMPLATE_VALUE__()
+                effect_output: Any = __TIDE_TEMPLATE_VALUE__()
 
                 if not isinstance(effect.preserve_output, __TIDE_TEMPLATE_VALUE__):
-                    preserved_output = effect.preserve_output
-                    _store_preserved_output(effect.preserve_output)
+                    effect_output = effect.preserve_output
+                    _record_effect_output(effect.preserve_output, origin)
 
                 targets = effect.targets if effect.targets else node.targets
 
@@ -642,9 +716,9 @@ class PipelineRunner:
                         to_write.append((self._unscope_data_ref(target), value))
                 else:
                     for target in targets:
-                        to_write.append((self._unscope_data_ref(target), preserved_output))
+                        to_write.append((self._unscope_data_ref(target), effect_output))
                         
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.WRITE, exec_id, to_write, effect.preserve_output), exec_id=exec_id))
+                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.WRITE, exec_id, to_write, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
 
                 for unscoped_target, value in to_write:
                     node.runtime_targets.append(unscoped_target)
@@ -656,9 +730,9 @@ class PipelineRunner:
                         "RUN requires at least one registered pipeline id"
                     )
 
-                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.RUN, exec_id, effect.targets, effect.preserve_output), exec_id=exec_id))
+                self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.EFFECT, payload=(Effects.RUN, exec_id, effect.targets, effect.preserve_output, {"origin": origin}), exec_id=exec_id))
 
-                _store_preserved_output(effect.preserve_output)
+                _record_effect_output(effect.preserve_output, origin)
                 
                 for pipeline_id in effect.targets:
                     self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=None, payload=(pipeline_id, effect.mode, effect.templates, effect.stay_alive, None), event_type=OceanEvents.RUN_PIPELINE, exec_id=exec_id))
@@ -666,8 +740,13 @@ class PipelineRunner:
                 
             elif isinstance(effect, EMIT):
                 for emitted_node in effect.nodes:
-                    node.emitted_nodes.append(emitted_node)
-        if die: return    
+                    emitted_occurrences.append((emitted_node, origin))
+
+        emitted_occurrences.extend(
+            (emitted_node, "runtime")
+            for emitted_node in returned_nodes
+        )
+        return emitted_occurrences
 
 
 
@@ -753,7 +832,7 @@ class PipelineRunner:
                                     f"objects or classes, got "
                                     f"{type(effect).__name__}"
                                 )
-                        self._handle_node_result(
+                        emitted_occurrences = self._handle_node_result(
                             node,
                             exec_id,
                             effects=handled_effects,
@@ -767,9 +846,16 @@ class PipelineRunner:
                             handling_error,
                         ) from handling_error
                 else:
-                    self._handle_node_result(node, exec_id)
+                    emitted_occurrences = self._handle_node_result(
+                        node,
+                        exec_id,
+                    )
 
-                self._register_emitted_nodes(node.id, node.emitted_nodes, exec_id)  
+                self._register_emitted_nodes(
+                    node.id,
+                    emitted_occurrences,
+                    exec_id,
+                )
 
 
                 self.node_processor._satisfy(node)  
@@ -1264,54 +1350,63 @@ class PipelineRunner:
                 
             
     
-    def _register_emitted_nodes(self, emitter_id, emitted_nodes: tuple[Node], exec_id):
+    def _register_emitted_nodes(
+        self,
+        emitter_id,
+        emitted_occurrences,
+        exec_id,
+    ):
         emitted = []
         emitted_evidence = []
-        for emitted_node in emitted_nodes:
+        emitted_origins = []
+        for emitted_node, origin in emitted_occurrences:
             
             # index node
             if emitted_node.content_id in self.index.node_index.node_by_content_id:
                 emitted_node = self.index.node_index.node_by_content_id[emitted_node.content_id]
-                emitted_node.emitted = True
-                emitted_node.emitted_by.append(emitter_id)
 
             else:
                 emitted_node = self.index.node_index._index_node(emitted_node)
-                
-                emitted_node.emitted = True
-                emitted_node.emitted_by.append(emitter_id)   
 
                 # extract deps
                 self.node_processor.compile_all_inputs(emitted_node)
 
                 # register node to dag with deps and release if no deps
-            self.runtime_dag.register_node(emitted_node, emitted_node.deps)
+            registered = self.runtime_dag.register_node(
+                emitted_node,
+                emitted_node.deps,
+            )
 
-            # # try resolve deps
-            for dep in emitted_node.deps:
-                if dep in self.runtime_dag.waiting_static_deps:
-                    continue
-                if dep in self.runtime_dag.waiting_dynamic_deps:
-                    continue
-            
-                unscoped_dep = self._unscope_data_ref(dep)
-                if self.dep_tools.exists(unscoped_dep):
-                    refs = self.dep_tools.get_key_refs(unscoped_dep)
-                    if dep.dynamic: emitted_node.dynamic_to_static_deps[dep].extend(refs)
-                    for ref in refs:
-                        value = self.dep_tools.get(ref)
-                        self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_AVAILABLE, payload=(ref.store, ref.key, "TIDE: Polling", value, "TIDE: Emitted Node Polling")))
+            if registered:
+                # Resolve dependencies only when the node first enters the
+                # DAG. Repeated emissions remain distinct evidence without
+                # queueing the same node twice.
+                for dep in emitted_node.deps:
+                    if dep in self.runtime_dag.waiting_static_deps:
+                        continue
+                    if dep in self.runtime_dag.waiting_dynamic_deps:
+                        continue
+
+                    unscoped_dep = self._unscope_data_ref(dep)
+                    if self.dep_tools.exists(unscoped_dep):
+                        refs = self.dep_tools.get_key_refs(unscoped_dep)
+                        if dep.dynamic: emitted_node.dynamic_to_static_deps[dep].extend(refs)
+                        for ref in refs:
+                            value = self.dep_tools.get(ref)
+                            self.event_emitter(Event(source="runner", source_id=self.id, target_runner_id=self.id, event_type=PipelineEvents.DEP_AVAILABLE, payload=(ref.store, ref.key, "TIDE: Polling", value, "TIDE: Emitted Node Polling")))
 
                         # self.runtime_dag.satisfy_downstream_deps(scoped_expanded_ref)
             emitted.append(emitted_node.id)
             emitted_evidence.append(
                 self._snapshot_execution_evidence(emitted_node)
             )
+            emitted_origins.append(origin)
 
         emitted_node_meta = (
             emitter_id,
             tuple(emitted),
             tuple(emitted_evidence),
+            tuple(emitted_origins),
         )
         if emitted:
             self.event_emitter(Event(source="runner", source_id=self.id, event_type=LogEvents.NODE_EMITTED, payload=emitted_node_meta, exec_id=exec_id))

@@ -67,9 +67,7 @@ class ExecutionLog:
         self.ref_to_last_value = {}
         self.ref_to_last_snapshot = {}
         self.last_concretised_as = {} #dynamic dep -> 'concretised' static refs (deps)
-        self.last_emitted_by = {}
         self.effects_produced_by_exec = defaultdict(list) #exec_id to effects produced
-        self.versioned_effect_to_effect_obect = defaultdict(list)
         self.last_blocked_by = {}
         self.last_blocked = {}
         self.exec_opaque_value_snapshots = {}
@@ -275,7 +273,8 @@ class ExecutionLog:
         for effect, targets in effects_produced_by_exec:
             effect_entry = EffectRecord(
                 effect=effect,
-                targets=targets
+                targets=targets,
+                origin="runtime",
                 )
             effects_log.append(effect_entry)
         return effects_log
@@ -547,7 +546,7 @@ class ExecutionLog:
                 func_name=identity["func_name"],
                 inputs=inputs_log,
                 deps=all_node_deps,
-                effects={},
+                effects=[],
                 declared_deps=declared_deps,
                 declared_effects=declared_effects,
                 declared_targets=declared_targets,
@@ -587,7 +586,6 @@ class ExecutionLog:
                 output_value=output_value,
                 resolve_output=identity["resolve_output"],
                 writes=[],
-                emitted_by=self.last_emitted_by.get(actor, []),
                 emitted_nodes=[],
                 base_node_id=identity["base_node_id"],
                 base_node_content_id=identity[
@@ -711,17 +709,23 @@ class ExecutionLog:
         exec_id,
         emitted_node_ids,
         emitted_evidence,
+        emitted_origins,
     ):
         exec_log: ExecRecord = self.exec_id_to_log[exec_id]        
-        if len(emitted_node_ids) != len(emitted_evidence):
+        if not (
+            len(emitted_node_ids)
+            == len(emitted_evidence)
+            == len(emitted_origins)
+        ):
             raise MissingExecutionEvidenceError(
                 f"Execution {exec_id} emitted-node evidence is incomplete"
             )
 
         _emitted_nodes = []
-        for emitted_node_id, evidence in zip(
+        for emitted_node_id, evidence, origin in zip(
             emitted_node_ids,
             emitted_evidence,
+            emitted_origins,
             strict=True,
         ):
             if not isinstance(evidence, dict):
@@ -744,14 +748,6 @@ class ExecutionLog:
                 evidence["declared_effects"]
             )
             
-            emitted_producer_id = Actor(
-                self.ocean_id,
-                evidence["runner_id"],
-                evidence["func_name"],
-            )
-            emitter_producer_id = exec_log.producer_id
-            self.last_emitted_by[emitted_producer_id] = (emitter_producer_id, exec_id)
-
             emitted_node_record = EmittedNodeRecord(
                 ocean_id = self.ocean_id, 
                 runner_id=evidence["runner_id"],
@@ -763,7 +759,7 @@ class ExecutionLog:
                 deps=all_node_deps, 
                 declared_targets=declared_targets,
                 declared_effects=declared_effects,
-                emitted_by=(emitter_producer_id, exec_id),
+                origin=origin,
                 content_id=evidence["content_id"],
                 base_node=evidence["base_node_id"],
                 base_node_content_id=evidence[
@@ -775,7 +771,6 @@ class ExecutionLog:
 
     
         exec_log.emitted_nodes = _emitted_nodes
-        pass
 
 
 class LogTools:
@@ -1004,17 +999,14 @@ class LogTools:
 
 
             if event_type in [LogEvents.EFFECT]:
-                if len(payload) == 5:
-                    (
-                        effect,
-                        exec_id,
-                        targets,
-                        preserved_output,
-                        effect_metadata,
-                    ) = payload
-                else:
-                    effect, exec_id, targets, preserved_output = payload
-                    effect_metadata = {}
+                (
+                    effect,
+                    exec_id,
+                    targets,
+                    effect_output,
+                    effect_metadata,
+                ) = payload
+                origin = effect_metadata["origin"]
 
                 if isinstance(targets, dict):
                     effect_targets = list(targets.items())
@@ -1029,9 +1021,9 @@ class LogTools:
                         ):
                             effect_targets.append(target)
                         else:
-                            effect_targets.append((target, preserved_output))
+                            effect_targets.append((target, effect_output))
                 else:
-                    effect_targets = [(targets, preserved_output)]
+                    effect_targets = [(targets, effect_output)]
 
                 for data_ref, value in effect_targets:
                     if isinstance(data_ref, DataRef): 
@@ -1052,12 +1044,17 @@ class LogTools:
                     effect_record = EffectRecord(
                         effect,
                         versioned,
+                        origin=origin,
                         output=value,
-                        preserved_output=preserved_output,
+                        target_existed=(
+                            effect_metadata.get("found")
+                            if effect in {Effects.READ, Effects.DELETE}
+                            else None
+                        ),
                     )
-                    self.exec_log.exec_id_to_log[exec_id].effects[
-                        (effect, versioned)
-                    ] = effect_record
+                    self.exec_log.exec_id_to_log[exec_id].effects.append(
+                        effect_record
+                    )
 
                     if (
                         effect == Effects.READ
@@ -1161,7 +1158,10 @@ class LogTools:
                     cause_effect,
                     versioned_blocker,
                     affectee=Actor(self.ocean_id, source_id, node_id),
-                    affected_inputs=dict(affected_inputs),
+                    affected_inputs=[
+                        {"name": item[0], "index": None}
+                        for item in affected_inputs
+                    ],
                 )
 
                 is_missing_ref_fallback = (
@@ -1173,22 +1173,54 @@ class LogTools:
                 )
                 if is_missing_ref_fallback:
                     exec_log: ExecRecord = self.exec_log.exec_id_to_log[exec_id]
-                    exec_log.effects[(cause_effect, versioned_blocker)].affected[affected.affectee] = affected
+                    effect_record = next(
+                        (
+                            record
+                            for record in exec_log.effects
+                            if record.effect == cause_effect
+                            and record.targets == versioned_blocker
+                        ),
+                        None,
+                    )
+                    if effect_record is not None:
+                        effect_record.affected[affected.affectee] = affected
                 
-                # self.exec_log.versioned_effect_to_effect_obect[(cause_effect, versioned_blocker)].add(affected)
                 self.exec_log.last_blocked_by[(source_id, node_id)] = (cause_effect, versioned_blocker) 
                 self.exec_log.last_blocked[cause_effect] = ((source_id, node_id), affected_inputs)
                 continue
 
             if event_type in [LogEvents.NODE_EMITTED]:
                 exec_id = entry["exec_id"]
-                emitter_id, emitted_ids, emitted_evidence = payload
+                (
+                    emitter_id,
+                    emitted_ids,
+                    emitted_evidence,
+                    emitted_origins,
+                ) = payload
       
                 self.exec_log.append_emitted_nodes(
                     exec_id,
                     emitted_ids,
                     emitted_evidence,
+                    emitted_origins,
                 )
+
+                emitter_name = self.exec_log.exec_id_to_log[
+                    exec_id
+                ].func_name
+                emitter_label = (
+                    f"{source_id} | {emitter_name}#{emitter_id}"
+                )
+                for emitted_id, evidence in zip(
+                    emitted_ids,
+                    emitted_evidence,
+                    strict=True,
+                ):
+                    emitted_name = evidence["func_name"]
+                    emitted_label = (
+                        f"{source_id} | {emitted_name}#{emitted_id}"
+                    )
+                    add_edge(emitter_label, emitted_label)
                 continue
              # For every NODE_READY event
             if event_type in [ExecutorEvents.NODE_READY]:
@@ -1201,16 +1233,6 @@ class LogTools:
                 # define consumer node
                 consumer_node_name = consumer_node.node_name.split("@", 1)[0]
                 consumer_node_label = f"{source_id} | {consumer_node_name}#{consumer_node.id}"   
-                
-                # if consumer was emitted by another node
-                if consumer_node.emitted:
-                    # get emitter node
-                    for emitter_node_id in consumer_node.emitted_by:
-                        emitter_node: RunnerNode = self.runners[source_id].index.node_index.node_by_id[emitter_node_id]  
-                        emitter_node_name = emitter_node.node_name.split("@", 1)[0]
-                        emitter_node_label = f"{source_id} | {emitter_node_name}#{emitter_node.id}"    
-                        
-                        add_edge(emitter_node_label, consumer_node_label)
                 
                 for dep, static_deps in consumer_node.dynamic_to_static_deps.items():
                     # what static deps link to dynamic deps

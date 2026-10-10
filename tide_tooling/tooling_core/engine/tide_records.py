@@ -97,7 +97,7 @@ class EmittedNodeRecord:
         deps,
         declared_targets,
         declared_effects,
-        emitted_by,
+        origin,
         content_id,
         base_node,
         base_node_content_id,
@@ -113,16 +113,14 @@ class EmittedNodeRecord:
         self.deps = deps
         self.declared_targets = declared_targets
         self.declared_effects = declared_effects
-        self.emitted_by = emitted_by
+        if origin not in {"declared", "runtime"}:
+            raise ValueError(
+                "EmittedNodeRecord origin must be 'declared' or 'runtime'"
+            )
+        self.origin = origin
         self.content_id = content_id
         self.base_node = base_node
         self.base_node_content_id = base_node_content_id
-
-
-class EmittedNodesRecord:
-    def __init__(self, emitted_nodes):
-        self.emitted_nodes = emitted_nodes
-
 
 class ExecRecord:
     def __init__(
@@ -153,7 +151,6 @@ class ExecRecord:
         output_value=__TEMPLATE__,
         resolve_output=None,
         writes=None,
-        emitted_by=None,
         emitted_nodes=None,
         base_node_id=None,
         base_node_content_id=None,
@@ -182,7 +179,7 @@ class ExecRecord:
         self.func_name = func_name
         self.inputs = inputs
         self.deps = deps
-        self.effects = effects or {}
+        self.effects = list(effects or ())
         self.affected = []
 
         self.declared_deps = declared_deps
@@ -207,7 +204,6 @@ class ExecRecord:
         )
         self.writes = writes or []
 
-        self.emitted_by = emitted_by
         self.emitted_nodes = emitted_nodes or []
         self.base_node_id = base_node_id
         self.base_node_content_id = base_node_content_id
@@ -236,14 +232,27 @@ class EffectRecord:
         self,
         effect,
         targets,
+        *,
+        origin,
         output=__TEMPLATE__,
-        preserved_output=__TEMPLATE__,
         affected=None,
+        target_existed=None,
     ):
+        if origin not in {"declared", "runtime"}:
+            raise ValueError(
+                "EffectRecord origin must be 'declared' or 'runtime'"
+            )
         self.effect = effect
         self.targets = targets
         self.output = output
-        self.preserved_output = preserved_output
+        self.origin = origin
+        effect_value = getattr(effect, "value", effect)
+        if effect_value in {"read", "DELETE"}:
+            self.target_existed = target_existed
+        elif target_existed is not None:
+            raise ValueError(
+                "target_existed is valid only for READ and DELETE effects"
+            )
         self.affected = affected if affected is not None else defaultdict()
 
 

@@ -1,4 +1,4 @@
-"""Validate and import a small conforming TIDE Model."""
+"""Validate and import a small semantically valid TIDE Model."""
 
 from tide_tooling import TIDE
 
@@ -7,6 +7,8 @@ MODEL = {
     "schema": "TIDE-Model",
     "schema_version": 1,
     "host": "demo-host",
+    "E": ["load-exec", "clean-exec", "report-exec"],
+    "S": ["raw-state", "clean-state", "report-state"],
     "I": [
         {"exec_id": "clean-exec", "state_id": "raw-state"},
         {"exec_id": "report-exec", "state_id": "clean-state"},
@@ -43,7 +45,7 @@ MODEL = {
 
 def main():
     validation = TIDE.validate_model(MODEL)
-    assert validation["conforms"], validation["errors"]
+    assert validation["semantically_valid"], validation["errors"]
 
     trace = TIDE.from_model(MODEL)
     trace.show()

@@ -19,7 +19,6 @@ from tide_tooling.tooling_core.engine.tide_records   import (
     DependencyUseRecord,
     EffectRecord,
     EmittedNodeRecord,
-    EmittedNodesRecord,
     ExecRecord,
     ExpandedDepRecord,
     InputUseRecord,
@@ -96,7 +95,6 @@ __all__ = [
     "DependencyUseRecord",
     "EffectRecord",
     "EmittedNodeRecord",
-    "EmittedNodesRecord",
     "ExecRecord",
     "ExpandedDepRecord",
     "InputUseRecord",
@@ -556,7 +554,7 @@ class Trace:
         Public ``to_model()`` remains strict by default.  A Trace imported
         through ``assign_unknown=True`` records that representational choice
         in ``model_context`` so internal model comparisons can reconstruct the
-        same conforming comparison document without asking the caller to
+        same semantically valid comparison document without asking the caller to
         repeat an already-made import decision.
         """
         model_context = (
@@ -666,7 +664,7 @@ class Trace:
         identity_mode="host",
         assign_unknown=False,
     ):
-        """Export only the interoperable ``K = (I, O)`` projection.
+        """Export the interoperable ``K = (E, S, I, O)`` projection.
 
         TIDE references and versions remain an internal Trace detail. Each
         exact internal State is assigned one opaque ``state_id``; state IDs
@@ -989,19 +987,21 @@ class Trace:
             if enrichment:
                 state_enrichments[state_id] = enrichment
 
+        execution_ids = sorted(
+            {
+                model_exec_id_by_trace_id[record.exec_id]
+                for record in model_records
+            },
+            key=lambda value: (type(value).__name__, repr(value)),
+        )
+        state_ids = list(dict.fromkeys(state_order))
         represented_exec_ids = {
             (type(exec_id), exec_id)
-            for exec_id, _ in (
-                _tide_incidence_set(inputs)
-                | _tide_incidence_set(outputs)
-            )
+            for exec_id in execution_ids
         }
         represented_state_ids = {
             (type(state_id), state_id)
-            for _, state_id in (
-                _tide_incidence_set(inputs)
-                | _tide_incidence_set(outputs)
-            )
+            for state_id in state_ids
         }
         execution_enrichments = {
             exec_id: enrichment
@@ -1018,6 +1018,8 @@ class Trace:
             "schema": "TIDE-Model",
             "schema_version": 1,
             "host": selected_host,
+            "E": execution_ids,
+            "S": state_ids,
             "I": inputs,
             "O": outputs,
         }
@@ -1050,6 +1052,11 @@ class Trace:
                 if (type(state_id), state_id) not in output_state_keys
             ]
             if missing_states:
+                if "unknown" not in model["E"]:
+                    model["E"].append("unknown")
+                    model["E"].sort(
+                        key=lambda value: (type(value).__name__, repr(value))
+                    )
                 for state_id in sorted(
                     missing_states,
                     key=lambda value: (type(value).__name__, repr(value)),
@@ -1093,18 +1100,18 @@ class Trace:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-        if not report["conforms"]:
+        if not report["semantically_valid"]:
             suggestion = (
                 "; pass assign_unknown=True only if a tool-side unknown "
                 "producer is acceptable"
                 if any(
-                    error.startswith("every_state_has_producer:")
+                    "has no represented producer" in error
                     for error in report["errors"]
                 )
                 else ""
             )
             raise ValueError(
-                "Trace cannot be exported as a conforming TIDE Model: "
+                "Trace cannot be exported as a semantically valid TIDE Model: "
                 + "; ".join(report["errors"])
                 + suggestion
             )
@@ -1115,9 +1122,9 @@ class Trace:
                 incidence_format=incidence_format,
             )
             report = TIDE.validate_model(model)
-            if not report["conforms"]:
+            if not report["semantically_valid"]:
                 raise ValueError(
-                    "Trace structural export is not a conforming TIDE Model: "
+                    "Trace structural export is not a semantically valid TIDE Model: "
                     + "; ".join(report["errors"])
                 )
         return model
@@ -1627,10 +1634,11 @@ class Trace:
             if effect == Effects.DELETE:
                 return SHOW_RED
             if effect == Effects.READ:
-                found = self.index._runtime_read_found(log, ref)
-                if found is False:
-                    return SHOW_RED
-                return SHOW_GREEN
+                return (
+                    SHOW_GREEN
+                    if effect_entry.target_existed is True
+                    else SHOW_RED
+                )
             return ref_colour(ref, ver)
 
         def lines_from_write(cause, result_name, ref, ver):
@@ -1801,7 +1809,7 @@ class Trace:
 
             #
             # handle effects
-            effects = log.effects.values() if log.effects else None
+            effects = log.effects
             if not_template(effects) and effects:
                 if effects: lines.append(f"  {SHOW_DIM}effects:{SHOW_RESET}")
                 for effect_entry in effects:
@@ -2290,13 +2298,6 @@ class Trace:
         
         obj.source_pipeline = DedupedList()
 
-
-        emitted_by = deduped_dict()
-        for exec_id in self.index.emitted_actor_to_emitter_exec_ids.get(actor, []):
-            exec_log: ExecRecord = self.index.exec_by_exec_id[exec_id]
-            emitted_by[exec_log.producer_id].append(exec_log.exec_id)
-
-
         upstream = deduped_dict()
         downstream = deduped_dict()
 
@@ -2309,12 +2310,11 @@ class Trace:
                 self.index.actor_to_exec_ids.get(emitted_actor, [])
             )
 
-        emitter_exec_ids = self.index.emitted_actor_to_emitter_exec_ids.get(
-            actor,
-            [],
-        )
-        for emitter_actor in self.index.actor_to_emitter_actors.get(actor, []):
-            upstream[emitter_actor].extend(emitter_exec_ids)
+        for emitter_exec_id in (
+            self.index.emitted_actor_to_emitter_exec_ids.get(actor, [])
+        ):
+            emitter_log = self.index.exec_by_exec_id[emitter_exec_id]
+            upstream[emitter_log.producer_id].append(emitter_exec_id)
 
         for exec_id in exec_ids:
             exec_inspected = self.inspect(exec_id, "exec_record")
@@ -2481,28 +2481,6 @@ class Trace:
             "stream direction must be 'upstream' or 'downstream'"
         )
 
-    def _direct_stream_paths(self, inspected, direction):
-        adjacency, _ = self._stream_adjacency(direction)
-        seeds = self._seed_inspected("source", inspected, direction)
-        root_state_versions = self._stream_root_state_versions(
-            inspected,
-            direction,
-        )
-        paths = {}
-        for seed in seeds:
-            edges = [
-                edge
-                for edge in adjacency[seed]
-                if (
-                    root_state_versions is None
-                    or (edge.produced_ref, edge.produced_ver)
-                    in root_state_versions
-                )
-            ]
-            if edges:
-                paths[seed] = [[edge] for edge in edges]
-        return paths
-
     @staticmethod
     def _stream_root_state_versions(inspected, direction):
         """Constrain a downstream State query to that exact State.
@@ -2545,7 +2523,7 @@ class Trace:
         """Walk exact relationship paths, then derive a unique layer view."""
         self._validate_stream_limits(depth, max_paths)
         adjacency, next_relation = self._stream_adjacency(direction)
-        seeds = self._seed_inspected("source", inspected, direction)
+        seeds = self._execution_seeds(inspected)
         root_state_versions = self._stream_root_state_versions(
             inspected,
             direction,
@@ -2568,34 +2546,6 @@ class Trace:
             path_count += 1
             return True
 
-        def walk(root_exec_id, current_exec_id, path, remaining, visited):
-            nonlocal truncated
-            if remaining == 0:
-                add_path(root_exec_id, path)
-                return
-
-            candidates = []
-            for edge in adjacency[current_exec_id]:
-                next_exec_id = getattr(edge, next_relation)
-                if next_exec_id in visited:
-                    continue
-                candidates.append((edge, next_exec_id))
-
-            if not candidates:
-                add_path(root_exec_id, path)
-                return
-
-            for edge, next_exec_id in candidates:
-                if truncated:
-                    return
-                walk(
-                    root_exec_id,
-                    next_exec_id,
-                    [*path, edge],
-                    None if remaining is None else remaining - 1,
-                    visited | {next_exec_id},
-                )
-
         for root_exec_id in seeds:
             for root_edge in adjacency[root_exec_id]:
                 if truncated:
@@ -2609,13 +2559,40 @@ class Trace:
                 ):
                     continue
                 next_exec_id = getattr(root_edge, next_relation)
-                walk(
-                    root_exec_id,
+                stack = [(
                     next_exec_id,
                     [root_edge],
                     depth,
                     {root_exec_id, next_exec_id},
-                )
+                )]
+
+                while stack and not truncated:
+                    current_exec_id, path, remaining, visited = stack.pop()
+                    if remaining == 0:
+                        add_path(root_exec_id, path)
+                        continue
+
+                    candidates = []
+                    for edge in adjacency[current_exec_id]:
+                        candidate_exec_id = getattr(edge, next_relation)
+                        if candidate_exec_id in visited:
+                            continue
+                        candidates.append((edge, candidate_exec_id))
+
+                    if not candidates:
+                        add_path(root_exec_id, path)
+                        continue
+
+                    next_remaining = (
+                        None if remaining is None else remaining - 1
+                    )
+                    for edge, candidate_exec_id in reversed(candidates):
+                        stack.append((
+                            candidate_exec_id,
+                            [*path, edge],
+                            next_remaining,
+                            visited | {candidate_exec_id},
+                        ))
             if truncated:
                 break
 
@@ -2711,13 +2688,10 @@ class Trace:
             max_paths=max_paths,
         )
 
-    def _seed_inspected(self, type: str, inspected: Inspected, direction: str) -> list[str]:
+    def _execution_seeds(self, inspected: Inspected) -> list[str]:
+        """Return the execution occurrences represented by a query endpoint."""
         if not isinstance(inspected, Inspected):
-            raise ValueError("SeedInspected got a non inspected object")
-        if type not in {"source", "target"}:
-            raise RuntimeError(
-                f"SeedInspected expected type to be either ['source' or 'target'] not {type}"
-            )
+            raise ValueError("execution seeding requires an Inspected endpoint")
 
         seeds = DedupedList()
 
@@ -2725,8 +2699,6 @@ class Trace:
             return [inspected.object.id]
         elif inspected.type == "actor":
             seeds.extend(inspected.history)
-                # for exec_ids in getattr(actor_exec, maybe_opposite).values():
-                #     seeds.extend(exec_ids)
         elif inspected.type in ["reference", "value"]:
             if inspected.type == "reference" and not inspected.grouped:
                 versions = (
@@ -2752,8 +2724,6 @@ class Trace:
 
         else:
             raise NotImplementedError(f"Seeding currently only works for execs, refs, actors, values, and effects | was {inspected.type}")
-            # for exec_ids in getattr(inspected, maybe_opposite).values():
-            #     seeds.extend(exec_ids)
 
         return seeds
     
@@ -2780,47 +2750,6 @@ class Trace:
         else:
             return []
         
-
-    # def upstream(self, inspected: Inspected, depth: int = None):
-    #     seeds = self._seed_inspected("source", inspected, "upstream")
-    #     target_refs = self._get_target_refs(inspected_root=inspected, direction="upstream")
-
-    #     stream_stack = defaultdict(lambda: defaultdict(list))
-    #     stream_paths = defaultdict(list)
-
-    #     for seed in seeds:
-    #         id = self.inspect(seed, "exec_record").id
-    #         input_edges = self.index.consumer_exec_id_to_producer_input_edges[seed]
-
-    #         for edge in input_edges:
-    #             # if target_refs and (edge.produced_ref, edge.produced_ver) not in target_refs:
-    #             #     continue
-
-    #             stream_stack[id]["root"].append(edge)
-    #             stream_paths[id].append([edge])
-
-    #     return Upstream(inspected, stream_stack, stream_paths)
-
-
-    # def downstream(self, inspected: Inspected, depth: int = None):
-    #     seeds = self._seed_inspected("source", inspected, "downstream")
-    #     target_refs = self._get_target_refs(inspected_root=inspected, direction="downstream")
-
-    #     stream_stack = defaultdict(lambda: defaultdict(list))
-    #     stream_paths = defaultdict(list)
-
-    #     for seed in seeds:
-    #         id = self.inspect(seed, "exec_record").id
-    #         input_edges = self.index.producer_exec_id_to_consumer_input_edges[seed]
-
-    #         for edge in input_edges:
-    #             # if target_refs and (edge.produced_ref, edge.produced_ver) not in target_refs:
-    #             #     continue
-
-    #             stream_stack[id]["root"].append(edge)
-    #             stream_paths[id].append([edge])
-
-    #     return Downstream(inspected, stream_stack, stream_paths)
 
     def _lines_from_edges(self, edges, direction, indent="      "):
         if direction == "upstream":
@@ -2856,8 +2785,179 @@ class Trace:
             lines.extend(actor_lines)
         
         return lines
-    
- 
+
+    @staticmethod
+    def _path_target_states(target):
+        """Return the exact State occurrences represented by an endpoint."""
+        if target.type not in {"reference", "value"}:
+            return set()
+        return {
+            (write.stored_target, write.stored_version)
+            for write in target.writes
+        }
+
+    def _edge_reaches_path_target(
+        self,
+        edge,
+        next_exec,
+        source,
+        target,
+        target_execs,
+        direction,
+        deep_link,
+    ):
+        """Decide endpoint reachability from graph facts, never display text."""
+        if isinstance(edge, EmittedStackLink):
+            if target.type == "actor":
+                return (
+                    edge.consumer_actor == target.id
+                    or (
+                        target.grouped
+                        and edge.consumer_actor.source_actor == target.id
+                    )
+                )
+
+        if target.type not in {"reference", "value"}:
+            return next_exec in target_execs
+
+        if (
+            direction == "upstream"
+            and not deep_link
+            and source.type in {"reference", "value"}
+        ):
+            return False
+
+        target_states = self._path_target_states(target)
+        edge_state = (edge.produced_ref, edge.produced_ver)
+        if edge_state in target_states:
+            return True
+
+        if direction != "downstream" or not deep_link:
+            return False
+
+        candidate = self.index.exec_by_exec_id.get(next_exec)
+        if candidate is None:
+            return False
+        return any(
+            (write.stored_target, write.stored_version) in target_states
+            for write in candidate.writes
+        )
+
+    def _edge_path_explanation(
+        self,
+        edge,
+        next_exec,
+        source,
+        target,
+        direction,
+        deep_link,
+        terminal,
+    ):
+        """Project one traversed edge into the existing display contract."""
+        if isinstance(edge, EmittedStackLink):
+            return []
+
+        ref = edge.produced_ref
+        ver = edge.produced_ver
+        producer = getattr(
+            edge.producer_actor,
+            "source_actor",
+            str(edge.producer_actor),
+        )
+        consumer = getattr(
+            edge.consumer_actor,
+            "source_actor",
+            str(edge.consumer_actor),
+        )
+
+        if isinstance(edge, AffectedStackLink):
+            if direction == "downstream":
+                return [f"read {ref}[v{ver}] from {producer}"]
+            return [f"wrote {ref}[v{ver}] used by {consumer}"]
+
+        value_query = source.type == "value" or target.type == "value"
+        if direction == "downstream":
+            action = "read as" if value_query else "read"
+            lines = [f"{action} {ref}[v{ver}] from {producer}"]
+
+            if deep_link and target.type in {"reference", "value"}:
+                target_states = self._path_target_states(target)
+                candidate = self.index.exec_by_exec_id.get(next_exec)
+                if candidate is not None:
+                    write_action = "written as" if value_query else "wrote"
+                    for write in candidate.writes:
+                        state = (write.stored_target, write.stored_version)
+                        if state in target_states and state != (ref, ver):
+                            lines.append(
+                                f"{write_action} {state[0]}[v{state[1]}]"
+                            )
+            return lines
+
+        action = "written as" if value_query else "wrote"
+        if value_query or (
+            terminal
+            and
+            source.type == "reference" and target.type == "reference"
+        ):
+            return [f"{action} {ref}[v{ver}]"]
+        return [f"{action} {ref}[v{ver}] used by {consumer}"]
+
+    def _direct_path_explanation(
+        self,
+        root_exec,
+        source,
+        target,
+        target_execs,
+        direction,
+    ):
+        """Explain a direct endpoint incidence without traversing an edge."""
+        if direction == "downstream" and source.type in {"reference", "value"}:
+            return []
+
+        record = self.index.exec_by_exec_id[root_exec]
+        reads = [
+            (read.unscoped_reference, read.resolved_version)
+            for dependency in record.deps
+            for read in self._dep_records(dependency)
+        ]
+        writes = [
+            (write.stored_target, write.stored_version)
+            for write in record.writes
+        ]
+
+        if source.type in {"reference", "value"}:
+            source_states = self._path_target_states(source)
+            writes = [state for state in writes if state in source_states]
+
+        if target.type in {"reference", "value"}:
+            target_states = self._path_target_states(target)
+            reads = []
+            writes = [state for state in writes if state in target_states]
+        elif root_exec not in target_execs:
+            return []
+        elif direction == "downstream":
+            reads = []
+        elif source.type == "value":
+            reads = []
+        elif source.type != "reference":
+            writes = []
+
+        value_query = source.type == "value" or target.type == "value"
+        lines = []
+        for ref, ver in reads:
+            producer_exec = self.index.ref_version_to_producer_exec_id[
+                (ref, ver)
+            ]
+            producer = self.index.exec_by_exec_id[
+                producer_exec
+            ].producer_id.source_actor
+            action = "read as" if value_query else "read"
+            lines.append(f"{action} {ref}[v{ver}] from {producer}")
+
+        action = "written as" if value_query else "wrote"
+        lines.extend(f"{action} {ref}[v{ver}]" for ref, ver in writes)
+        return lines
+
     def path(
         self,
         source: Any,
@@ -2914,536 +3014,124 @@ class Trace:
 
 
 
-        # V-ALPHA: target is exec_id
-        # if exec -> walk downstream to target 
-        # if actor -> walk history to target
-        # if ref -> walk consumers and their consumers to target
-        # if effect -> walk producers to their consumers to target
-
-        # walk downstream
-
-        if direction == "upstream":
-            actor = "producer"
-
-        else: 
-            actor = "consumer"
-
-        queried_source = source
-        
-        
-        def terminal_link(
-            curr_source_exec,
-            candidate_exec,
-            curr_step=None,
-            source_is_root=True,
-        ):
-
-            curr_source = self.inspect(curr_source_exec, "exec_record")
-
-            curr_candidate = self.inspect(candidate_exec, "exec_record")
-
-
-            valid_read_sources = []
-            valid_write_sources = []
-
-            valid_read_targets = []
-            valid_write_targets = []
-
-            source_refs = self._get_target_refs(source, "upstream")
-            target_refs = self._get_target_refs(target, direction)
-
-            if target.type in ["reference", "value"]:
-                target_refs = [
-                    (write.stored_target, write.stored_version)
-                    for write in target.writes
-                ]
-
-            # DOWNSTREAM
-            if direction == "downstream":
-
-                if source_is_root and source.type in ["reference", "value"]:
-                    valid_write_sources = [
-                        (write.stored_target, write.stored_version)
-                        for write in curr_source.object.writes
-                        if (
-                            write.stored_target,
-                            write.stored_version,
-                        )
-                        in source_refs
-                    ]
-                else:
-                    valid_write_sources = [
-                        (write.stored_target, write.stored_version)
-                        for write in curr_source.object.writes
-                    ]
-
-
-                match target.type:
-                    case "actor" | "exec_record" | "effect":
-                        execs = []
-                        if target.type == "exec_record":
-                            execs = [target.id]
-                        else:
-                            execs = target.history
-                        for exec_id in execs:
-                            
-                            inspected = self.inspect(exec_id, "exec_record")
-                            valid_read_targets.extend([
-                                (read.unscoped_reference, read.resolved_version)
-                                for reads in inspected.object.reads 
-                                for read in self._dep_records(reads)
-                                
-                            ])
-                            valid_write_targets.extend([(write.stored_target, write.stored_version) for write in inspected.object.writes])
-                    case "reference" | "value":
-                        valid_read_targets = target_refs
-                    case _:
-                        raise RuntimeWarning(f".path() terminal_link recieved an invalid type! was {target.type}")
-
-            else:
-                # UPSTREAM
-                if source_is_root and source.type == "reference":
-                    valid_write_sources = [
-                        (write.stored_target, write.stored_version)
-                        for write in curr_source.object.writes
-                        if (write.stored_target, write.stored_version) in source_refs
-                    ]
-
-                    valid_read_sources = [
-                        (read.unscoped_reference, read.resolved_version)
-                        for read in curr_source.object.reads
-                    ]
-                elif source_is_root and source.type == "value":
-                    valid_write_sources = [
-                        (write.stored_target, write.stored_version)
-                        for write in curr_source.object.writes
-                        if (write.stored_target, write.stored_version) in source_refs
-                    ]
-                else:
-                    valid_read_sources = [
-                        (read.unscoped_reference, read.resolved_version)
-                        for read in curr_source.object.reads
-                    ]
-
-                match target.type:
-                    case "actor" | "exec_record" | "effect":
-                        execs = []
-                        if target.type == "exec_record":
-                            execs = [target.id]
-                        else:
-                            execs = target.history
-                        for exec_id in execs:
-                            inspected = self.inspect(exec_id, "exec_record")
-                            valid_read_targets.extend([
-                                (write.stored_target, write.stored_version)
-                                for write in inspected.object.writes
-                            ])
-                            valid_write_targets.extend([
-                                (read.unscoped_reference, read.resolved_version)
-                                for read in inspected.object.reads
-                            ])
-                    case "reference" | "value":
-                        valid_write_targets = target_refs
-                    case _:
-                        raise RuntimeWarning(f".path() terminal_link recieved an invalid type! was {target.type}")
-
-
-            reads = DedupedList()
-            for record in curr_candidate.object.reads:
-                if record.type == 'dynamic':
-                    reads.extend([(read.unscoped_reference, read.resolved_version) for read in record.expanded_to])
-                else:
-                    reads.append((record.unscoped_reference, record.resolved_version))
-            candidate_reads = reads
-            candidate_writes = [(write.stored_target, write.stored_version) for write in curr_candidate.object.writes]
-
-            current_edge_refs = None
-
-            if curr_step is not None and isinstance(curr_step, StackLink):
-                current_edge_refs = {
-                    (curr_step.produced_ref, curr_step.produced_ver)
-                }
-
-
-
-            terminal = False
-            stay_terminal = True
-            downstream_action = "read"
-            upstream_action = "wrote"
-            lines = DedupedList()
-            target_refs = set(valid_read_targets) | set(valid_write_targets)
-
-            if target.type == "actor" and candidate_exec not in target.history:
-                stay_terminal = False
-
-            if target.type == "exec_record" and candidate_exec != target.id:
-                stay_terminal = False
-
-            if target.type == "effect" and candidate_exec not in target.history:
-                stay_terminal = False
-
-            if isinstance(curr_step, EmittedStackLink):
-                return lines, stay_terminal
-
-            if isinstance(curr_step, AffectedStackLink):
-                producer_actor = getattr(
-                    curr_step.producer_actor,
-                    "source_actor",
-                    str(curr_step.producer_actor),
-                )
-                if direction == "downstream":
-                    lines.append(
-                        f"read {curr_step.produced_ref}"
-                        f"[v{curr_step.produced_ver}] from {producer_actor}"
-                    )
-                else:
-                    consumer_actor = getattr(
-                        curr_step.consumer_actor,
-                        "source_actor",
-                        str(curr_step.consumer_actor),
-                    )
-                    lines.append(
-                        f"wrote {curr_step.produced_ref}"
-                        f"[v{curr_step.produced_ver}] used by {consumer_actor}"
-                    )
-                return lines, stay_terminal
-
-            if source.type == "value" or target.type == "value":
-                downstream_action = "read as"
-                upstream_action = "written as"
-
-
-            if direction == "downstream":
-                bridge_refs = set(valid_write_sources) & set(candidate_reads)
-
-                if current_edge_refs is not None:
-                    bridge_refs &= current_edge_refs
-
-                if curr_source_exec == candidate_exec and not bridge_refs:
-                    if source.type in ["reference", "value"]:
-                        return [], False
-
-                    direct_refs = set(valid_read_sources) | set(valid_write_sources)
-
-                    if target.type in ["reference", "value"]:
-                        direct_refs &= target_refs
-                        if not direct_refs:
-                            return [], False
-
-                    for ref, ver in valid_read_sources:
-                        if (ref, ver) not in direct_refs:
-                            continue
-
-                        producer_actor_rep = self.inspect(
-                            self.index.ref_version_to_producer_exec_id[(ref, ver)],
-                            "exec_record",
-                        ).object.object.producer_id.source_actor
-                        lines.append(f"{downstream_action} {ref}[v{ver}] from {producer_actor_rep}")
-
-                    for ref, ver in valid_write_sources:
-                        if (ref, ver) not in direct_refs:
-                            continue
-
-                        lines.append(f"{upstream_action} {ref}[v{ver}]")
-
-                    return lines, stay_terminal
-
-
-
-                if bridge_refs:
-                    target_write_refs = set(candidate_writes) & set(target_refs)
-
-                    if deep_link and target.type in ["reference", "value"] and target_write_refs:
-                        terminal = stay_terminal
-
-                    terminal_hits = bridge_refs & target_refs
-
-                    if terminal_hits:
-
-
-                        for ref, ver in terminal_hits:
-                            producer_actor_rep = self.inspect(self.index.ref_version_to_producer_exec_id[(ref, ver)], "exec_record").object.object.producer_id.source_actor
-                            lines.append(f"{downstream_action} {ref}[v{ver}] from {producer_actor_rep}")
-
-                        if deep_link and target.type in ["reference", "value"]:
-                            for ref, ver in target_write_refs:
-                                target_line = f"{upstream_action} {ref}[v{ver}]"
-                                if target_line not in lines:
-                                    lines.append(target_line)
-
-                        terminal = stay_terminal
-                        return lines, terminal
-
-                    if target.type in ["actor", "exec_record", "effect"]:
-                        terminal = stay_terminal
-                    candidate_read_refs = defaultdict(list)
-                    candidate_write_refs = defaultdict(list)
-                    for ver_ref in candidate_reads:
-                        candidate_read_refs[ver_ref[0]].append(ver_ref[1]) 
-                    for ver_ref in candidate_writes:
-                        candidate_write_refs[ver_ref[0]].append(ver_ref[1])
-                    seen_refs = set()
-                    for ref, ver in bridge_refs:    
-                        if ref in seen_refs:
-                            continue
-                        seen_refs.add(ref)
-                        if ref in candidate_read_refs: 
-                            ref_versions = candidate_read_refs[ref] 
-                            for version in ref_versions:
-                                producer_actor_rep = self.inspect(self.index.ref_version_to_producer_exec_id[(ref, version)], "exec_record").object.object.producer_id.source_actor
-                                lines.append(f"{downstream_action} {ref}[v{version}] from {producer_actor_rep}")
-
-
-
-                        if ref in candidate_write_refs: 
-                            ref_versions = candidate_write_refs[ref] 
-                            for version in ref_versions:
-                                consumer_actor_rep = curr_source.object.object.producer_id.source_actor
-                                if source.type == "value" or target.type == "value" or all([target.type == "reference", source.type == "reference", direction=="upstream"]):
-                                    lines.append(f"{upstream_action} {ref}[v{version}]")
-                                else:
-                                    lines.append(f"{upstream_action} {ref}[v{version}] used by {consumer_actor_rep}")
-
-                    if deep_link and target.type in ["reference", "value"]:
-                        for ref, ver in target_write_refs:
-                            target_line = f"{upstream_action} {ref}[v{ver}]"
-                            if target_line not in lines:
-                                lines.append(target_line)
-
-
-
-                return lines, terminal
-
-            else:
-                bridge_refs = set(valid_read_sources) & set(candidate_writes)
-
-                if current_edge_refs is not None:
-                    bridge_refs &= current_edge_refs
-
-                if curr_source_exec == candidate_exec and not bridge_refs:
-                    direct_refs = set(valid_read_sources) | set(valid_write_sources)
-
-                    if target.type in ["reference", "value"]:
-                        direct_refs &= target_refs
-                        if not direct_refs:
-                            return [], False
-
-                        if direct_refs & set(valid_read_sources):
-                            return [], False
-
-                    for ref, ver in valid_read_sources:
-                        if (ref, ver) not in direct_refs:
-                            continue
-
-                        producer_actor_rep = self.inspect(
-                            self.index.ref_version_to_producer_exec_id[(ref, ver)],
-                            "exec_record",
-                        ).object.object.producer_id.source_actor
-                        lines.append(f"{downstream_action} {ref}[v{ver}] from {producer_actor_rep}")
-
-                    for ref, ver in valid_write_sources:
-                        if (ref, ver) not in direct_refs:
-                            continue
-
-                        lines.append(f"{upstream_action} {ref}[v{ver}]")
-
-                    return lines, stay_terminal
-
-
-
-
-                if bridge_refs:
-                    target_write_refs = set(candidate_writes) & set(target_refs)
-
-                    if deep_link and target.type in ["reference", "value"] and target_write_refs:
-                        terminal = stay_terminal
-
-                    terminal_hits = bridge_refs & target_refs
-
-                    if (
-                        not deep_link
-                        and source.type == "reference"
-                        and target.type == "reference"
-                    ):
-                        terminal_hits = set()
-
-                    if terminal_hits:
-
-                        for ref, ver in terminal_hits:
-                            consumer_actor_rep = curr_source.object.object.producer_id.source_actor
-                            if source.type == "value" or target.type == "value" or all([target.type == "reference", source.type == "reference", direction=="upstream"]):
-                                lines.append(f"{upstream_action} {ref}[v{ver}]")
-                            else:
-                                lines.append(f"{upstream_action} {ref}[v{ver}] used by {consumer_actor_rep}")
-
-
-                        terminal = stay_terminal
-                        return lines, terminal
-
-
-                    if target.type in ["actor", "exec_record", "effect"]:
-                        terminal = stay_terminal
-
-                    candidate_read_refs = defaultdict(list)
-                    candidate_write_refs = defaultdict(list)
-                    for ver_ref in candidate_reads:
-                        candidate_read_refs[ver_ref[0]].append(ver_ref[1]) 
-                    for ver_ref in candidate_writes:
-                        candidate_write_refs[ver_ref[0]].append(ver_ref[1])
-                    seen_refs = set()
-                    for ref, ver in bridge_refs:    
-                        if ref in seen_refs:
-                            continue
-                        seen_refs.add(ref)
-
-                        if ref in candidate_read_refs: 
-                            ref_versions = candidate_read_refs[ref] 
-                            for version in ref_versions:
-                                producer_actor_rep = self.inspect(self.index.ref_version_to_producer_exec_id[(ref, version)]).object.object.producer_id.source_actor
-                                lines.append(f"{downstream_action} {ref}[v{version}] from {producer_actor_rep}")
-
-
-                        if ref in candidate_write_refs: 
-                            ref_versions = candidate_write_refs[ref] 
-                            for version in ref_versions:
-                                consumer_actor_rep = curr_source.object.object.producer_id.source_actor
-                                if source.type == "value" or target.type == "value":
-                                    lines.append(f"{upstream_action} {ref}[v{version}]")
-                                else:
-                                    lines.append(f"{upstream_action} {ref}[v{version}] used by {consumer_actor_rep}")
-
-
-
-
-                return lines, terminal
-
-
-        def _filter_valid_paths(
+        target_seeds = self._execution_seeds(target)
+        valid_paths = defaultdict(list)
+        source_seeds = self._execution_seeds(source)
+        adjacency, next_relation = self._stream_adjacency(direction)
+        root_state_versions = self._stream_root_state_versions(
             source,
             direction,
-            valid_paths,
-            curr_path=None,
-        ):
-            if curr_path is None:
-                curr_path = []
+        )
 
-            # Endpoint pathing walks one exact relationship at a time.  It
-            # must not depend on the public stream query's depth policy.
-            paths = self._direct_stream_paths(source, direction)
-
-            for path in paths.get(source.id, []):
-
-                # Every sibling path starts from the same parent prefix,
-                # not from the mutated result of the previous sibling.
-                branch_path = list(curr_path)
-
-                for curr_step in path:
-                    if (
-                        not curr_path
-                        and queried_source.type == "effect"
-                    ):
-                        effect_id = queried_source.id
-                        effect_kind = (
-                            effect_id[0]
-                            if isinstance(effect_id, tuple)
-                            else effect_id
-                        )
-                        effect_refs = set(
-                            self._get_target_refs(
-                                queried_source,
-                                direction,
-                            )
-                        )
-                        if effect_kind in {Effects.WRITE, Effects.DELETE}:
-                            if not isinstance(curr_step, AffectedStackLink):
-                                continue
-                            if curr_step.cause_effect != effect_kind:
-                                continue
-                            if effect_refs and (
-                                curr_step.produced_ref,
-                                curr_step.produced_ver,
-                            ) not in effect_refs:
-                                continue
-
-                    branch_path.append(curr_step)
-
-                    next_exec = getattr(
-                        curr_step,
-                        f"{actor}_exec_id",
-                    )
-
-                    link, terminal = terminal_link(
-                        source.id,
-                        next_exec,
-                        curr_step,
-                        source_is_root=not curr_path,
-                    )
-
-                    if link:
-                        branch_path.extend(link)
-
-                    if not terminal:
-                        if deep_link and (
-                            link
-                            or isinstance(curr_step, EmittedStackLink)
-                        ):
-                            next_source = self.inspect(
-                                next_exec,
-                                "exec_record",
-                            )
-
-                            valid_paths = _filter_valid_paths(
-                                next_source,
-                                direction,
-                                valid_paths,
-                                branch_path.copy(),
-                            )
-
-                        continue
-
-                    valid_paths[ROOT_SEED].append(
-                        branch_path.copy()
-                    )
-
-            return valid_paths               
-                        
-
-
-
-        target_seeds = self._seed_inspected("target", target, direction)
-        valid_paths = defaultdict(list)
-
-        
-        source_seeds = self._seed_inspected("source", source, direction)
-
-        for _source in source_seeds:
+        for root_exec_id in source_seeds:
             # 1. Direct/root proof:
-            link, terminal = terminal_link(
-                _source,
-                _source,
-                source_is_root=True,
+            link = self._direct_path_explanation(
+                root_exec_id,
+                source,
+                target,
+                target_seeds,
+                direction,
             )
 
-            if terminal:
-                valid_paths[_source].append(link)
-    
-            ROOT_SEED = _source    
-            # 2. Edge-walk proof:
-            valid_paths = _filter_valid_paths(self.inspect(_source, "exec_record"), direction, valid_paths)
+            if link:
+                valid_paths[root_exec_id].append(link)
+
+            # 2. Edge-walk proof.  A stack frame either expands one execution
+            # or evaluates one pending edge.  Reversing expansion order keeps
+            # the same deterministic depth-first order as the former recursive
+            # walk without depending on Python's call-stack limit.
+            stack = [("expand", root_exec_id, [], {root_exec_id}, True)]
+            while stack:
+                frame, current_exec_id, branch_path, visited, is_root = stack.pop()
+
+                if frame == "expand":
+                    edges = adjacency[current_exec_id]
+                    for curr_step in reversed(edges):
+                        if (
+                            is_root
+                            and root_state_versions is not None
+                            and (
+                                curr_step.produced_ref,
+                                curr_step.produced_ver,
+                            ) not in root_state_versions
+                        ):
+                            continue
+                        stack.append((
+                            curr_step,
+                            current_exec_id,
+                            branch_path,
+                            visited,
+                            is_root,
+                        ))
+                    continue
+
+                curr_step = frame
+                if is_root and source.type == "effect":
+                    effect_id = source.id
+                    effect_kind = (
+                        effect_id[0]
+                        if isinstance(effect_id, tuple)
+                        else effect_id
+                    )
+                    effect_refs = set(
+                        self._get_target_refs(source, direction)
+                    )
+                    if effect_kind in {Effects.WRITE, Effects.DELETE}:
+                        if not isinstance(curr_step, AffectedStackLink):
+                            continue
+                        if curr_step.cause_effect != effect_kind:
+                            continue
+                        if effect_refs and (
+                            curr_step.produced_ref,
+                            curr_step.produced_ver,
+                        ) not in effect_refs:
+                            continue
+
+                next_exec = getattr(curr_step, next_relation)
+                next_path = [*branch_path, curr_step]
+                terminal = self._edge_reaches_path_target(
+                    curr_step,
+                    next_exec,
+                    source,
+                    target,
+                    target_seeds,
+                    direction,
+                    deep_link,
+                )
+                link = self._edge_path_explanation(
+                    curr_step,
+                    next_exec,
+                    source,
+                    target,
+                    direction,
+                    deep_link,
+                    terminal,
+                )
+                if link:
+                    next_path.extend(link)
+
+                # Match the target before suppressing a revisited execution.
+                # This preserves a closing edge such as X -> ... -> X, while
+                # the visited set still prevents expansion around the cycle.
+                if terminal:
+                    valid_paths[root_exec_id].append(next_path)
+                    continue
+
+                if (
+                    deep_link
+                    and next_exec is not None
+                    and next_exec not in visited
+                ):
+                    stack.append((
+                        "expand",
+                        next_exec,
+                        next_path,
+                        visited | {next_exec},
+                        False,
+                    ))
 
         pathed = Pathed(self.inspect, self.index, source, source_seeds, target, target_seeds, valid_paths, direction)
         return pathed
-
-    def _filter_seeds(self, source, seeds: list, direction="unknown"):
-        # create a dict of what each seed, a seed has n amount of edges, of each edge, determine what related to source
-        seed_to_source_paths = defaultdict(list)
-        
-        for seed in seeds:
-            path: Pathed = self.path(source, seed, direction=direction)
-            if path.exists():
-                seed_to_source_paths[seed].append(path)
-
-        return seed_to_source_paths                  
 
     def produced_by(
         self,

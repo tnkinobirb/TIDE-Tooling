@@ -69,6 +69,14 @@ CHALLENGE_MODEL = {
         ["e:15:convert", "s:atlas_z_graphic"],
     ],
 }
+CHALLENGE_MODEL["E"] = sorted({
+    execution
+    for execution, _ in CHALLENGE_MODEL["I"] + CHALLENGE_MODEL["O"]
+})
+CHALLENGE_MODEL["S"] = sorted({
+    state
+    for _, state in CHALLENGE_MODEL["I"] + CHALLENGE_MODEL["O"]
+})
 
 
 @pytest.fixture
@@ -199,8 +207,8 @@ def test_model_diff_reuses_recorded_unknown_assignment_policy(challenge_trace):
     compared = challenge_trace.diff(challenge_trace)
 
     assert compared.same is True
-    assert compared.before_report["conforms"] is True
-    assert compared.after_report["conforms"] is True
+    assert compared.before_report["semantically_valid"] is True
+    assert compared.after_report["semantically_valid"] is True
 
     restored = TIDE.from_bundle(challenge_trace.to_bundle())
     assert restored.model_context["assigned_unknown_states"]

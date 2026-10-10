@@ -88,7 +88,6 @@ class TIDERunDeserialiser:
             output_value=output_value,
             resolve_output=record.get("resolve_output"),
             writes=writes,
-            emitted_by=self._deserialise_emitted_by(record.get("emitted_by")),
             emitted_nodes=emitted_nodes,
             base_node_id=self._content_id_value(
                 record.get("base_node_id")
@@ -193,7 +192,7 @@ class TIDERunDeserialiser:
         if not isinstance(effects, (list, tuple)):
             raise TypeError("TideRun effects must be a list")
 
-        rebuilt = {}
+        rebuilt = []
 
         for record in effects:
             if not isinstance(record, dict):
@@ -217,32 +216,24 @@ class TIDERunDeserialiser:
                     entry.get("exec_id"),
                 )
 
-            output = self._resolve_optional_value_hash(
+            output = self._resolve_available_value(
                 record.get("output_value_hash"),
+                record.get("output_value_available"),
                 values,
             )
-            preserved_output_hash = record.get(
-                "preserved_output_value_hash"
-            )
-            if preserved_output_hash is not None:
-                preserved_output = self._resolve_value_hash(
-                    preserved_output_hash,
-                    values,
-                )
-            else:
-                preserved_output = (
-                    True
-                    if record.get("preserved")
-                    else self._template_value()
-                )
             effect = self._types["EffectRecord"](
                 effect=effect_kind,
                 targets=targets,
+                origin=record["origin"],
                 output=output,
-                preserved_output=preserved_output,
                 affected=affected,
+                target_existed=(
+                    record["target_existed"]
+                    if record.get("effect") in {"read", "DELETE"}
+                    else None
+                ),
             )
-            rebuilt[(effect.effect, targets)] = effect
+            rebuilt.append(effect)
 
         return rebuilt
 
@@ -323,20 +314,6 @@ class TIDERunDeserialiser:
             record.get("name"),
         )
 
-    def _deserialise_emitted_by(self, record):
-        if record is None:
-            return None
-
-        if not isinstance(record, dict):
-            raise TypeError("TideRun emitted_by must be a dict")
-
-        actor = self._deserialise_actor(record.get("actor"))
-
-        if actor is None:
-            return None
-
-        return actor, record.get("exec_id")
-
     def _deserialise_emitted_node(self, record, values):
         if not isinstance(record, dict):
             raise TypeError("TideRun emitted node must be a dict")
@@ -362,7 +339,7 @@ class TIDERunDeserialiser:
                 self._deserialise_effect_descriptor(entry)
                 for entry in record.get("declared_effects", ())
             ],
-            emitted_by=self._deserialise_emitted_by(record.get("emitted_by")),
+            origin=record.get("origin"),
             content_id=self._content_id_value(record.get("content_id")),
             base_node=self._content_id_value(
                 record.get("base_node_id")
@@ -480,9 +457,6 @@ class TIDERunDeserialiser:
 
         if run.get("kind") != "tide_run":
             raise ValueError("Unsupported TideRun kind")
-
-        if run.get("codec_version") != 2:
-            raise ValueError("Unsupported TideRun codec version")
 
         if not isinstance(run.get("exec_records"), list):
             raise TypeError("TideRun exec_records must be a list")

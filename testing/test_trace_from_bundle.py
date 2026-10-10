@@ -54,8 +54,7 @@ def make_exec_record(seq_id, exec_id, name, deps=(), writes=()):
         node_options={"resolve_output": False},
         deps=list(deps),
         writes=list(writes),
-        effects={},
-        emitted_by=None,
+        effects=[],
         emitted_nodes=[],
         producer_id=make_actor(name),
     )
@@ -396,7 +395,6 @@ def test_effect_evidence_survives_json_bundle_round_trip(capsys):
     )
     effect_record = prepared_effect.object.effects[0]
     assert effect_record.output == prepared_value
-    assert effect_record.preserved_output == prepared_value
 
     path = rebuilt.path(
         (Effects.WRITE, ("global:prepared", 0)),
@@ -445,7 +443,7 @@ def test_deleted_reference_read_remains_effect_evidence_without_fake_dependency(
 
     rebuilt = TIDE.from_bundle(source.to_bundle().to_dict())
     rebuilt_read = rebuilt.exec_log[-1]
-    rebuilt_effect = next(iter(rebuilt_read.effects.values()))
+    rebuilt_effect = rebuilt_read.effects[0]
 
     assert rebuilt_read.runtime_effects[0]["found"] is False
     assert not rebuilt_read.deps

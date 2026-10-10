@@ -119,7 +119,7 @@ if __name__ == "__main__":
         "exec_record",
     ).show()
 
-    print("\n8. DELETE FOLLOWED BY A FAILED RUNTIME READ")
+    print("\n8. DELETE FOLLOWED BY A MISSING RUNTIME READ")
     deleted_tide = TIDE()
     deleted_tide.declare("ephemeral", {"available": True})
     deleted_tide.event(

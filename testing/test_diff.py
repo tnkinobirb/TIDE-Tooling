@@ -111,6 +111,22 @@ def test_trace_diff_compares_execution_evidence_and_view_objects():
     assert first.find("writer").diff(first.find("writer")).same is True
 
 
+def test_model_diff_keeps_judgments_for_semantically_invalid_structure():
+    cycle = {
+        "E": ["left", "right"],
+        "S": ["to-left", "to-right"],
+        "I": [["left", "to-left"], ["right", "to-right"]],
+        "O": [["left", "to-right"], ["right", "to-left"]],
+    }
+
+    compared = TIDE().trace().diff(cycle)
+
+    assert compared.after_report["structurally_valid"] is True
+    assert compared.after_report["semantically_valid"] is False
+    assert compared.after_report["judgments"]["direct_handoffs"]
+    assert compared.after_report["judgments"]["reachability"]
+
+
 def test_bundle_round_trip_does_not_turn_none_content_ids_into_strings():
     tide = TIDE()
     tide.event("writer", writes={"@message": "stable"})
@@ -152,6 +168,8 @@ def test_diff_show_groups_execution_reads_and_writes_by_record():
 
 def test_trace_diff_defaults_to_tide_model_and_judgment_sets():
     before = TIDE.from_model({
+        "E": ["unknown", "e1", "e2"],
+        "S": ["s0", "s1", "s2"],
         "I": [["e1", "s0"], ["e2", "s1"]],
         "O": [
             ["unknown", "s0"],
@@ -160,6 +178,8 @@ def test_trace_diff_defaults_to_tide_model_and_judgment_sets():
         ],
     })
     after = TIDE.from_model({
+        "E": ["unknown", "e1", "e2", "e3"],
+        "S": ["s0", "s1", "s2", "s3"],
         "I": [
             ["e1", "s0"],
             ["e2", "s1"],
@@ -181,7 +201,7 @@ def test_trace_diff_defaults_to_tide_model_and_judgment_sets():
     assert compared.same is False
     assert compared.same_kernel is False
     assert compared.same_judgments is False
-    assert set(data["kernel"]) == {"I", "O"}
+    assert set(data["kernel"]) == {"E", "S", "I", "O"}
     assert data["kernel"]["I"]["added"] == [{
         "exec_id": "e3",
         "state_id": "s2",
@@ -209,10 +229,14 @@ def test_trace_diff_defaults_to_tide_model_and_judgment_sets():
 
 def test_tide_model_diff_accepts_compact_incidence_dictionaries():
     before = TIDE.from_model({
+        "E": ["e1", "e2"],
+        "S": ["s1"],
         "I": [{"e": "e2", "s": "s1"}],
         "O": [{"e": "e1", "s": "s1"}],
     })
     after = {
+        "E": ["e1", "e2", "e3"],
+        "S": ["s1", "s2"],
         "I": [
             {"e": "e2", "s": "s1"},
             {"e": "e3", "s": "s2"},
@@ -238,10 +262,14 @@ def test_tide_model_diff_accepts_compact_incidence_dictionaries():
 
 def test_tide_model_diff_can_change_kernel_without_changing_judgments():
     before = TIDE.from_model({
+        "E": ["e1"],
+        "S": ["s0"],
         "I": [],
         "O": [["e1", "s0"]],
     })
     after = TIDE.from_model({
+        "E": ["e1", "unknown"],
+        "S": ["s0", "boundary"],
         "I": [],
         "O": [["e1", "s0"], ["unknown", "boundary"]],
     })
@@ -278,10 +306,14 @@ def test_tide_model_diff_treats_host_labels_as_context_only():
 
 def test_tide_model_diff_defaults_to_literal_host_identity():
     before = TIDE.from_model({
+        "E": ["left-produce", "left-consume"],
+        "S": ["left-state"],
         "I": [["left-consume", "left-state"]],
         "O": [["left-produce", "left-state"]],
     })
     after = TIDE.from_model({
+        "E": ["right-produce", "right-consume"],
+        "S": ["right-state"],
         "I": [["right-consume", "right-state"]],
         "O": [["right-produce", "right-state"]],
     })
@@ -296,11 +328,15 @@ def test_tide_model_diff_defaults_to_literal_host_identity():
 
 def test_tide_model_diff_structural_view_is_an_explicit_toggle():
     before = TIDE.from_model({
+        "E": ["left-produce", "left-consume"],
+        "S": ["left-state"],
         "I": [["left-consume", "left-state"]],
         "O": [["left-produce", "left-state"]],
         "states": {"left-state": {"value": "left-value"}},
     })
     after = {
+        "E": ["right-produce", "right-consume"],
+        "S": ["right-state"],
         "I": [["right-consume", "right-state"]],
         "O": [["right-produce", "right-state"]],
         "states": {"right-state": {"value": "different-value"}},
@@ -321,7 +357,7 @@ def test_tide_model_diff_structural_view_is_an_explicit_toggle():
         "state_id": "state_0",
     }]
     assert compared.identity_basis == (
-        "canonical I/O incidence structure "
+        "canonical E/S identities and I/O incidence "
         "(values and enrichment excluded)"
     )
     assert "states" not in compared.before
@@ -341,11 +377,15 @@ def test_trace_diff_rejects_structural_identity_for_object_diff():
 def test_tide_model_diff_show_is_relationship_first_and_tide_styled():
     before = TIDE.from_model({
         "host": "before-host",
+        "E": ["e1", "e2"],
+        "S": ["s1"],
         "I": [["e2", "s1"]],
         "O": [["e1", "s1"]],
     })
     after = TIDE.from_model({
         "host": "after-host",
+        "E": ["unknown", "e1", "e2"],
+        "S": ["s1", "s2"],
         "I": [["e2", "s2"]],
         "O": [["e1", "s1"], ["unknown", "s2"]],
     })
@@ -362,7 +402,7 @@ def test_tide_model_diff_show_is_relationship_first_and_tide_styled():
     assert "KERNEL:" in plain
     assert plain.index("DIRECT HANDOFFS:") < plain.index("KERNEL:")
     assert "- e1 --s1--> e2" in plain
-    assert "literal Execution and State identities in I/O" in plain
+    assert "literal E/S identity carriers and I/O incidence" in plain
     assert "host: before-host → after-host" in plain
 
 

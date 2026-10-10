@@ -783,10 +783,6 @@ def test_emit_effect_registers_child_before_child_execution_and_maps_path():
         "emitted_child",
     ]
     emitter_record, child_record = trace.exec_log
-    assert child_record.emitted_by == (
-        emitter_record.producer_id,
-        emitter_record.exec_id,
-    )
     assert child_record.producer_id in trace.index.actors_by_emitter_actor[
         emitter_record.producer_id
     ]
@@ -799,6 +795,19 @@ def test_emit_effect_registers_child_before_child_execution_and_maps_path():
         "actor",
         "actor",
     ).exists()
+    assert trace.path(
+        emitter_record.exec_id,
+        child_record.exec_id,
+        "exec_record",
+        "exec_record",
+    ).exists()
+    assert trace.path(
+        child_record.exec_id,
+        emitter_record.exec_id,
+        "exec_record",
+        "exec_record",
+        direction="upstream",
+    ).exists()
 
     imported = TIDE.from_bundle(trace.to_bundle().to_dict())
     assert imported.path(
@@ -806,6 +815,20 @@ def test_emit_effect_registers_child_before_child_execution_and_maps_path():
         "emitted_child",
         "actor",
         "actor",
+    ).exists()
+    imported_emitter, imported_child = imported.exec_log
+    assert imported.path(
+        imported_emitter.exec_id,
+        imported_child.exec_id,
+        "exec_record",
+        "exec_record",
+    ).exists()
+    assert imported.path(
+        imported_child.exec_id,
+        imported_emitter.exec_id,
+        "exec_record",
+        "exec_record",
+        direction="upstream",
     ).exists()
 
 
@@ -859,10 +882,6 @@ def test_returned_node_is_emitted_executed_once_and_maps_portably():
     assert emitter_record.emitted_nodes[0].declared_targets == [
         DataRef("returned_emission", "global")
     ]
-    assert child_record.emitted_by == (
-        emitter_record.producer_id,
-        emitter_record.exec_id,
-    )
     assert trace.value_of("global:returned_emission") == [
         "returned-child-result"
     ]
@@ -949,11 +968,6 @@ def test_node_lists_work_for_returned_and_explicit_emissions():
             emitted.func_name
             for emitted in emitter_record.emitted_nodes
         ] == ["first_emitted", "second_emitted"]
-        assert all(
-            child.emitted_by
-            == (emitter_record.producer_id, emitter_record.exec_id)
-            for child in children
-        )
         assert trace.value_of("global:first_emitted") == [
             "first-result"
         ]
@@ -977,6 +991,168 @@ def test_node_lists_work_for_returned_and_explicit_emissions():
                 "actor",
                 "actor",
             ).exists()
+
+
+def test_emission_occurrences_preserve_declared_then_runtime_order():
+    @node(targets=["global:declared_first"])
+    def declared_first():
+        return "declared-first"
+
+    @node(targets=["global:declared_second"])
+    def declared_second():
+        return "declared-second"
+
+    @node(targets=["global:runtime_child"])
+    def runtime_child():
+        return "runtime-child"
+
+    @node(effects=[
+        EMIT(declared_first.as_node()),
+        EMIT(declared_second.as_node()),
+    ])
+    def emitter():
+        return runtime_child.as_node()
+
+    @pipeline
+    def flow():
+        return emitter()
+
+    trace = TIDE().ocean.run_pipeline(flow, mode="sequential")
+    occurrences = trace.exec_log[0].emitted_nodes
+
+    assert [record.func_name for record in occurrences] == [
+        "declared_first",
+        "declared_second",
+        "runtime_child",
+    ]
+    assert [record.origin for record in occurrences] == [
+        "declared",
+        "declared",
+        "runtime",
+    ]
+
+    bundle = trace.to_bundle().to_dict()
+    bundled_run = bundle["manifest"]["run"]
+    bundled_occurrences = bundled_run["exec_records"][0][
+        "emitted_nodes"
+    ]
+    assert [record["func_name"] for record in bundled_occurrences] == [
+        "declared_first",
+        "declared_second",
+        "runtime_child",
+    ]
+    assert [record["origin"] for record in bundled_occurrences] == [
+        "declared",
+        "declared",
+        "runtime",
+    ]
+    assert "emitted_by" not in bundled_run["exec_records"][0]
+    assert all(
+        "emitted_by" not in record
+        for record in bundled_occurrences
+    )
+
+    imported = TIDE.from_bundle(bundle)
+    assert [
+        (record.func_name, record.origin)
+        for record in imported.exec_log[0].emitted_nodes
+    ] == [
+        ("declared_first", "declared"),
+        ("declared_second", "declared"),
+        ("runtime_child", "runtime"),
+    ]
+
+
+def test_repeated_emission_is_two_occurrences_but_one_dag_node():
+    calls = []
+
+    @node(targets=["global:child"])
+    def child():
+        calls.append("child")
+        return "child"
+
+    @node
+    def emitter():
+        emitted = child.as_node()
+        return EMIT([emitted, emitted])
+
+    @pipeline
+    def flow():
+        return emitter()
+
+    trace = TIDE().ocean.run_pipeline(flow, mode="sequential")
+    occurrences = trace.exec_log[0].emitted_nodes
+
+    assert calls == ["child"]
+    assert len(occurrences) == 2
+    assert [record.node_id for record in occurrences] == [
+        occurrences[0].node_id,
+        occurrences[0].node_id,
+    ]
+    assert [record.origin for record in occurrences] == [
+        "runtime",
+        "runtime",
+    ]
+
+    imported = TIDE.from_bundle(trace.to_bundle().to_dict())
+    imported_occurrences = imported.exec_log[0].emitted_nodes
+    assert len(imported_occurrences) == 2
+    assert [record.node_id for record in imported_occurrences] == [
+        imported_occurrences[0].node_id,
+        imported_occurrences[0].node_id,
+    ]
+
+
+def test_each_emitter_keeps_its_own_relationship_to_a_reused_node():
+    @node(targets=["global:shared_child"])
+    def shared_child():
+        return "shared-child"
+
+    @node
+    def first_emitter():
+        return shared_child.as_node()
+
+    @node
+    def second_emitter():
+        return shared_child.as_node()
+
+    @pipeline
+    def flow():
+        return [first_emitter(), second_emitter()]
+
+    trace = TIDE().ocean.run_pipeline(flow, mode="sequential")
+
+    for emitter in ("first_emitter", "second_emitter"):
+        assert trace.path(
+            emitter,
+            "shared_child",
+            "actor",
+            "actor",
+        ).exists()
+
+    first_record, second_record, child_record = trace.exec_log
+    inspected_child = trace.inspect(
+        child_record.producer_id,
+        "actor",
+        grouped=False,
+    )
+    assert inspected_child.upstream[first_record.producer_id] == [
+        first_record.exec_id
+    ]
+    assert inspected_child.upstream[second_record.producer_id] == [
+        second_record.exec_id
+    ]
+
+
+def test_tide_event_does_not_turn_emit_into_a_runner_effect():
+    @node
+    def child():
+        return None
+
+    tide = TIDE()
+
+    with pytest.raises(TypeError, match="Unsupported TIDE event effect"):
+        tide.event("external emitter", effects=EMIT(child.as_node()))
 
 
 def test_emitted_definition_uses_emission_snapshot_not_live_node_state(

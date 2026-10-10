@@ -118,15 +118,32 @@ class StoreRouter:
                 and event.target_runner_id is None
                 else event.target_runner_id
             )
-            store, key, source, cause = event.payload
+            if len(event.payload) == 6:
+                (
+                    store,
+                    key,
+                    source,
+                    cause,
+                    _,
+                    effect_metadata,
+                ) = event.payload
+            else:
+                store, key, source, cause = event.payload
+                effect_metadata = None
             scoped_stores = self.resolve_store_reference(store, runner_id)
             exec_id = event.exec_id
-            for store in scoped_stores:
-                self.delete(store, key)
+            target_existed = False
+            for scoped_store in scoped_stores:
+                found, _ = self.get_store(scoped_store).pop_if_present(key)
+                target_existed = target_existed or found
                 
-                store_obj = self.registry.get(store)
+                store_obj = self.registry.get(scoped_store)
                 if store_obj.scope == "global": runner_id = "*"             
-                self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=runner_id, event_type=PipelineEvents.DEP_DELETED, payload=(store, key, source, cause), exec_id=exec_id))
+                if found:
+                    self.event_emitter(Event(source="store_router", source_id=self.id, target_runner_id=runner_id, event_type=PipelineEvents.DEP_DELETED, payload=(scoped_store, key, source, cause), exec_id=exec_id))
+
+            if effect_metadata is not None:
+                effect_metadata["found"] = target_existed
             return
         
         

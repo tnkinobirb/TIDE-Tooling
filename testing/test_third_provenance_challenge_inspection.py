@@ -51,13 +51,16 @@ def challenge_source():
 def challenge_model(challenge_source):
     # Explicit and inferred outputs stay reviewable in the fixture.  The TIDE
     # import boundary receives their union as its one O relation.
+    outputs = copy.deepcopy(
+        challenge_source["O_explicit"] + challenge_source["O_inferred"]
+    )
+    inputs = copy.deepcopy(challenge_source["I"])
     return {
         "host": challenge_source["name"],
-        "I": copy.deepcopy(challenge_source["I"]),
-        "O": copy.deepcopy(
-            challenge_source["O_explicit"]
-            + challenge_source["O_inferred"]
-        ),
+        "E": sorted({execution for execution, _ in inputs + outputs}),
+        "S": sorted({state for _, state in inputs + outputs}),
+        "I": inputs,
+        "O": outputs,
     }
 
 
@@ -96,13 +99,11 @@ def test_boundary_states_remain_an_explicit_import_decision(
     producer_errors = {
         error
         for error in original_report["errors"]
-        if error.startswith("every_state_has_producer:")
+        if error.startswith("unique_creation:")
     }
 
-    assert original_report["conforms"] is False
-    # Validation stops at the first failed validity condition.  The repair
-    # boundary below derives and records the complete missing-State set.
-    assert len(producer_errors) == 1
+    assert original_report["semantically_valid"] is False
+    assert len(producer_errors) == 2
 
     with pytest.raises(ValueError, match="assign_unknown=True"):
         TIDE.from_model(copy.deepcopy(challenge_model))
@@ -124,7 +125,7 @@ def test_boundary_states_remain_an_explicit_import_decision(
             assign_unknown=True,
         )
 
-    assert TIDE.validate_model(exported)["conforms"] is True
+    assert TIDE.validate_model(exported)["semantically_valid"] is True
 
 
 def test_trace_literal_and_structural_views_keep_the_same_history(

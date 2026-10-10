@@ -133,7 +133,6 @@ def test_event_semantically_equals_exec():
                 "effects": normalise(record.effects or {}),
                 "affected": normalise(record.affected or []),
 
-                "emitted_by": actor_name(record.emitted_by),
                 "emitted_nodes": normalise(record.emitted_nodes or []),
 
                 "status": record.status,
@@ -441,4 +440,3 @@ def test_trace_read_writes_values():
         "!result",
         "!seed-1",
     )
-

@@ -124,7 +124,7 @@ class IntentMap:
             self.states.actual_only,
         ))
         report["intent_equal"] = (
-            report["whole_kernel_equal"]
+            report["complete_agreement"]
             and report["identity_alignment_complete"]
         )
         return report
@@ -393,14 +393,12 @@ def build_trace_intent(trace, runner):
         for target in node.targets:
             produce(exec_id, target)
 
-    represented_exec_ids = {
-        exec_id
-        for exec_id, _ in inputs | outputs
-    }
     model = {
         "schema": "TIDE-Model",
         "schema_version": 1,
         "host": "Ocean Intent Graph",
+        "E": sorted(executions),
+        "S": sorted(states),
         "I": [
             {"exec_id": execution_id, "state_id": state_id}
             for execution_id, state_id in sorted(inputs)
@@ -409,11 +407,7 @@ def build_trace_intent(trace, runner):
             {"exec_id": execution_id, "state_id": state_id}
             for execution_id, state_id in sorted(outputs)
         ],
-        "executions": {
-            exec_id: metadata
-            for exec_id, metadata in executions.items()
-            if exec_id in represented_exec_ids
-        },
+        "executions": executions,
         "states": states,
         "host_record": {
             "projection_kind": "intent",
@@ -425,7 +419,7 @@ def build_trace_intent(trace, runner):
     from tide_tooling.core import TIDE
 
     validation = TIDE.validate_model(model)
-    if not validation["conforms"]:
+    if not validation["semantically_valid"]:
         raise ValueError(
             "Intent projection failed TIDE validation: "
             + "; ".join(validation["errors"])

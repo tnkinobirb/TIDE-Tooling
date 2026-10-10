@@ -40,7 +40,7 @@ def make_exec(seq_id: int, name: str, deps=None, writes=None, effects=None, inpu
         func_name=name,
         inputs=inputs or {},
         deps=deps or [],
-        effects=effects or {},
+        effects=effects or [],
         declared_effects=[],
         declared_targets=[],
         runtime_effects=[],
@@ -86,8 +86,13 @@ def create_effect_trace():
     input_use.dependencies = [dep]
     consumer = make_exec(1, "Consumer", deps=[dep], inputs={"payload": input_use})
 
-    effect = EffectRecord(Effects.WRITE, ("global:@A", 0), preserved_output="!A")
-    effect_producer = make_exec(2, "EffectProducer", effects={(Effects.WRITE, ("global:@A", 0)): effect})
+    effect = EffectRecord(
+        Effects.WRITE,
+        ("global:@A", 0),
+        origin="declared",
+        output="!A",
+    )
+    effect_producer = make_exec(2, "EffectProducer", effects=[effect])
 
     return Trace(event_log=None, exec_log=[writer, consumer, effect_producer], runner="tests", ocean_id=0)
 
@@ -368,7 +373,7 @@ def test_effect_creates_affected_stack_link_with_affected_input():
     edge = edges[0]
     assert isinstance(edge, AffectedStackLink)
     assert edge_tuple(edge) == (exec_id(trace, 2), exec_id(trace, 1), "global:@A", 0)
-    assert [name for name, _ in edge.consumer_inputs] == ["payload"]
+    assert edge.consumer_inputs == [{"name": "payload", "index": None}]
     assert edge.cause_effect == Effects.WRITE
 
 

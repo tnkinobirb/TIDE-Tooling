@@ -226,6 +226,10 @@ class Stream:
 
     def _execution_display(self, exec_id, actor=None):
         """Show a stable occurrence label without exposing an opaque ID."""
+        if exec_id is None:
+            actor_name = getattr(actor, "source_actor", actor)
+            return str(actor_name)
+
         inspect = getattr(self, "inspect", None)
         if inspect is not None:
             try:
@@ -979,6 +983,38 @@ class Pathed(Stream):
                     last_connected_exec = connected_exec
                     pending_edge = None
 
+                if isinstance(pending_edge, EmittedStackLink):
+                    connected_exec_id = (
+                        pending_edge.producer_exec_id
+                        if self.direction == "upstream"
+                        else pending_edge.consumer_exec_id
+                    )
+                    connected_actor = (
+                        pending_edge.producer_actor
+                        if self.direction == "upstream"
+                        else pending_edge.consumer_actor
+                    )
+                    connected_display = self._execution_display(
+                        connected_exec_id,
+                        connected_actor,
+                    )
+                    terminal_text = self._path_terminal_line(
+                        pending_edge,
+                        "",
+                        show_input_positions,
+                        dim,
+                        white,
+                        reset,
+                        green=green,
+                        cyan=cyan,
+                        red=red,
+                    )
+                    lines.append(
+                        f"{dim}{path_prefix}{SHOW_TREE_LAST}{reset} "
+                        f"{cyan}{connected_display}{reset} "
+                        f"{dim}|{reset} {terminal_text}{reset}"
+                    )
+
         return lines
 
 
@@ -1721,8 +1757,8 @@ class Investigate:
         for actor, affected_record in record.affected.items():
             input_positions = []
             for item in affected_record.affected_inputs or []:
-                if isinstance(item, tuple) and item:
-                    input_positions.append(str(item[0]))
+                if isinstance(item, dict):
+                    input_positions.append(str(item.get("name", "unknown")))
                 else:
                     input_positions.append(str(item))
 
@@ -1734,22 +1770,11 @@ class Investigate:
                 "inputs": input_positions,
             })
 
-        preserved = not isinstance(
-            record.preserved_output,
-            __TIDE_TEMPLATE_VALUE__,
-        )
         if effect == Effects.DELETE:
             available = False
             healthy = False
         elif effect == Effects.READ:
-            read_states = [
-                self.index._runtime_read_found(
-                    self.index.exec_by_exec_id[exec_id],
-                    target,
-                )
-                for exec_id in producer_exec_ids
-            ]
-            available = any(found is True for found in read_states)
+            available = record.target_existed is True
             healthy = available
         else:
             available = (
@@ -1772,10 +1797,6 @@ class Investigate:
             "available": available,
             "healthy": healthy,
             "output": record.output,
-            "preserved": preserved,
-            "preserved_output": (
-                record.preserved_output if preserved else None
-            ),
             "producers": [
                 self._exec_entity(exec_id)
                 for exec_id in producer_exec_ids
@@ -2533,7 +2554,6 @@ class Object:
         self.reads = []
         self.writes = []
         self.effects = []
-        self.emitted_by = {}
         # For execution
         self.source_id: int = None # f"{self.source_ocean}{self.source_runner}{self.type[0]}{self.id}" # ocean
         
@@ -3162,9 +3182,11 @@ class Compared:
 
 
 class TIDEModelCompared(Compared):
-    """A semantic diff of two valid TIDE Model kernels and judgments."""
+    """A diff of two structurally valid TIDE Model kernels and judgments."""
 
     _KERNEL_LABELS = {
+        "E": "EXECUTION IDENTITIES",
+        "S": "STATE IDENTITIES",
         "I": "INPUT INCIDENCE",
         "O": "OUTPUT INCIDENCE",
     }
@@ -3208,9 +3230,10 @@ class TIDEModelCompared(Compared):
         self.kernel = kernel
         self.judgments = judgments
         self.identity_basis = (
-            "canonical I/O incidence structure (values and enrichment excluded)"
+            "canonical E/S identities and I/O incidence "
+            "(values and enrichment excluded)"
             if identity_mode == "structural"
-            else "literal Execution and State identities in I/O"
+            else "literal E/S identity carriers and I/O incidence"
         )
 
     @staticmethod

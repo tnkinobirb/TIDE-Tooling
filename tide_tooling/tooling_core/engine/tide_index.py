@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
-
-from tide_tooling.tooling_core.engine.classes import DataRef, __TIDE_TEMPLATE_VALUE__
 from tide_tooling.tooling_core.engine.events import Effects
 from tide_tooling.tooling_core.engine.tide_links import AffectedStackLink, EmittedStackLink, StackLink
 from tide_tooling.tooling_core.engine.tide_records import (
@@ -57,7 +54,7 @@ class TraceIndex:
         self.consumer_exec_id_to_producer_input_edges = deduped_dict()
         self.producer_exec_id_to_consumer_input_edges = deduped_dict()
 
-        # future effects
+        # effects
         self.effects_by_exec_id = deduped_dict()
         self.effect_type_to_affected = deduped_dict()
         self.effect_to_affected = deduped_dict()
@@ -73,11 +70,6 @@ class TraceIndex:
         self.effect_records_by_versioned_target = deduped_dict()
         self.effect_affected_input_positions = deduped_dict()
         self.deleted_ref_versions = set()
-
-    def _effects_items(self, effects):
-        if hasattr(effects, "items"):
-            return effects.items()
-        return enumerate(effects or [])
 
     def _dep_queue(self, record):
         return record.expanded_to if record.type == "dynamic" else [record]
@@ -151,9 +143,6 @@ class TraceIndex:
         self.value_hash_to_producer_exec_ids[hashed].add(exec_id)
 
 
-    def _effect_is_preserved(self, preserved_output: __TIDE_TEMPLATE_VALUE__ | Any):
-        return False if isinstance(preserved_output, __TIDE_TEMPLATE_VALUE__) else True
-
     def _index_affect_record(self, effect, target, ver, actor, affect_record: AffectedRecord):
 
         self.effect_type_to_affected[effect].append({actor: affect_record})
@@ -164,7 +153,7 @@ class TraceIndex:
             self.ref_version_to_consumer_exec_ids[(target, ver)].add(affect_record.affected_exec_id)
 
     def _affected_inputs_for(self, affectee_log: ExecRecord, targets):
-        affected_inputs = DedupedList()
+        affected_inputs = []
 
         for _, input_use_record in affectee_log.inputs.items():
             for dependency in input_use_record.dependencies:
@@ -173,7 +162,12 @@ class TraceIndex:
                     version = dep_record.resolved_version
 
                     if (reference, version) == targets:
-                        affected_inputs.add((input_use_record.name, input_use_record))
+                        affected_input = {
+                            "name": input_use_record.name,
+                            "index": dep_record.input_index,
+                        }
+                        if affected_input not in affected_inputs:
+                            affected_inputs.append(affected_input)
 
         return affected_inputs
 
@@ -182,14 +176,12 @@ class TraceIndex:
         exec_id = log.exec_id
         effect = record.effect
         targets = record.targets
-        preserved_output = record.preserved_output
-
         target = targets[0]
         ver = targets[1]
 
         if target != "Runner":
             self.seen_refs.add(target)
-            if effect == Effects.DELETE:
+            if effect == Effects.DELETE and record.target_existed is True:
                 self.deleted_ref_versions.add((target, ver))
             elif effect == Effects.WRITE:
                 self.deleted_ref_versions.discard((target, ver))
@@ -203,11 +195,9 @@ class TraceIndex:
             (effect, (target, ver))
         )
 
-        preserved_output = self._effect_is_preserved(preserved_output)
-
         affectees = []
 
-        if effect in [Effects.WRITE] or preserved_output:
+        if effect == Effects.WRITE:
             affectees = self.ref_version_to_consumer_exec_ids[(target, ver)]
             self.effect_type_to_versioned_effects[effect].add((effect, (target, ver)))
 
@@ -286,73 +276,52 @@ class TraceIndex:
         self.effect_to_touched_exec_ids[(effect, target)].add(exec_id)
         self.effect_type_to_producer_exec_ids[effect].add(exec_id)
 
-    def _index_emitted_node_record(self, log:ExecRecord, record: EmittedNodeRecord):
-        emitter_actor = record.emitted_by[0]
-        self.actors_by_emitter_actor[emitter_actor].add(log.producer_id)
-        self.actor_to_emitter_actors[log.producer_id].add(emitter_actor)
-
-    def _index_emitted_by(self, log: ExecRecord):
-        if not log.emitted_by:
-            return
-
-        emitter_actor = log.emitted_by[0]
-        emitter_exec_id = log.emitted_by[1]
-
-        self.actors_by_emitter_actor[emitter_actor].add(log.producer_id)
-        self.actor_to_emitter_actors[log.producer_id].add(emitter_actor)
-        self.emitted_actor_to_emitter_exec_ids[log.producer_id].add(emitter_exec_id)
-
-        emitter_log = self.exec_by_exec_id.get(emitter_exec_id)
-        if emitter_log is None:
-            return
+    def _index_emitted_node_record(
+        self,
+        emitter_log: ExecRecord,
+        record: EmittedNodeRecord,
+        emitted_exec_id=None,
+    ):
+        emitter_actor = emitter_log.producer_id
+        emitted_actor = record.producer_id
+        self.actors_by_emitter_actor[emitter_actor].add(emitted_actor)
+        self.actor_to_emitter_actors[emitted_actor].add(emitter_actor)
+        self.emitted_actor_to_emitter_exec_ids[emitted_actor].add(
+            emitter_log.exec_id
+        )
 
         emitted_link = EmittedStackLink(
-            emitter_exec_id,
-            emitter_log.producer_id,
-            log.exec_id,
-            log.producer_id,
+            emitter_log.exec_id,
+            emitter_actor,
+            emitted_exec_id,
+            emitted_actor,
         )
-        self.consumer_exec_id_to_producer_input_edges[log.exec_id].append(
-            emitted_link
-        )
-        self.producer_exec_id_to_consumer_input_edges[emitter_exec_id].append(
-            emitted_link
-        )
-
-    @staticmethod
-    def _runtime_read_found(log, target):
-        for runtime_effect in getattr(log, "runtime_effects", ()) or ():
-            if not isinstance(runtime_effect, dict):
-                continue
-            if runtime_effect.get("effect") != Effects.READ:
-                continue
-
-            reference = runtime_effect.get("reference")
-            if isinstance(reference, DataRef):
-                reference = DataRef.to_string(
-                    reference,
-                    strip_leading=True,
-                )
-            if reference == target:
-                return runtime_effect.get("found")
-
-        return None
+        if emitted_exec_id is not None:
+            self.consumer_exec_id_to_producer_input_edges[
+                emitted_exec_id
+            ].append(emitted_link)
+        self.producer_exec_id_to_consumer_input_edges[
+            emitter_log.exec_id
+        ].append(emitted_link)
 
     def _link_deleted_runtime_reads(self, exec_logs):
         last_delete_by_ref_version = {}
 
         for log in exec_logs:
-            for _, record in self._effects_items(log.effects):
+            for record in log.effects:
                 target, version = record.targets
                 versioned_target = (target, version)
 
-                if record.effect == Effects.DELETE:
+                if (
+                    record.effect == Effects.DELETE
+                    and record.target_existed is True
+                ):
                     last_delete_by_ref_version[versioned_target] = record
                     continue
 
                 if record.effect != Effects.READ:
                     continue
-                if self._runtime_read_found(log, target) is not False:
+                if record.target_existed is not False:
                     continue
 
                 delete_record = last_delete_by_ref_version.get(
@@ -365,12 +334,13 @@ class TraceIndex:
                     Effects.DELETE,
                     versioned_target,
                     log.producer_id,
-                    ["runtime_read"],
+                    [{"name": "runtime_read", "index": None}],
                     log.exec_id,
                 )
 
     def build(self, exec_logs):
         exec_logs = list(exec_logs)
+        exec_ids_by_node_id = defaultdict(list)
 
         # Pass one establishes complete producer/consumer truth. Effects can
         # point at executions that occur later in the log, so indexing them in
@@ -381,6 +351,7 @@ class TraceIndex:
             exec_id = log.exec_id
 
             self.exec_by_exec_id[exec_id] = log
+            exec_ids_by_node_id[log.node_id].append(exec_id)
             self.reads_by_exec_id[exec_id].extend(log.deps)
             for dep_record in log.deps:
                 queue = [dep_record]
@@ -411,20 +382,34 @@ class TraceIndex:
                 record: WriteRecord
                 self._index_write_record(log, record)
 
-            self._index_emitted_by(log)
-
         # A failed runtime READ after DELETE is causally affected by the
         # deletion, but it is not a successful value dependency.
         self._link_deleted_runtime_reads(exec_logs)
 
         # Pass two indexes effects against the now-complete dependency graph.
         for log in exec_logs:
-            for _, record in self._effects_items(log.effects):
+            for record in log.effects:
                 record: EffectRecord
                 self._index_effect_record(log, record)
 
             for record in log.emitted_nodes:
-                self._index_emitted_node_record(log, record)
+                emitted_exec_id = next(
+                    (
+                        candidate_exec_id
+                        for candidate_exec_id in exec_ids_by_node_id.get(
+                            record.node_id,
+                            (),
+                        )
+                        if self.exec_by_exec_id[
+                            candidate_exec_id
+                        ].seq_id > log.seq_id
+                    ),
+                    None,
+                )
+                self._index_emitted_node_record(
+                    log,
+                    record,
+                    emitted_exec_id,
+                )
 
         return self
-

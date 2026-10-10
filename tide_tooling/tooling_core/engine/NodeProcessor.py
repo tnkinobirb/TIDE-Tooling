@@ -1,4 +1,4 @@
-from typing import Callable, Tuple, Any, Union, Iterable, Generator
+from typing import Callable, Tuple, Any, Union, Generator
 from .classes import Node, NodeInput, ProcessStates, DataRef, RunnerNode, RunnerNodeInput, Event
 from .DependencyTools import DependencyTools
 import inspect
@@ -312,13 +312,8 @@ class NodeProcessor: # __init__(DepTools)
         node.resolved_result = resolved_result
         node.state.result_cached = True
     
-    def _cache_emitted_nodes(self, node: Node, emitted_nodes: Iterable[Node]) -> None:
-        node.emitted_nodes = list(emitted_nodes)
-
     def _fill_cache(self, node: Node, result: Any, resolved_result) -> None:
         self._cache_result(node, result, resolved_result)
-        emitted_nodes = self._extract_nodes_from_result(result)
-        self._cache_emitted_nodes(node, emitted_nodes)
 
     def _satisfy(self, node: Node) -> None:
         all_inputs = list(node.get_all_inputs().values())

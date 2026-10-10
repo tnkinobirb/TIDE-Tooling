@@ -3,7 +3,6 @@ from tide_tooling.tooling_core.engine.classes import (
     DataRef,
     DELETE,
     DELETE_NOW,
-    EMIT,
     END,
     Event,
     Effect,
@@ -79,7 +78,7 @@ import warnings
 
 
 class TIDEModelReport(dict):
-    """A mapping-compatible conformance report for ``K = (I, O)``."""
+    """A mapping-compatible validity report for ``K = (E, S, I, O)``."""
 
     @property
     def direct_handoffs(self):
@@ -120,9 +119,9 @@ class TIDEModelReport(dict):
             simple=simple,
             colour=colour,
         )
-        conforms = bool(self.get("conforms"))
-        status = "VALID" if conforms else "INVALID"
-        status_color = SHOW_GREEN if conforms else SHOW_RED
+        valid = bool(self.get("semantically_valid"))
+        status = "VALID" if valid else "INVALID"
+        status_color = SHOW_GREEN if valid else SHOW_RED
         counts = self.get("counts", {})
         host = self.get("host") or "unspecified"
 
@@ -140,7 +139,7 @@ class TIDEModelReport(dict):
         ]
 
         if not simple:
-            lines.append(f"{SHOW_DIM}CONFORMANCE:{SHOW_RESET}")
+            lines.append(f"{SHOW_DIM}VALIDITY:{SHOW_RESET}")
             for check, passed in self.get("checks", {}).items():
                 label = check.replace("_", " ")
                 if passed:
@@ -553,7 +552,7 @@ class TIDE:
         identity_mode="host",
         assign_unknown=False,
     ) -> Trace:
-        """Project a conforming ``K = (I, O)`` document into a Trace.
+        """Project a semantically valid ``K = (E, S, I, O)`` into a Trace.
 
         By default, imported ExecRecords retain each host-supplied Execution
         identifier exactly. ``identity_mode="structural"`` instead gives the
@@ -584,7 +583,7 @@ class TIDE:
                 else ""
             )
             raise TypeError(
-                "TIDE.from_model() requires a dict containing I and O; "
+                "TIDE.from_model() requires a dict containing E, S, I and O; "
                 f"received {received}{trace_guidance}"
             )
 
@@ -595,10 +594,10 @@ class TIDE:
         )
         assigned_unknown_states = ()
         if (
-            not report["conforms"]
+            not report["semantically_valid"]
             and assign_unknown
             and any(
-                error.startswith("every_state_has_producer:")
+                "has no represented producer" in error
                 for error in report["errors"]
             )
         ):
@@ -610,28 +609,28 @@ class TIDE:
                 model_document,
                 host=host,
             )
-            if report["conforms"]:
+            if report["semantically_valid"]:
                 warnings.warn(
                     "TIDE Model States have no represented producer: "
                     + ", ".join(repr(state) for state in assigned_unknown_states)
                     + ". assign_unknown=True introduced the tool-side "
                     "Execution 'unknown'; this does not establish host "
-                    "provenance or make the original model conforming.",
+                    "provenance or make the original model semantically valid.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-        if not report["conforms"]:
+        if not report["semantically_valid"]:
             suggestion = (
                 "; pass assign_unknown=True only if a tool-side unknown "
                 "producer is acceptable"
                 if any(
-                    error.startswith("every_state_has_producer:")
+                    "has no represented producer" in error
                     for error in report["errors"]
                 )
                 else ""
             )
             raise ValueError(
-                "TIDE Model conformance failed: "
+                "TIDE Model semantic validity failed: "
                 + "; ".join(report["errors"])
                 + suggestion
             )
@@ -651,9 +650,9 @@ class TIDE:
                 model_document,
                 host=host,
             )
-            if not report["conforms"]:
+            if not report["semantically_valid"]:
                 raise ValueError(
-                    "TIDE structural model conformance failed: "
+                    "TIDE structural model semantic validity failed: "
                     + "; ".join(report["errors"])
                 )
 
@@ -670,7 +669,7 @@ class TIDE:
 
     @classmethod
     def validate_model(cls, model, *, host=None):
-        """Return a projection-relative TIDE Model conformance report."""
+        """Return structural and semantic validity for a TIDE Model."""
         _, report = cls._normalise_model_document(model, host=host)
         return report
 
@@ -714,19 +713,13 @@ class TIDE:
         inputs = cls._model_list(repaired["I"], "I")
         outputs = cls._model_list(repaired["O"], "O")
 
-        represented_states = {}
-        for relation, entries in (("I", inputs), ("O", outputs)):
-            for index, entry in enumerate(entries):
-                _, state_id = cls._model_incidence_pair(
-                    entry,
-                    relation,
-                    index,
-                )
-                state_id = cls._model_identifier(
-                    state_id,
-                    f"{relation}[{index}].state",
-                )
-                represented_states[(type(state_id), state_id)] = state_id
+        represented_states = {
+            (type(state_id), state_id): state_id
+            for state_id in cls._normalise_model_carrier(
+                repaired["S"],
+                "S",
+            )
+        }
 
         produced_state_keys = set()
         for index, entry in enumerate(outputs):
@@ -747,22 +740,13 @@ class TIDE:
         if not missing_states:
             return repaired, ()
 
-        represented_executions = {}
-        for relation, entries in (("I", inputs), ("O", outputs)):
-            for index, entry in enumerate(entries):
-                exec_id, _ = cls._model_incidence_pair(
-                    entry,
-                    relation,
-                    index,
-                )
-                exec_id = cls._model_identifier(
-                    exec_id,
-                    f"{relation}[{index}].execution",
-                )
-                represented_executions[(type(exec_id), exec_id)] = exec_id
+        represented_executions = cls._normalise_model_carrier(
+            repaired["E"],
+            "E",
+        )
         if any(
             type(exec_id) is str and exec_id == "unknown"
-            for exec_id in represented_executions.values()
+            for exec_id in represented_executions
         ):
             raise ValueError(
                 "assign_unknown cannot infer producers because the model "
@@ -772,21 +756,16 @@ class TIDE:
             {"exec_id": "unknown", "state_id": state_id}
             for state_id in missing_states
         )
-        if "E" in repaired:
-            executions = cls._model_list(repaired["E"], "E")
-            executions.append("unknown")
-            repaired["E"] = executions
+        executions = cls._model_list(repaired["E"], "E")
+        executions.append("unknown")
+        repaired["E"] = executions
         repaired["O"] = outputs
         return repaired, missing_states
 
     @staticmethod
     def _model_identifier(value, location):
-        if isinstance(value, bool) or not isinstance(value, (str, int)):
-            raise ValueError(
-                f"{location} must be a non-empty string or integer"
-            )
-        if isinstance(value, str) and not value.strip():
-            raise ValueError(f"{location} cannot be empty")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{location} must be a non-empty string")
         return value
 
     @staticmethod
@@ -859,30 +838,16 @@ class TIDE:
         )
 
     @classmethod
-    def _model_compatibility_carrier(
-        cls,
-        model,
-        field,
-        derived,
-        identity_name,
-    ):
-        if field not in model:
-            return
-
-        entries = cls._model_list(model[field], field)
-        asserted = {}
+    def _normalise_model_carrier(cls, entries, field):
+        entries = cls._model_list(entries, field)
+        identities = {}
         for index, entry in enumerate(entries):
             identity = cls._model_identifier(entry, f"{field}[{index}]")
-            asserted[(type(identity), identity)] = identity
-        derived_by_key = {
-            (type(identity), identity): identity
-            for identity in derived
-        }
-        if asserted.keys() != derived_by_key.keys():
-            raise ValueError(
-                f"{field} compatibility carrier must equal the "
-                f"{identity_name} identities derived from I and O"
-            )
+            identities.setdefault((type(identity), identity), identity)
+        return sorted(
+            identities.values(),
+            key=cls._model_identity_sort_key,
+        )
 
     @staticmethod
     def _model_enrichments(value, location):
@@ -905,7 +870,8 @@ class TIDE:
     @classmethod
     def _normalise_model_document(cls, model, *, host=None):
         report = TIDEModelReport({
-            "conforms": False,
+            "structurally_valid": False,
+            "semantically_valid": False,
             "schema": "TIDE-Model",
             "schema_version": 1,
             "host": host,
@@ -914,8 +880,7 @@ class TIDE:
                 "identity": False,
                 "incidence": False,
                 "unique_creation": False,
-                "every_state_has_producer": False,
-                "acyclic_occurrence_ancestry": False,
+                "acyclic_ancestry": False,
             },
             "counts": {
                 "executions": 0,
@@ -933,12 +898,14 @@ class TIDE:
         })
 
         if not isinstance(model, dict):
-            report["errors"].append("model must be a dict containing I and O")
+            report["errors"].append(
+                "model must be a dict containing E, S, I and O"
+            )
             return None, report
 
         missing_fields = [
             field_name
-            for field_name in ("I", "O")
+            for field_name in ("E", "S", "I", "O")
             if field_name not in model
         ]
         if missing_fields:
@@ -986,6 +953,8 @@ class TIDE:
                 report["errors"].append(f"kernel_shape: {error}")
 
         try:
+            execution_ids = cls._normalise_model_carrier(model["E"], "E")
+            state_ids = cls._normalise_model_carrier(model["S"], "S")
             raw_inputs = cls._model_list(model["I"], "I")
             raw_outputs = cls._model_list(model["O"], "O")
             execution_enrichments = cls._model_enrichments(
@@ -1011,29 +980,32 @@ class TIDE:
             report["errors"].append(f"incidence: {error}")
             return None, report
 
-        report["checks"]["incidence"] = True
         report["counts"]["inputs"] = len(inputs)
         report["counts"]["outputs"] = len(outputs)
 
-        execution_id_by_key = {}
-        state_id_by_key = {}
-        for exec_id, state_id in inputs + outputs:
-            execution_id_by_key.setdefault(
-                (type(exec_id), exec_id),
-                exec_id,
-            )
-            state_id_by_key.setdefault(
-                (type(state_id), state_id),
-                state_id,
-            )
-        execution_ids = sorted(
-            execution_id_by_key.values(),
-            key=cls._model_identity_sort_key,
-        )
-        state_ids = sorted(
-            state_id_by_key.values(),
-            key=cls._model_identity_sort_key,
-        )
+        execution_keys = {
+            (type(exec_id), exec_id)
+            for exec_id in execution_ids
+        }
+        state_keys = {
+            (type(state_id), state_id)
+            for state_id in state_ids
+        }
+        for relation, incidence in (("I", inputs), ("O", outputs)):
+            for exec_id, state_id in incidence:
+                if (type(exec_id), exec_id) not in execution_keys:
+                    report["errors"].append(
+                        f"incidence: {relation} references Execution "
+                        f"{exec_id!r} outside E"
+                    )
+                if (type(state_id), state_id) not in state_keys:
+                    report["errors"].append(
+                        f"incidence: {relation} references State "
+                        f"{state_id!r} outside S"
+                    )
+        if report["errors"]:
+            return None, report
+        report["checks"]["incidence"] = True
 
         executions = []
         execution_by_id = {}
@@ -1041,19 +1013,6 @@ class TIDE:
         state_by_id = {}
 
         try:
-            cls._model_compatibility_carrier(
-                model,
-                "E",
-                execution_ids,
-                "Execution",
-            )
-            cls._model_compatibility_carrier(
-                model,
-                "S",
-                state_ids,
-                "State",
-            )
-
             for index, exec_id in enumerate(execution_ids):
                 source = dict(execution_enrichments.get(exec_id, {}))
                 source["exec_id"] = exec_id
@@ -1142,48 +1101,51 @@ class TIDE:
             return None, report
 
         report["checks"]["identity"] = True
+        report["structurally_valid"] = True
         report["counts"]["executions"] = len(executions)
         report["counts"]["states"] = len(states)
 
-        producer_by_state = {}
+        producers_by_state = defaultdict(set)
         for exec_id, state_id in outputs:
-            if state_id in producer_by_state:
-                prior = producer_by_state[state_id]
+            producers_by_state[state_id].add(exec_id)
+
+        for state_id in state_ids:
+            producers = sorted(
+                producers_by_state[state_id],
+                key=cls._model_identity_sort_key,
+            )
+            if not producers:
                 report["errors"].append(
                     "unique_creation: State "
-                    f"{state_id!r} is output by {prior!r} and {exec_id!r}"
+                    f"{state_id!r} has no represented producer in O"
                 )
-                return None, report
-            producer_by_state[state_id] = exec_id
-        report["checks"]["unique_creation"] = True
-
-        states_without_producer = [
-            state["state_id"]
-            for state in states
-            if state["state_id"] not in producer_by_state
-        ]
-        if states_without_producer:
-            state_id = states_without_producer[0]
-            report["errors"].append(
-                "every_state_has_producer: State "
-                f"{state_id!r} has no represented producer in O"
-            )
-            return None, report
-        report["checks"]["every_state_has_producer"] = True
+            elif len(producers) > 1:
+                report["errors"].append(
+                    "unique_creation: State "
+                    f"{state_id!r} has multiple represented producers "
+                    f"{producers!r}"
+                )
+        report["checks"]["unique_creation"] = not any(
+            error.startswith("unique_creation:")
+            for error in report["errors"]
+        )
 
         adjacency = {execution["exec_id"]: set() for execution in executions}
         indegree = {execution["exec_id"]: 0 for execution in executions}
         direct_handoffs = []
         for consumer_exec_id, state_id in inputs:
-            producer_exec_id = producer_by_state[state_id]
-            direct_handoffs.append({
-                "producer_exec_id": producer_exec_id,
-                "state_id": state_id,
-                "consumer_exec_id": consumer_exec_id,
-            })
-            if consumer_exec_id not in adjacency[producer_exec_id]:
-                adjacency[producer_exec_id].add(consumer_exec_id)
-                indegree[consumer_exec_id] += 1
+            for producer_exec_id in sorted(
+                producers_by_state[state_id],
+                key=cls._model_identity_sort_key,
+            ):
+                direct_handoffs.append({
+                    "producer_exec_id": producer_exec_id,
+                    "state_id": state_id,
+                    "consumer_exec_id": consumer_exec_id,
+                })
+                if consumer_exec_id not in adjacency[producer_exec_id]:
+                    adjacency[producer_exec_id].add(consumer_exec_id)
+                    indegree[consumer_exec_id] += 1
 
         ready = [
             execution["exec_id"]
@@ -1191,7 +1153,6 @@ class TIDE:
             if indegree[execution["exec_id"]] == 0
         ]
         topological_execution_ids = []
-        visited = 0
         while ready:
             ready.sort(
                 key=cls._model_identity_sort_key,
@@ -1199,7 +1160,6 @@ class TIDE:
             )
             exec_id = ready.pop()
             topological_execution_ids.append(exec_id)
-            visited += 1
             for consumer_exec_id in sorted(
                 adjacency[exec_id],
                 key=cls._model_identity_sort_key,
@@ -1207,12 +1167,6 @@ class TIDE:
                 indegree[consumer_exec_id] -= 1
                 if indegree[consumer_exec_id] == 0:
                     ready.append(consumer_exec_id)
-
-        if visited != len(executions):
-            report["errors"].append(
-                "acyclic_occurrence_ancestry: incidence contains a cycle"
-            )
-            return None, report
 
         reachability = []
         execution_ids = [
@@ -1236,12 +1190,25 @@ class TIDE:
                         "target_exec_id": target_exec_id,
                     })
 
-        report["checks"]["acyclic_occurrence_ancestry"] = True
+        cyclic_execution_ids = [
+            judgment["source_exec_id"]
+            for judgment in reachability
+            if judgment["source_exec_id"] == judgment["target_exec_id"]
+        ]
+        if cyclic_execution_ids:
+            report["errors"].append(
+                "acyclic_ancestry: Executions reach themselves "
+                f"{cyclic_execution_ids!r}"
+            )
+        report["checks"]["acyclic_ancestry"] = not cyclic_execution_ids
         report["judgments"]["direct_handoffs"] = direct_handoffs
         report["judgments"]["reachability"] = reachability
         report["counts"]["direct_handoffs"] = len(direct_handoffs)
         report["counts"]["reachability"] = len(reachability)
-        report["conforms"] = True
+        report["semantically_valid"] = (
+            report["checks"]["unique_creation"]
+            and report["checks"]["acyclic_ancestry"]
+        )
 
         inputs_by_exec = defaultdict(list)
         outputs_by_exec = defaultdict(list)
@@ -1262,7 +1229,11 @@ class TIDE:
             "outputs": outputs,
             "inputs_by_exec": inputs_by_exec,
             "outputs_by_exec": outputs_by_exec,
-            "producer_by_state": producer_by_state,
+            "producer_by_state": {
+                state_id: next(iter(producers))
+                for state_id, producers in producers_by_state.items()
+                if len(producers) == 1
+            },
             "topological_execution_ids": topological_execution_ids,
             "execution_enrichments": execution_enrichments,
             "state_enrichments": state_enrichments,
@@ -1593,7 +1564,7 @@ class TIDE:
             func_name=execution["actor"],
             inputs=Inputs({"args": input_record}),
             deps=dependencies,
-            effects={},
+            effects=[],
             declared_effects=[],
             declared_targets=[
                 state["ref"] for state in execution["outputs"]
@@ -1626,7 +1597,6 @@ class TIDE:
             output_value=output_value,
             resolve_output=False,
             writes=writes,
-            emitted_by=None,
             emitted_nodes=[],
             content_id=source.get("content_id"),
         )
@@ -1864,17 +1834,13 @@ class ExecutionLog:
             return Effects.END
         if isinstance(effect, RUN):
             return Effects.RUN
-        if isinstance(effect, EMIT):
-            return Effects.EMIT
         raise TypeError(f"Unsupported TIDE event effect: {effect!r}")
 
     def _append_event_effect_records(self, record, effects):
         for effect in effects:
             kind = self._effect_kind(effect)
             targets = getattr(effect, "targets", None)
-            if isinstance(effect, EMIT):
-                targets = ["Runner"]
-            elif isinstance(targets, __TIDE_TEMPLATE_VALUE__):
+            if isinstance(targets, __TIDE_TEMPLATE_VALUE__):
                 targets = ["Runner"]
             elif not isinstance(targets, (list, tuple, set)):
                 targets = [targets]
@@ -1890,10 +1856,10 @@ class ExecutionLog:
                 effect_record = EffectRecord(
                     kind,
                     (target, version),
+                    origin="declared",
                     output=getattr(effect, "preserve_output", __TIDE_TEMPLATE_VALUE__()),
-                    preserved_output=getattr(effect, "preserve_output", __TIDE_TEMPLATE_VALUE__()),
                 )
-                record.effects[(kind, (target, version))] = effect_record
+                record.effects.append(effect_record)
 
 
     def _log_exec_event(self, event: ExecEvent | ExecRecord) -> ExecRecord:
@@ -2017,7 +1983,7 @@ class ExecutionLog:
             func_name=func_name,
             inputs=inputs,
             deps=deps,
-            effects={},
+            effects=[],
             declared_deps=[DataRef.from_string(read, strip_leading=False) for read in event.reads.keys()],
             declared_effects=list(event.effects),
             declared_targets=[DataRef.from_string(write, strip_leading=False) for write in event.writes.keys()],
@@ -2032,7 +1998,6 @@ class ExecutionLog:
             output_value=None,
             resolve_output=True,
             writes=[],
-            emitted_by=[],
             emitted_nodes=[],
             base_node_id=None,
             base_node_content_id=None,
@@ -2227,13 +2192,16 @@ class EventCapture:
                 self._source_ocean.done=False
             self._source_ocean.store_router.set(ref.store, ref.key, val, force=True)
 
-        for effect in effects:
-            if not isinstance(effect, DELETE):
+        for effect_record in exec_record.effects:
+            if effect_record.effect != Effects.DELETE:
                 continue
-            for ref in effect.targets:
-                ref = self._normalise_ref_strs_to_data_ref(ref)
-                if self._source_ocean.store_router.exists(ref.store, ref.key):
-                    self._source_ocean.store_router.delete(ref.store, ref.key)
+            ref = self._normalise_ref_strs_to_data_ref(
+                effect_record.targets[0]
+            )
+            found, _ = self._source_ocean.store_router.get_store(
+                ref.store
+            ).pop_if_present(ref.key)
+            effect_record.target_existed = found
         self._source_ocean.tick(external=True)
             # self._source_ocean.consume_event(Event(source=f"runner", source_id=self._source_runner, event_type=RouterEvents.STORE_WRITE, payload=(ref.store, ref.key, val, actor if isinstance(actor, str) else actor.__name__, ".event() write"), exec_id=exec_record.exec_id))
 

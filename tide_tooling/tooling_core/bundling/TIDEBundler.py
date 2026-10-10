@@ -420,18 +420,11 @@ class TIDEBundler:
                 != "__TIDE_TEMPLATE_VALUE__"
             ):
                 values[cas.value_hasher(output_value)] = output_value
-            effects = getattr(record, "effects", None)
-            effect_values = (
-                effects.values()
-                if hasattr(effects, "values")
-                else effects or ()
-            )
-            for effect in effect_values:
-                for name in ("output", "preserved_output"):
-                    value = getattr(effect, name, None)
-                    if value.__class__.__name__ == "__TIDE_TEMPLATE_VALUE__":
-                        continue
-                    values[cas.value_hasher(value)] = value
+            for effect in getattr(record, "effects", ()) or ():
+                value = getattr(effect, "output", None)
+                if value.__class__.__name__ == "__TIDE_TEMPLATE_VALUE__":
+                    continue
+                values[cas.value_hasher(value)] = value
         ref_versions = {
             ref_version: cas.value_hasher(indexed_values[value_hash])
             for ref_version, value_hash in indexed_ref_versions.items()
@@ -566,11 +559,6 @@ class TIDEBundler:
                 TIDEBundler._normalise_named_value_hash(
                     effect,
                     "output_value_hash",
-                    hash_map,
-                )
-                TIDEBundler._normalise_named_value_hash(
-                    effect,
-                    "preserved_output_value_hash",
                     hash_map,
                 )
             TIDEBundler._normalise_named_value_hash(
