@@ -65,7 +65,6 @@ def record_store_write(event: Event, state: ConstructionState):
     exec_log = state.exec_log
     target = DataRef.to_string(ref, prefix=False)
     write_snapshot = ensure_tide_snapshot(snapshot, boundary="write")
-    previous_snapshot = state.ref_to_last_snapshot.get(target)
 
     # Resolve the Store command and the Event that requested it.
     cause_event = state.events_by_id.get(event.cause.event_id) if event.cause and event.cause.event_id else None
@@ -86,22 +85,11 @@ def record_store_write(event: Event, state: ConstructionState):
         if write_event and write_event.type == PipelineEvents.RESULT_READY
         else None
     )
-    availability_mutation = (
-        not event.payload.state_occurrence
-        and previous_snapshot is not None
-        and previous_snapshot.value_hash != write_snapshot.value_hash
-    )
-    mutation_observed = availability_mutation or (
+    mutation_observed = (
         result_snapshot is not None
         and result_snapshot.value_hash != write_snapshot.value_hash
     )
-    prior_snapshot = (
-        result_snapshot
-        if result_snapshot is not None
-        else previous_snapshot
-        if availability_mutation
-        else None
-    )
+    prior_snapshot = result_snapshot
 
     # Advance the target State version and preserve known mutability.
     version = state.versioned_references.get(target, -1) + 1
@@ -163,8 +151,12 @@ def record_store_write(event: Event, state: ConstructionState):
         record = exec_log.exec_id_to_record[exec_id]
         record.event_seq_id = state.current_event_seq_id
         producer_event = command_event or event
-        runner_id = producer_event.source
-        node_id = producer_event.source_id
+        if event.payload.is_poll:
+            runner_id = "TIDE: External"
+            node_id = "TIDE: External"
+        else:
+            runner_id = producer_event.source
+            node_id = producer_event.source_id
         exec_log._assign_external_identity(record, runner_id, node_id)
         tick_actor_occurrence_id(record, state)
 
@@ -706,8 +698,13 @@ def read_dependency_state(event: Event, state: ConstructionState):
     # observation, so it cannot change the reconstructed State value.
     target = DataRef.to_string(event.payload.ref, prefix=False)
     previous_snapshot = state.ref_to_last_snapshot.get(target)
-    if not event.payload.state_occurrence and previous_snapshot is not None:
-        return
+    if event.payload.is_poll and previous_snapshot is not None:
+        poll_snapshot = ensure_tide_snapshot(
+            event.payload.snapshot,
+            boundary="write",
+        )
+        if previous_snapshot.value_hash == poll_snapshot.value_hash:
+            return
 
     # The dependency Event itself proves availability. Its already-seen cause
     # may attribute that fact, but an absent or unusual cause never delays it.

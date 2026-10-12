@@ -788,13 +788,15 @@ def test_trace_shows_each_source_when_exec_calls_are_combined(capsys):
     trace.show(color=False)
     shown = capsys.readouterr().out
 
-    assert "Tide Runs: MULTIPLE (2)" in shown
-    assert "Pipelines: MULTIPLE (2)" in shown
+    assert "Tide Runs:" not in shown
+    assert "Pipelines:" not in shown
     assert "Sources:" not in shown
 
     trace.show(color=False, show_sources=True)
     shown = capsys.readouterr().out
 
+    assert "Tide Runs: MULTIPLE (2)" in shown
+    assert "Pipelines: MULTIPLE (2)" in shown
     assert "Sources:    2" in shown
     assert "TIDE: .run_node(first)" in shown
     assert "TIDE: .run_node(second)" in shown

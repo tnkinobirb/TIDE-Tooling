@@ -84,7 +84,7 @@ def test_event_state_retains_every_published_field_without_reconciliation():
         if record.get("type", "").endswith(":State")
     )
     assert set(state_record["fields"]) == {
-        "ref", "value", "snapshot", "state_occurrence",
+        "ref", "value", "snapshot", "is_poll",
         "value_type",
     }
     restored = TIDEEventDeserialiser().deserialise(graph)[0]

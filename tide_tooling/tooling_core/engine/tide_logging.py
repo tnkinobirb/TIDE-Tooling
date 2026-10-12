@@ -2548,11 +2548,12 @@ class Trace:
             if source_pipelines
             else "TIDE: UNKNOWN"
         )
-        identifier = (
-            f"Ocean: {self.ocean_id} | "
-            f"{run_label}: {run} | "
-            f"{pipeline_label}: {pipeline}"
-        )
+        identifier = f"Ocean: {self.ocean_id}"
+        if show_sources:
+            identifier += (
+                f" | {run_label}: {run}"
+                f" | {pipeline_label}: {pipeline}"
+            )
         lines = show_header("TRACE", summary, identifier)
         lines.extend(show_section("RUN"))
         if self._pipeline_starting_event_id is not None:

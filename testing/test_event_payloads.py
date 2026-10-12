@@ -36,7 +36,7 @@ def test_pipeline_run_has_one_fixed_shape():
 def test_state_keeps_reference_value_and_snapshot_together():
     payload = State("ref", "value", "snapshot")
 
-    assert tuple(payload) == ("ref", "value", "snapshot", True, None)
+    assert tuple(payload) == ("ref", "value", "snapshot", False, None)
 
 
 def test_effect_occurrence_defaults_are_explicit():

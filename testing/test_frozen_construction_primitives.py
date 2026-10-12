@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tide_tooling import TIDE, node, pipeline
 from tide_tooling.tooling_core.engine.classes import DataRef
 from tide_tooling.tooling_core.engine.event_payloads import (
     PipelineRun,
@@ -459,14 +460,77 @@ def test_unchanged_polling_reuses_the_recorded_state():
     ref = DataRef(key="key", store="global")
     snapshot = tide_snapshot_value("value", boundary="write")
     write = Event(source="business", source_id="test", type=RouterEvents.STORE_WRITE, cause=Cause(description="external write"), ocean_id="ocean", payload=State(ref, "value", snapshot))
+    available = Event(source="store_router", source_id=0, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(write), ocean_id="ocean", target_runner_id="*", payload=write.payload)
     start = Event(source="ocean", source_id=0, type=OceanEvents.RUN_PIPELINE, cause=Cause(description="trace start"), ocean_id="ocean", payload=PipelineRun(0, None, "sequential", {}, False, None, None))
-    poll = Event(source="runner", source_id=0, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(start), ocean_id="ocean", payload=State(ref, "value", snapshot))
+    poll = Event(source="runner", source_id=0, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(start), ocean_id="ocean", payload=State(ref, "value", snapshot, is_poll=True))
 
     reader = EventLogReader("ocean")
-    state = reader._construct_log([write, start, poll])
+    state = reader._construct_log([write, available, start, poll])
 
     assert state.versioned_references == {"global:key": 0}
     assert len(state.exec_log.exec_log) == 1
+
+
+def test_changed_poll_records_a_new_state_version():
+    ref = DataRef(key="key", store="global")
+    first_snapshot = tide_snapshot_value("first", boundary="write")
+    second_snapshot = tide_snapshot_value("second", boundary="write")
+    write = Event(source="business", source_id="test", type=RouterEvents.STORE_WRITE, cause=Cause(description="external write"), ocean_id="ocean", payload=State(ref, "first", first_snapshot))
+    available = Event(source="store_router", source_id=0, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(write), ocean_id="ocean", target_runner_id="*", payload=write.payload)
+    start = Event(source="ocean", source_id=0, type=OceanEvents.RUN_PIPELINE, cause=Cause(description="trace start"), ocean_id="ocean", payload=PipelineRun(0, None, "sequential", {}, False, None, None))
+    poll = Event(source="runner", source_id=0, type=PipelineEvents.DEP_AVAILABLE, cause=Cause.from_event(start), ocean_id="ocean", payload=State(ref, "second", second_snapshot, is_poll=True))
+
+    reader = EventLogReader("ocean")
+    state = reader._construct_log([write, available, start, poll])
+
+    assert state.versioned_references == {"global:key": 1}
+    assert len(state.exec_log.exec_log) == 2
+    recorded_snapshot, version = state.ref_to_last_value["global:key"]
+    assert recorded_snapshot.value_hash == second_snapshot.value_hash
+    assert recorded_snapshot.observed_mutable is False
+    assert version == 1
+    assert state.mutable_references == {}
+
+    external_record = state.exec_log.exec_log[-1]
+    assert external_record.runner_id == "TIDE: External"
+    assert external_record.node_id == "TIDE: External"
+    assert len(external_record.writes) == 1
+    assert external_record.writes[0].stored_version == 1
+    assert external_record.writes[0].observed_mutable is False
+    assert external_record.writes[0].updated is False
+    assert len(external_record.writes[0].snapshot_lineage) == 1
+
+
+def test_runtime_poll_records_its_first_external_state_without_mutation():
+    value = {"count": 1}
+    tide = TIDE()
+    tide.declare("global:value", value)
+    tide.ocean.store_router.get("global", "value")["count"] = 2
+
+    @node(args=("@global:value",), targets="global:observed")
+    def observe(current):
+        return current["count"]
+
+    @pipeline
+    def workflow():
+        observe()
+
+    trace = tide.ocean.run_pipeline(workflow, mode="sequential")
+    value_writes = [
+        (record, write)
+        for record in trace.log
+        for write in record.writes
+        if write.stored_target == "global:value"
+    ]
+
+    assert [write.stored_version for _, write in value_writes] == [0]
+    external_record, external_write = value_writes[-1]
+    assert external_record.runner_id == "TIDE: External"
+    assert external_record.node_id == "TIDE: External"
+    assert external_write.stored_result == {"count": 2}
+    assert external_write.observed_mutable is False
+    assert external_write.updated is False
+    assert len(external_write.snapshot_lineage) == 1
 
 
 def test_store_write_command_alone_does_not_claim_success():

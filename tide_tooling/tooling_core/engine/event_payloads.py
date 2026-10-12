@@ -32,7 +32,7 @@ class State(NamedTuple):
     ref: DataRef
     value: Any
     snapshot: TIDEValueSnapshot
-    state_occurrence: bool = True
+    is_poll: bool = False
     value_type: type | None = None
 
 

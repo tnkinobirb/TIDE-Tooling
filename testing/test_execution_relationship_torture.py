@@ -284,10 +284,10 @@ def test_torture_mutation_external_inputs_duplicates_scopes_and_value_identity()
 
     for trace in (live, restored):
         assert trace.value_of("global:mutable", 0)["shared_left"] == []
-        uses = trace.used_as("global:mutable[v0]")
+        uses = trace.used_as("global:mutable[v1]")
         assert len(uses) == 3
         assert all(
-            use["observed"]["differs_from_stored"]
+            not use["observed"]["differs_from_stored"]
             for use in uses.uses
         )
         observed = uses.values[0]

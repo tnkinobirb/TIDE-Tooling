@@ -51,9 +51,10 @@ def test_nested_duplicate_reads_survive_external_change_and_bundle():
     )
     assert [read.input_path for read in before.deps] == [(0, "left"), (0, "again", 0), (0,)]
     assert [read.resolved_version for read in before.deps] == [0, 0, 0]
-    assert [read.resolved_version for read in after.deps] == [1, 1, 0]
+    assert [read.resolved_version for read in after.deps] == [2, 2, 0]
     assert trace.value_of("global:data", 0) == {"items": [1]}
     assert trace.value_of("global:data", 1) == {"items": [1, 2]}
+    assert trace.value_of("global:data", 2) == {"items": [1]}
 
     rebuilt = TIDE.from_bundle(trace.to_bundle())
     rebuilt_before = next(
@@ -67,7 +68,7 @@ def test_nested_duplicate_reads_survive_external_change_and_bundle():
     assert [read.input_path for read in rebuilt_before.deps] == [
         (0, "left"), (0, "again", 0), (0,),
     ]
-    assert [read.resolved_version for read in rebuilt_after.deps] == [1, 1, 0]
+    assert [read.resolved_version for read in rebuilt_after.deps] == [2, 2, 0]
     tide.ocean.close()
 
 

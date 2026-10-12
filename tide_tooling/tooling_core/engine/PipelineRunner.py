@@ -432,7 +432,7 @@ class PipelineRunner:
                     ref,
                     value,
                     tide_snapshot_value(value, boundary="write"),
-                    state_occurrence=False,
+                    is_poll=True,
                     value_type=type(value),
                 ),
             ))
@@ -1227,7 +1227,7 @@ class PipelineRunner:
                                 existing_ref,
                                 value,
                                 snapshot,
-                                state_occurrence=False,
+                                is_poll=True,
                                 value_type=type(value),
                             ))
 

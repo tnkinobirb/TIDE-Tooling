@@ -1509,7 +1509,7 @@ def test_result_to_write_mutation_is_preserved_in_write_lineage(monkeypatch):
     ] == ["result", "write"]
 
 
-def test_external_mutation_between_write_and_read_remains_a_use_observation():
+def test_external_mutation_between_write_and_read_creates_a_new_version():
     value = {"items": [1]}
     tide = TIDE()
     tide.declare("data", value)
@@ -1521,22 +1521,25 @@ def test_external_mutation_between_write_and_read_remains_a_use_observation():
         writes="count",
     )
     trace = tide.trace()
-    declared, consumer = trace.log
+    declared, external, consumer = trace.log
 
     assert declared.writes[0].stored_result == {"items": [1]}
+    assert external.writes[0].stored_result == {"items": [1, 2]}
+    assert external.writes[0].stored_version == 1
     assert consumer.deps[0].resolved_value == {"items": [1, 2]}
-    assert consumer.deps[0].resolved_version == 0
-    assert consumer.deps[0].producer_exec_id == declared.exec_id
-    assert consumer.deps[0].observed_mutable is True
+    assert consumer.deps[0].resolved_version == 1
+    assert consumer.deps[0].producer_exec_id == external.exec_id
+    assert consumer.deps[0].observed_mutable is False
     assert [
         entry["boundary"]
         for entry in consumer.deps[0].snapshot_lineage
     ] == ["write", "read"]
 
-    used = trace.used_as("global:data[v0]")
+    used = trace.used_as("global:data[v1]")
     assert trace.value_of("global:data", 0) == {"items": [1]}
+    assert trace.value_of("global:data", 1) == {"items": [1, 2]}
     assert used.values == ({"items": [1, 2]},)
-    assert used.uses[0]["observed"]["differs_from_stored"] is True
+    assert used.uses[0]["observed"]["differs_from_stored"] is False
 
 
 def test_hash_only_snapshot_becomes_opaque_evidence_not_hash_string():
