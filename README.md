@@ -290,8 +290,8 @@ trace.parents_of("execution_id").show()
 trace.children_of("execution_id").show()
 ```
 
-Shows child work directly attributed to a parent Execution. In v0.0.3 this
-relationship is stored as `emitted_by_exec_id`; it records direct parentage and
+Shows child work directly attributed to a parent Execution. This relationship
+is stored as `emitted_by_exec_id`; it records direct parentage and
 does not require a native TIDE node-emission mechanism.
 
 ### Find what consumed something
@@ -493,4 +493,4 @@ For deeper detail:
 - Native execution and scheduling → [`docs/Ocean_Rundown.md`](docs/Ocean_Rundown.md)
 - TIDE Models → [`docs/TIDE_Model.md`](docs/TIDE_Model.md)
 - TIDE Bundles → [`docs/Bundles.md`](docs/Bundles.md)
-- v0.0.3 changes → [`CHANGELOG.md`](CHANGELOG.md)
+- Release history → [`CHANGELOG.md`](CHANGELOG.md)
