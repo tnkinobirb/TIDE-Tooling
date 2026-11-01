@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.5 (pre-alpha)
+
+Trace export:
+- `Trace.to_dict()` now includes execution sequence IDs for sources and actors, and producer and consumer execution sequence IDs for reference versions.
+
 ## v0.0.4 (pre-alpha)
 
 Preamble:

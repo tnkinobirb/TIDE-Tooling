@@ -1,5 +1,7 @@
 from tide_tooling import TIDE
 from tide_tooling.core import Trace, ExecRecord, Actor
+from tide_tooling.tooling_core.engine.events import Cause
+from tide_tooling.tooling_core.engine.tide_logging import Inputs, WriteRecord
 
 def test_event_semantically_equals_exec():
     def assert_exec_record_semantic_equivalence(a: ExecRecord, b: ExecRecord):
@@ -445,3 +447,93 @@ def test_trace_read_writes_values():
         "!result",
         "!seed-1",
     )
+
+
+def test_trace_to_dict_preserves_relationships_by_exec_seq_id():
+    trace = create_trace_fixture()
+    data = trace.to_dict()
+
+    expected_sources = {}
+    for record in trace.log:
+        expected_sources.setdefault(
+            (record.runner_id, record.pipeline_id),
+            [],
+        ).append(record.seq_id)
+
+    assert {
+        (source["run"], source["pipeline_id"]): source["exec_seq_ids"]
+        for source in data["sources"]
+    } == expected_sources
+
+    assert {
+        actor["id"]: actor["exec_seq_ids"]
+        for actor in data["actors"]
+    } == {
+        record.producer_id.to_dict()["id"]: [record.seq_id]
+        for record in trace.log
+    }
+
+    ref_versions = {
+        (entry["ref"], entry["version"]): entry
+        for entry in data["ref_versions"]
+    }
+    assert ref_versions[("global:@seed", 0)]["producers"] == [0]
+    assert ref_versions[("global:@seed", 0)]["consumers"] == [1]
+    assert ref_versions[("global:@result", 0)]["producers"] == [1]
+    assert ref_versions[("global:@result", 0)]["consumers"] == []
+    assert ref_versions[("global:@seed", 1)]["producers"] == [2]
+    assert ref_versions[("global:@seed", 1)]["consumers"] == []
+
+
+def test_trace_to_dict_preserves_multiple_producer_exec_seq_ids():
+    def execution(seq_id, name):
+        return ExecRecord(
+            seq_id=seq_id,
+            exec_id=f"exec-{seq_id}",
+            ocean_id="ocean",
+            runner_id="runner",
+            pipeline_id="pipeline",
+            node_id=name,
+            func=None,
+            func_name=name,
+            inputs=Inputs({}),
+            deps=[],
+            effects=[],
+            declared_effects=[],
+            declared_targets=[],
+            runtime_effects=[],
+            runtime_targets=[],
+            declared_deps=[],
+            unscoped_store_refs=[],
+            status="succeeded",
+            started_at=seq_id,
+            finished_at=seq_id,
+            duration_ms=0,
+            error=None,
+            node_options={},
+            writes=[WriteRecord(
+                Cause(description="test"),
+                "value",
+                0,
+                "global:@shared",
+            )],
+        )
+
+    trace = Trace(
+        log=[execution(0, "writer"), execution(1, "writer")],
+        ocean_id="ocean",
+    )
+    writer = next(
+        actor
+        for actor in trace.to_dict()["actors"]
+        if actor["name"] == "writer"
+    )
+    shared = next(
+        entry
+        for entry in trace.to_dict()["ref_versions"]
+        if (entry["ref"], entry["version"]) == ("global:@shared", 0)
+    )
+
+    assert writer["exec_seq_ids"] == [0, 1]
+    assert shared["producers"] == [0, 1]
+    assert shared["consumers"] == []

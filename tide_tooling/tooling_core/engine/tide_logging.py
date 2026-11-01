@@ -1033,6 +1033,12 @@ class Trace:
         if serialise_events and self._event_log is not None:
             events = self._event_log.to_event_bundle().to_dict()
 
+        def exec_seq_ids(exec_ids):
+            return sorted(
+                self._index.exec_by_exec_id[exec_id].seq_id
+                for exec_id in exec_ids
+            )
+
         return {
             "type": "trace",
             "name": self.name,
@@ -1044,8 +1050,21 @@ class Trace:
                     "pipeline": self._get_pipeline_named_tuple_from_id(
                         pipeline_id
                     )[1],
+                    "exec_seq_ids": [
+                        execution.seq_id
+                        for execution in self._execution_records
+                        if execution.runner_id == runner_id
+                        and execution.pipeline_id == pipeline_id
+                    ],
                 }
                 for runner_id, pipeline_id in self._sources()
+            ],
+            "actors": [
+                {
+                    **actor.to_dict(),
+                    "exec_seq_ids": exec_seq_ids(exec_ids),
+                }
+                for actor, exec_ids in self._index.actor_to_exec_ids.items()
             ],
             "from_cas": self.from_cas,
             "bundle_context": copy.deepcopy(self._bundle_context),
@@ -1060,6 +1079,18 @@ class Trace:
                     "ref": ref,
                     "version": version,
                     "value_hash": value_hash,
+                    "producers": exec_seq_ids(
+                        self._index.producer_exec_ids_by_ref_version.get(
+                            (ref, version),
+                            (),
+                        )
+                    ),
+                    "consumers": exec_seq_ids(
+                        self._index.consumer_exec_ids_by_ref_version.get(
+                            (ref, version),
+                            (),
+                        )
+                    ),
                 }
                 for (ref, version), value_hash in sorted(
                     self._index.value_hash_by_ref_version.items(),
