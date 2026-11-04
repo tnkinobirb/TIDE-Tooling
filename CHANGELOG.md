@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.6 (pre-alpha)
+
+Trace to_dict: 
+- `Trace.to_dict()` now uses `serialise_events=True` as default. `to_dict()` should always be serialisable.
+
 ## v0.0.5 (pre-alpha)
 
 Trace export:

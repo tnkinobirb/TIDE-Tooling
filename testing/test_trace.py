@@ -1,3 +1,4 @@
+import json
 from tide_tooling import TIDE
 from tide_tooling.core import Trace, ExecRecord, Actor
 from tide_tooling.tooling_core.engine.events import Cause
@@ -537,3 +538,14 @@ def test_trace_to_dict_preserves_multiple_producer_exec_seq_ids():
     assert writer["exec_seq_ids"] == [0, 1]
     assert shared["producers"] == [0, 1]
     assert shared["consumers"] == []
+
+def test_trace_to_dict_returns_dict():
+    trace = create_trace_fixture()
+    to_dict = trace.to_dict()
+    assert isinstance(to_dict, dict)
+
+
+def test_trace_to_dict_is_default_serialisable():
+    trace = create_trace_fixture()
+    to_dict = trace.to_dict()
+    json.dumps(to_dict)

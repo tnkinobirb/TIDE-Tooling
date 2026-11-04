@@ -1024,7 +1024,7 @@ class Trace:
             for execution in self._execution_records
         ))
 
-    def to_dict(self, *, serialise_events=False):
+    def to_dict(self, *, serialise_events=True):
         """Return the Trace summary, optionally serialising retained Events."""
         if not isinstance(serialise_events, bool):
             raise TypeError("serialise_events must be a bool")
