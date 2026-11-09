@@ -282,7 +282,22 @@ class TIDEValueSnapshot:
             and root_record.get("serialiser") != "opaque"
             else type(restored).__name__
         )
-        if represented_type != self.type_name:
+        path_type_names = {
+            "windows": {"WindowsPath", "PureWindowsPath"},
+            "posix": {"PosixPath", "PurePosixPath"},
+        }
+        equivalent_path_types = (
+            root_record.get("serialiser") == "path"
+            and represented_type in path_type_names.get(
+                root_record.get("flavour"),
+                set(),
+            )
+            and self.type_name in path_type_names.get(
+                root_record.get("flavour"),
+                set(),
+            )
+        )
+        if represented_type != self.type_name and not equivalent_path_types:
             self._integrity_error(
                 "serialised value evidence does not agree with type_name"
             )

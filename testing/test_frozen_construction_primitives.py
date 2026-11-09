@@ -1,8 +1,10 @@
+from pathlib import PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
 
 from tide_tooling import TIDE, node, pipeline
+from tide_tooling.tooling_core.bundling.TIDEBundler import TIDEBundler
 from tide_tooling.tooling_core.engine.classes import DataRef
 from tide_tooling.tooling_core.engine.event_payloads import (
     PipelineRun,
@@ -137,6 +139,52 @@ def test_serialised_exact_snapshot_remains_exact_after_roundtrip():
     assert restored.exact is True
     assert restored.value_hash == snapshot.value_hash
     assert restored.restore() == value
+
+
+@pytest.mark.parametrize(
+    ("value", "captured_type"),
+    [
+        (PureWindowsPath("C:/example/file.txt"), "WindowsPath"),
+        (PurePosixPath("/example/file.txt"), "PosixPath"),
+    ],
+)
+def test_serialised_path_snapshot_accepts_portable_path_type(
+    value,
+    captured_type,
+):
+    value_bundle = TIDEBundler().bundle(value)
+
+    snapshot = TIDEValueSnapshot(
+        value_hash=tide_value_hash_from_bundle(value_bundle),
+        value_bundle=value_bundle,
+        capture_method="serialised",
+        type_name=captured_type,
+        representation=repr(value),
+        boundary="test.path",
+        exact=True,
+    )
+
+    assert snapshot.restore() == value
+
+
+def test_serialised_path_snapshot_rejects_unrelated_type():
+    value_bundle = TIDEBundler().bundle(
+        PureWindowsPath("C:/example/file.txt")
+    )
+
+    with pytest.raises(
+        TIDEValueSnapshot._IntegrityError,
+        match="does not agree with type_name",
+    ):
+        TIDEValueSnapshot(
+            value_hash=tide_value_hash_from_bundle(value_bundle),
+            value_bundle=value_bundle,
+            capture_method="serialised",
+            type_name="PosixPath",
+            representation="path",
+            boundary="test.path",
+            exact=True,
+        )
 
 
 def test_snapshot_hash_and_restored_value_share_one_serialised_observation():

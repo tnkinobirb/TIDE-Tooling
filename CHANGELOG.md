@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.7 (pre-alpha)
+
+Bundle reconstruction-integrity assertions: 
+- Fixed a bug where `bundles` containing `Path` objects generated on one platform ['linux'|'windows'] and loaded on another caused an intergrity failure due to the host systems differing on native `Path` intepretation.  
+
 ## v0.0.6 (pre-alpha)
 
 Trace to_dict: 
