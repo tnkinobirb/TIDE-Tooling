@@ -1,5 +1,9 @@
 # Base Exception Class
-class PipelineError(Exception):
+class TIDEError(Exception):
+    """Base class for all TIDE error objects"""
+    pass
+
+class PipelineError(TIDEError):
     """Base class for all Pipeline error objects"""
     pass
 
@@ -59,10 +63,7 @@ class NodeFailed(PipelineError):
         self.error = error
         super().__init__(str(error))
 
-# Base Exception Class
-class TIDEError(Exception):
-    """Base class for all TIDE error objects"""
-    pass
+
 
 
 class ReadInsideProcessPoolError(TIDEError):

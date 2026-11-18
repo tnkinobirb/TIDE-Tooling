@@ -334,9 +334,22 @@ def test_tide_now_capture_uses_main_collection(monkeypatch, tmp_path):
     assert calls[0][0][4:6] == ["-c", "main"]
 
 
-def test_tide_now_capture_still_handles_zero_argument_pipeline(tmp_path):
+def test_tide_now_capture_still_handles_zero_argument_pipeline(tmp_path, request):
     if find_spec("noworkflow") is None:
         pytest.skip("noWorkflow is not installed")
+    project_root = Path(__file__).resolve().parents[1]
+    if (
+        os.name == "nt"
+        and len({
+            path.drive.casefold()
+            for path in (tmp_path, project_root, Path(sys.base_prefix))
+            if path.drive
+        }) > 1
+    ):
+        request.node.add_marker(pytest.mark.xfail(
+            reason="noWorkflow #294: cross-drive module capture fails on Windows",
+            strict=True,
+        ))
     script = tmp_path / "pipeline.py"
     script.write_text(
         """
@@ -351,7 +364,6 @@ TIDE().ocean.run_pipeline(flow)
 """.lstrip(),
         encoding="utf-8",
     )
-    project_root = Path(__file__).resolve().parents[1]
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(project_root), environment.get("PYTHONPATH")) if part

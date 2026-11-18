@@ -121,6 +121,15 @@ def test_every_demo_runs_without_error(tmp_path):
     copied_root = tmp_path / "demos"
     shutil.copytree(DEMO_ROOT, copied_root)
 
+    noworkflow_cross_drive = (
+        os.name == "nt"
+        and len({
+            path.drive.casefold()
+            for path in (tmp_path, PROJECT_ROOT, Path(sys.base_prefix))
+            if path.drive
+        }) > 1
+    )
+
     environment = os.environ.copy()
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -132,7 +141,10 @@ def test_every_demo_runs_without_error(tmp_path):
     for relative_path in DEMO_ORDER:
         if (
             relative_path in NOWORKFLOW_DEMOS
-            and find_spec("noworkflow") is None
+            and (
+                find_spec("noworkflow") is None
+                or noworkflow_cross_drive
+            )
         ):
             continue
         completed = subprocess.run(

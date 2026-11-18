@@ -22,24 +22,15 @@ The adapter is a projection boundary. It retains the relationships and value
 representations noWorkflow recorded, but does not repair failed capture after
 the fact or manufacture missing provenance.
 
-## Known upstream capture limitations
+## Upstream status
 
-PyPosAST:
-1. PyPosAST dictionary unpacking positions.
+noWorkflow is actively developed. TIDE does not maintain a duplicate list of
+its upstream defects; current reports and their status are available in the
+[noWorkflow issue tracker](https://github.com/gems-uff/noworkflow/issues).
 
-noWorkflow:
-1. noWorkflow property-decorator capture.
-2. noWorkflow walrus inside yield.
-3. noWorkflow dictionary-unpacking capture.
-4. noWorkflow zero-argument callback binding.
-
-Related focused upstream work includes:
-
-- [PyPosAST dictionary-unpacking positions](https://github.com/JoaoFelipe/pyposast/pull/2)
-- [noWorkflow dictionary-unpacking item dependency](https://github.com/gems-uff/noworkflow/pull/201)
-
-These links describe proposed upstream changes; their presence here does not
-imply that they have been merged or released.
+TIDE inherits the capture behaviour of the installed noWorkflow version. One
+upstream limitation directly characterized by TIDE's tests is
+[cross-drive module capture on Windows](https://github.com/gems-uff/noworkflow/issues/294).
 
 ## Current compatibility patch
 

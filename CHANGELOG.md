@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.0.8 (pre-alpha)
+
+Exception typing and facade:
+- Added parent `TIDEError` to `tide_tooling.__init__` imports.
+- All TIDE exceptions now use `TIDEError` as their base class.
+
+Bundle validation:
+- `TIDE.from_bundle()` invalid input errors now include the received type.
+
+noWorkflow:
+- Updated noWorkflow's required version to 2.2.0.
+- Adjusted tests to expect a noWorkflow issue previously causing tests to fail (`#294`).
+
 ## v0.0.7 (pre-alpha)
 
 Bundle reconstruction-integrity assertions: 

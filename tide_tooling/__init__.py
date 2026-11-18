@@ -36,6 +36,7 @@ from tide_tooling.tooling_core.engine.errors import (
     RaiseHandlingError,
     ReadInsideProcessPoolError,
     WriteNowInsideProcessPoolError,
+    TIDEError,
 )
 from tide_tooling.tooling_core.engine.tide_links import (
     EffectEdge,
@@ -142,6 +143,7 @@ __all__ = [
     "WriteNowInsideProcessPoolError",
     "DeleteNowInsideProcessPoolError",
     "RaiseHandlingError",
+    "TIDEError",
     "READ",
     "READ_EFFECT",
     "WRITE",

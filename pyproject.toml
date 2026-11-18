@@ -1,6 +1,6 @@
 [project]
 name = "tide-tooling"
-version = "0.0.7"
+version = "0.0.8"
 description = "Queryable execution provenance for Python"
 readme = "README.md"
 authors = [
@@ -16,7 +16,7 @@ test = [
     "pytest>=9.1.1",
 ]
 now = [
-    "noworkflow>=2.1.3",
+    "noworkflow>=2.2.0",
 ]
 signing = [
     "cryptography>=46.0.0",

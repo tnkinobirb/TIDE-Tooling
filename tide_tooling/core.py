@@ -711,7 +711,7 @@ class TIDE:
             )
         else:
             raise TypeError(
-                "TIDE.from_bundle expects a TIDEBundle, dict, or JSON path"
+                f"TIDE.from_bundle expects a TIDEBundle, dict, or JSON path, got {type(bundle).__name__}"
             )
         if verify is not None:
             imported.verify(verify)
